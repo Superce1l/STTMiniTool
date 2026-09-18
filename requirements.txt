@@ -1,0 +1,26 @@
+# Qwen3 ASR MiniTool - 运行环境依赖
+# 安装：pip install -r requirements.txt
+
+# WebView 版界面：原生 WebView2 窗口（系统 runtime，不打包 Chromium）。
+# 仅用 pywebview「加载本机网址」开窗，不使用其 js_api（避开 pythonnet
+# 序列化的递归 bug）；前端与本机 HTTP server 走 HTTP/SSE 沟通。
+pywebview>=6.0
+
+# 推理引擎
+openvino>=2026.4.0
+onnxruntime>=1.17.0
+
+# 音频处理
+numpy>=1.24.0
+soundfile>=0.12.0
+
+# 中文转换（OpenCC 简繁/词汇转换，按设置使用）
+opencc-python-reimplemented>=0.1.7
+
+# 模型下载
+requests>=2.30.0
+
+# ──────────────────────────────────────────────────────
+# 以下仅开发时需要（用于重新产生 prompt_template.json）
+# pip install qwen-asr transformers
+# python generate_prompt_template.py

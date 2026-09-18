@@ -1,0 +1,119 @@
+# ── Python ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+dist2/
+build/
+*.spec
+results/
+
+# ── 发行包（make_release_zip.bat 产生，上传至 GitHub Releases）──
+QwenASR_*.zip
+QwenASR_*.7z
+
+# ── 虚拟环境 ─────────────────────────────────────────
+venv/
+venv-gpu/
+build_venv/
+.venv/
+env/
+
+# ── 模型文件（下载后产生，体积大）──────────────────────
+ov_models/qwen3_asr_int8/
+ov_models/qwen3_asr_1p7b_int8/
+ov_models/qwen3_asr_1p7b_kv/
+ov_models/qwen3_asr_1p7b_kv_int8/
+ov_models/qwen3_asr_1p7b_kv_int8_openvino_Scripts/
+ov_models/silero_vad*.onnx
+ov_models/*.gguf
+onnx_models/
+GPUModel/
+GGUF/
+ffmpeg/
+*.onnx
+*.bin
+*.xml
+*.gguf
+
+# ── 允许特定 ov_models 文件 ───────────────────────────
+!ov_models/mel_filters.npy
+
+# ── 自动生成的配置文件 ────────────────────────────
+settings.json
+settings-gpu.json
+
+# ── 输出文件 ─────────────────────────────────────────
+subtitles/
+*.srt
+installer/
+
+# ── 所有 BAT 文件预设忽略，以下三個除外 ───────────────────
+*.bat
+!build.bat
+!build_venv.bat
+!start-gpu.bat
+!make_release_zip.bat
+
+# ── 开发/测试用脚本 ──────────────────────────────────
+test_*.py
+benchmark.py
+check_*.py
+export_onnx.*
+generate_srt.py
+merge_onnx.py
+cleanup_merged.py
+download_test_audio.py
+quantize_cpu.py
+REQ.txt
+setup.iss
+
+# ── 测试音频 ─────────────────────────────────────────
+test_audio/
+*.wav
+*.mp3
+*.flac
+*.m4a
+
+# ── chatllm DLL 目录（二进制，体积大，从 GitHub Releases 获取）────────
+chatllm/
+chatllmtest/
+
+# ── CrispASR / Whisper 核心与测试文件（使用时下载 / 开发测试，不入库）──────
+crispasr/
+CASRCore/
+_freshtest/
+_freshtest_models/
+crisp_smoke.py
+compress_kv_int4.py
+ov_models/qwen3_asr_1p7b_kv_int4/
+
+# ── 杂项暂存（误产生 / 工作交接，不入库）────────────────────────────
+*.stackdump
+工作交接*.md
+UI.txt
+/root
+
+# ── 其他 ─────────────────────────────────────────────
+# .claude/ 内只有 skills/ 要进行版本控制（给使用者的 Agent 用），其它（settings.local.json
+# 等本地配置）不入库。注意必须写成 `.claude/*` 而非 `.claude/`——后者会让 git 根本
+# 不進入该目录，底下的 `!` 反向规则就永远不会生效。
+.claude/*
+!.claude/skills/
+*.jpg
+*.png
+*.log
+*.tmp
+
+# 图标 PNG 例外（必须放在 *.png 之后才生效）
+!assets/icon.png
+!webview/favicon.png
+
+# ── 运行 Readme 文件夹内的截图（含 webview 子文件夹）──────
+!Readme/*.jpg
+!Readme/*.png
+!Readme/webview/*.jpg
+!Readme/webview/*.png

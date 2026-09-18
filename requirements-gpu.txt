@@ -1,0 +1,8 @@
+# requirements-gpu.txt 已删除
+#
+# 旧版「GPU 版」（app-gpu.py + qwen-asr PyTorch 路线）随 CustomTkinter 桌面版
+# 一并移除。现行 GPU 加速走 CrispASR（Vulkan / CUDA 二进制，随包或按需下载），
+# 依赖见 requirements.txt。
+#
+# generate_prompt_template.py（开发期一次性工具）仍需 qwen-asr / transformers，
+# 用途与安装说明见该文件与 requirements.txt 尾部注释。
