@@ -1,1 +1,0 @@
-{"ok": true, "core": "Qwen", "model": "Qwen3-ASR-0.6B", "backend": "openvino", "arch": "CPU · OpenVINO INT8", "restartRequired": false, "canLoadNow": true, "note": "", "message": "已选定「Qwen · Qwen3-ASR-0.6B」（CPU · OpenVINO INT8）。点「下载并加载模型」即可开始（不需重启）。"}

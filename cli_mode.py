@@ -72,7 +72,7 @@ def _use_scratch_settings(core) -> Path:
     global _ORIG_SETTINGS
     real = Path(core.SETTINGS_FILE)
     _ORIG_SETTINGS = real
-    tmp = Path(tempfile.mkdtemp(prefix="qwenasr-cli-")) / "settings.json"
+    tmp = Path(tempfile.mkdtemp(prefix="sttminitool-cli-")) / "settings.json"
     try:
         if real.exists():
             shutil.copyfile(real, tmp)
