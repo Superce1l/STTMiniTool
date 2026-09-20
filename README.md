@@ -19,7 +19,7 @@
 | 🈶 **全面简体化** | 界面与全部提示改为简体中文；字库换用 Noto Sans SC；识别输出默认简体（不再默认繁化，可在设置切换简繁词汇转换） |
 | 🗑️ **移除批量识别与端点服务** | 批量识别标签页、LAN 转录 API、手机扫码上传、Cloudflare 对外通道全部删除，界面与代码更精简 |
 | 🎙️ **模型目录调整** | 移除 TEA-ASR-1.1（台湾国语）与 Whisper Breeze-ASR-26；新增 **OpenAI Whisper 官方模型**（Base / Small / Medium / Large / Large-Turbo） |
-| ⚡ **核心升级** | CrispASR v0.8.32 → **v0.8.33**；OpenVINO 依赖 → **2026.4**；chatllm 向下兼容层对齐 **v24** |
+| ⚡ **核心升级** | CrispASR v0.8.32 → **CrispASR仓库最新版**；OpenVINO 依赖 → **2026.4**；chatllm 向下兼容层对齐 **v24** |
 | 🟢 **CUDA 优先** | NVIDIA 显卡用户默认推荐 **CUDA**（依驱动版本自动选 CUDA 13 / CUDA 12，自带 runtime 免装 Toolkit）；AMD / Intel 仍走 Vulkan |
 | ✂️ **长音频切片转录** | 超过 2 小时的音频自动用 FFmpeg 按 30 分钟切片（相邻片 15 秒重叠防切点截字），逐片转录后时间轴平移合并 —— 内存峰值大幅降低 |
 | 🎨 **全新图标** | Streamline「语音转文字」（麦克风→A）彩色图标，由 SVG 生成（`assets/make_icon.py`） |
@@ -102,7 +102,7 @@
 ### CRISPASR（GPU）— 主力核心
 
 以 [CrispASR](https://github.com/CrispStrobe/CrispASR)（whisper.cpp 家族的多后端 runtime，ggml C++）
-加速推理，本版使用 **CrispASR v0.8.33** 核心。
+加速推理。
 
 | 模型 | 用途 |
 |------|------|

@@ -311,15 +311,60 @@ def download_1p7b(model_dir: Path, progress_cb=None):
 # ══════════════════════════════════════════════════════════════════════
 
 # ── CrispASR 核心：多加速版本（Vulkan / CUDA / CPU）─────────────────────
-# v0.8.33（2026-09 release）。GitHub 来源不套用 HF 镜像。
+# 不再固定版本：下载时向 GitHub API 查询最新 release（结果缓存于内存，
+# 进程生命周期内只查一次），失败或离线时回退到 _CRISPASR_FALLBACK_VERSION。
+# 资产命名跨版本一致（crispasr-windows-x86_64-<variant>.zip），故只需替换
+# tag 段即可。GitHub 来源不套用 HF 镜像。
 #
 # Windows 官方只出 Vulkan / CUDA / CPU 三条路——**没有** HIP(ROCm) 也没有 SYCL，
 # 所以 AMD 与 Intel 显卡的最佳解就是 Vulkan；只有 NVIDIA 才多一条 CUDA 可选。
 # CUDA 包含 runtime DLL（cudart/cublas/cublasLt）故体积极大，是否值得换那点速度
 # 由使用者自己在「推理加速版本」决定，我们只负责推荐。
-_CRISPASR_VERSION  = "0.8.33"
-_CRISPASR_REL_BASE = ("https://github.com/CrispStrobe/CrispASR/releases/"
-                      f"download/v{_CRISPASR_VERSION}")
+_CRISPASR_FALLBACK_VERSION = "0.8.33"      # API 不可达时的保底版本
+_CRISPASR_REPO_API = ("https://api.github.com/repos/CrispStrobe/CrispASR/"
+                      "releases/latest")
+_crispasr_ver_cache: str | None = None     # 进程级缓存；None＝尚未解析
+_CRISPASR_API_TIMEOUT = 10                 # 秒；启动页查询不能久等
+
+
+def crispasr_version() -> str:
+    """当前应下载的 CrispASR 版本号（不带 v 前缀）。
+
+    优先取 GitHub 最新 release 的 tag（v0.8.34 → 0.8.34）；网络失败／超时／
+    响应异常时回退 _CRISPASR_FALLBACK_VERSION。结果缓存，进程内只查一次
+    （GPU 页／自检页／下载会重复调用，不能每次都打 API）。
+    """
+    global _crispasr_ver_cache
+    if _crispasr_ver_cache is not None:
+        return _crispasr_ver_cache
+    ver = _CRISPASR_FALLBACK_VERSION
+    try:
+        import json as _json
+        req = urllib.request.Request(
+            _CRISPASR_REPO_API, headers={"User-Agent": _UA, "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=_CRISPASR_API_TIMEOUT,
+                                    context=_ssl_ctx()) as resp:
+            tag = (_json.loads(resp.read().decode("utf-8")).get("tag_name") or "").strip()
+        if tag.lower().startswith("v") and tag[1:].replace(".", "").isdigit():
+            ver = tag[1:]
+    except Exception:
+        pass                                # 离线／限流 → 保底版本
+    _crispasr_ver_cache = ver
+    return ver
+
+
+def _crispasr_rel_base() -> str:
+    """当前版本的 release 资产基 URL（…/releases/download/vX.Y.Z）。"""
+    return ("https://github.com/CrispStrobe/CrispASR/releases/"
+            f"download/v{crispasr_version()}")
+
+
+def __getattr__(name: str):
+    """模块级 __getattr__：旧调用端 `from downloader import _CRISPASR_VERSION`
+    改走动态版本解析（PEP 562）。保留旧名字以免逐处改动调用端。"""
+    if name == "_CRISPASR_VERSION":
+        return crispasr_version()
+    raise AttributeError(name)
 
 # variant → 中继数据。gpu_backend 直接喂给 crispasr.exe 的 `--gpu-backend`
 # （None＝不给 GPU 后端、改挂 `-ng` 纯 CPU 推理）。
@@ -640,7 +685,7 @@ def _write_crispasr_marker(crispasr_dir: Path, variant: str):
     import json as _json
     try:
         (Path(crispasr_dir) / _CRISPASR_MARKER).write_text(
-            _json.dumps({"version": _CRISPASR_VERSION, "variant": variant},
+            _json.dumps({"version": crispasr_version(), "variant": variant},
                         ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -659,7 +704,7 @@ def quick_check_crispasr(crispasr_dir: Path, variant: str | None = None) -> bool
     if not exists or variant is None:
         return exists
     info = installed_crispasr_info(crispasr_dir)
-    return info["version"] == _CRISPASR_VERSION and info["variant"] == variant
+    return info["version"] == crispasr_version() and info["variant"] == variant
 
 
 def download_crispasr_core(crispasr_dir: Path, progress_cb=None,
@@ -679,7 +724,8 @@ def download_crispasr_core(crispasr_dir: Path, progress_cb=None,
 
     variant = variant if variant in _CRISPASR_VARIANTS else _CRISPASR_DEFAULT_VARIANT
     meta    = _CRISPASR_VARIANTS[variant]
-    url     = f"{_CRISPASR_REL_BASE}/{meta['zip']}"
+    version = crispasr_version()           # 下载时才解析最新版本（含缓存）
+    url     = f"{_crispasr_rel_base()}/{meta['zip']}"
 
     crispasr_dir = Path(crispasr_dir)
     crispasr_dir.mkdir(parents=True, exist_ok=True)
@@ -720,7 +766,7 @@ def download_crispasr_core(crispasr_dir: Path, progress_cb=None,
         raise RuntimeError("CrispASR 核心解压后仍找不到 crispasr.exe")
     _write_crispasr_marker(crispasr_dir, variant)
     if progress_cb:
-        progress_cb(1.0, f"CrispASR {_CRISPASR_VERSION}（{meta['label']}）就绪")
+        progress_cb(1.0, f"CrispASR {version}（{meta['label']}）就绪")
 
 
 # ── ffmpeg（按需下载，不随安装包附带）──────────────────────────────────
