@@ -228,3 +228,8 @@ build_webview.bat              # 产出 dist2\STTMiniTool\STTMiniTool.exe
 本分支基于 [dseditor/QwenASRMiniTool](https://github.com/dseditor/QwenASRMiniTool)
 （MIT 授权）修改而成，原项目的设计与实现是本分支的基础。本项目代码继续以 **MIT** 授权释出。
 模型权重与第三方预编译二进制依各自来源的授权条款。
+
+---
+
+## 相关链接
+[Linux.do](https://linux.do/): 连接开发者与 AI 爱好者的社区。
