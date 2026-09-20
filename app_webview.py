@@ -26,6 +26,54 @@ from webview_server import WebViewServer
 
 APP_NAME = "语音识别小工具"
 WIN_W, WIN_H = 1180, 820
+MIN_W, MIN_H = 960, 680
+
+
+# ════════════════════════════════════════════════════════
+# 屏幕适配：启动时按工作区收敛窗口尺寸，任何一边不超出屏幕
+# ════════════════════════════════════════════════════════
+#   pywebview（winforms）稍后自己 SetProcessDPIAware，并把 create_window
+#   的 width/height/x/y 当「逻辑像素（96-DPI）」乘 scale 转物理像素。本模块
+#   在 webview.start() 之前查询时进程尚未 DPI 感知 → SystemParametersInfo
+#   返回同一套 96-DPI 虚拟化值，单位与 pywebview 一致，可直接用于收敛尺寸。
+#   工作区用 SPI_GETWORKAREA 取（主屏去掉任务栏后的矩形，任务栏靠边／
+#   自动隐藏都正确；SM_CYFULLSCREEN 在自动隐藏时不扣任务栏，不可用）。
+_SPI_GETWORKAREA = 0x0030
+_BOTTOM_MARGIN = 8               # 底边安全边距（逻辑 px）：DPI 缩放取整可能
+                                 # 让物理底边比工作区低 1~2px，压进任务栏
+def _workarea_logical() -> tuple[int, int]:
+    """主屏工作区（任务栏以外的矩形），逻辑像素；非 Windows／失败回 (0,0)。"""
+    if sys.platform != "win32":
+        return (0, 0)
+    try:
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        rect = wintypes.RECT()
+        if not u.SystemParametersInfoW(_SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            return (0, 0)
+        return (rect.right - rect.left,
+                max(0, (rect.bottom - rect.top) - _BOTTOM_MARGIN))
+    except Exception:
+        return (0, 0)
+
+
+def fit_window_to_screen(w: int, h: int, min_w: int, min_h: int):
+    """按工作区收敛窗口与最小尺寸，并给出工作区内居中的位置。
+
+    回 (x, y, w, h, min_w, min_h)。大屏尺寸不变、仅居中；小屏按工作区截断，
+    最小尺寸同步夹紧（否则 WinForms 的 MinimumSize 大于屏幕时窗口仍会被撑
+    出边缘）。位置必须显式给出：pywebview 默认 CenterScreen 以整屏（含任务
+    栏空间）居中，高度贴满工作区时底边会压到任务栏之下。
+    """
+    wa_w, wa_h = _workarea_logical()
+    if wa_w > 0 and wa_h > 0:
+        w, h = min(w, wa_w), min(h, wa_h)
+        min_w, min_h = min(min_w, w), min(min_h, h)
+        x = max(0, (wa_w - w) // 2)
+        y = max(0, (wa_h - h) // 2)
+    else:
+        x = y = None                  # 查询失败 → 交给 pywebview 默认居中
+    return x, y, w, h, min_w, min_h
 
 
 # ════════════════════════════════════════════════════════
@@ -49,6 +97,7 @@ _COLOR_BLACK = 0x00000000        # COLORREF：黑字
 _COLOR_DARK_BG = 0x0026201E      # COLORREF 0x00BBGGRR ← #1E2026（深色面板底，与 CSS 一致）
 
 _initial_theme = "light"         # main() 启动时由设置填入，供窗口装饰 worker 取用初始深浅
+_BACKEND_REF = [None]            # main() 填入 WebBackend，closing 处理查任务状态用
 
 
 def _os_dark() -> bool:
@@ -259,6 +308,18 @@ def webview2_available() -> bool:
 # ════════════════════════════════════════════════════════
 # 主要：原生 WebView2 窗口（pywebview，只加载网址、无 js_api）
 # ════════════════════════════════════════════════════════
+def _confirm_quit_with_task(label: str) -> bool:
+    """有任务进行中时弹原生确认框。回 True=用户确认退出（放弃任务）。"""
+    if sys.platform != "win32":
+        return True
+    import ctypes as _ct
+    MB_OKCANCEL, MB_ICONWARNING = 0x1, 0x30
+    msg = (f"{label}尚未完成。\n\n现在退出将中断该任务，未保存的识别结果会丢失。"
+           "\n确定要退出吗？")
+    r = _ct.windll.user32.MessageBoxW(0, msg, APP_NAME, MB_OKCANCEL | MB_ICONWARNING)
+    return r == 1        # IDOK=1
+
+
 def run_native_window(url: str) -> bool:
     """以原生 WebView2 窗口加载 url，阻塞至关窗回 True；不可用/失败回 False。"""
     try:
@@ -273,10 +334,27 @@ def run_native_window(url: str) -> bool:
             webview.settings['ALLOW_DOWNLOADS'] = True
         except Exception:
             pass
-        webview.create_window(
+        x, y, w, h, mn_w, mn_h = fit_window_to_screen(WIN_W, WIN_H, MIN_W, MIN_H)
+        window = webview.create_window(
             APP_NAME, url=url,
-            width=WIN_W, height=WIN_H, min_size=(960, 680),
+            x=x, y=y, width=w, height=h, min_size=(mn_w, mn_h),
         )
+
+        # 关窗拦截：closing 处理函数回 False → pywebview 取消本次关闭
+        # （winforms.on_closing 同步执行，弹原生 MessageBox 安全）。
+        def _on_closing():
+            backend = _BACKEND_REF[0]
+            if backend is None or not backend.has_running_tasks():
+                return True                       # 无任务 → 直接关
+            if not _confirm_quit_with_task(backend.running_task_label()):
+                return False                      # 用户取消 → 留在程序
+            try:
+                backend.cancel()                  # 确认退出 → 通知转录停止
+            except Exception:
+                pass
+            return True
+
+        window.events.closing += _on_closing
         _decorate_window_async()   # 窗口显示后背景套用白底黑字标题栏 + 程序图标
         webview.start()            # 阻塞至窗口关闭（在主线程）
         return True
@@ -308,10 +386,11 @@ def _profile_dir() -> str:
 def open_edge_app(url: str) -> subprocess.Popen | None:
     edge = _find_edge()
     if edge:
+        _, _, w, h, _, _ = fit_window_to_screen(WIN_W, WIN_H, MIN_W, MIN_H)
         args = [
             edge, f"--app={url}", "--inprivate",
             f"--user-data-dir={_profile_dir()}",
-            f"--window-size={WIN_W},{WIN_H}",
+            f"--window-size={w},{h}",
             "--no-first-run", "--no-default-browser-check", "--disable-sync",
             "--disable-background-networking",
             "--disable-features=msImplicitSignin,msEdgeSyncEnabled,msEdgeWelcomePage,EdgeFollowEnabled",
@@ -366,6 +445,7 @@ def main():
 
     srv = WebViewServer(host="127.0.0.1", port=0)   # 随机空闲端口，只绑回环
     srv.start()
+    _BACKEND_REF[0] = srv.backend
     # 窗口外观：读持久化外观偏好决定初始标题栏深浅；注册回调，让 UI 切换主题时
     # 窗口标题栏实时跟着深/浅。
     global _initial_theme
@@ -389,10 +469,13 @@ def main():
 
     # 只有在系统具备 WebView2 Runtime 时才试原生窗口（否则会卡在空白窗，
     # 见 webview2_available 注释）；缺则直接走 Edge --app，不需 WebView2/.NET。
+    # 原生窗口 URL 加 ?native=1 → 前端跳过 beforeunload 兜底（关闭确认由
+    # pywebview closing 的原生 MessageBox 负责，避免二次弹窗）。
     has_wv2 = webview2_available()
     if not has_wv2:
         print(f"[{APP_NAME}] 未检测到 WebView2 Runtime，改用 Edge --app 窗口。")
-    native_ok = has_wv2 and run_native_window(url)
+    native_url = url + ("&" if "?" in url else "?") + "native=1"
+    native_ok = has_wv2 and run_native_window(native_url)
     try:
         if not native_ok:                           # fallback：Edge --app 无痕 → 默认浏览器
             proc = open_edge_app(url)

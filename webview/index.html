@@ -136,7 +136,7 @@
       <section class="view" data-view="record">
         <div class="controls">
           <span style="font-size:13px;color:var(--ink-2);min-width:48px" data-i18n="record.mic">麦克风</span>
-          <select class="select" id="rec-mic" style="min-width:240px" title="录音输入设备"><option value="">默认麦克风</option></select>
+          <select class="select" id="rec-mic" style="min-width:240px;max-width:100%;flex:1 1 240px" title="录音输入设备"><option value="">默认麦克风</option></select>
           <button class="btn btn-ghost btn-sm" id="rec-mic-refresh" data-i18n="record.refresh">刷新</button>
           <span class="chip chip-muted" id="rec-perm" hidden></span>
           <div class="sp"></div>
@@ -197,7 +197,7 @@
         <div class="radio-cards" id="core-cards"></div>
         <div class="model-pick" style="display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap">
           <span style="font-size:13px;color:var(--ink-2);min-width:36px" data-i18n="model.model">模型</span>
-          <select class="select" id="model-select" style="min-width:250px"></select>
+          <select class="select" id="model-select" style="min-width:250px;max-width:100%"></select>
           <span class="chip chip-muted" id="model-arch"></span>
         </div>
         <div id="model-note" class="banner banner-warn" hidden style="margin-top:10px"></div>
@@ -248,11 +248,11 @@
           <div class="row"><div class="label"><div class="t" data-i18n="set.chunk">每段最长秒数（字级对齐）</div><div class="d" data-i18n="set.chunkDesc">调短可减少长段歌词／语音“段尾字级逐渐跑掉、换段才归位”的漂移。实际上限依模型自动夹紧（0.6B 30s、1.7B 10s）；CrispASR 走自身窗口，不受此设置影响。</div></div>
             <input type="range" class="slider" id="set-chunk" min="5" max="30" step="1" value="30"><span class="slider-val" id="set-chunk-val">30s</span></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.modelDir">模型下载位置</div><div class="d" data-i18n="set.modelDirDesc">Qwen / Whisper 模型的存储目录；留空＝程序目录下的 ov_models（重启后生效）</div></div>
-            <div class="with-browse"><input class="input mono" id="set-model-dir" placeholder="（留空＝默认位置）" style="width:260px"><button class="btn btn-ghost btn-sm" id="btn-model-dir-browse">浏览…</button></div></div>
+            <div class="with-browse"><input class="input mono" id="set-model-dir" placeholder="（留空＝默认位置）" style="width:260px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-model-dir-browse">浏览…</button></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.mirror">HuggingFace 镜像站</div><div class="d" data-i18n="set.mirrorDesc">下载模型较慢时可改用镜像</div></div>
-            <input class="input mono" id="set-mirror" placeholder="hf-mirror.com" style="width:200px"></div>
+            <input class="input mono" id="set-mirror" placeholder="hf-mirror.com" style="width:200px;max-width:100%"></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.ffmpeg">FFmpeg 路径</div><div class="d" data-i18n="set.ffmpegDesc">处理视频音轨所需（留空则需要时自动下载）</div></div>
-            <div class="with-browse"><input class="input mono" id="set-ffmpeg" placeholder="（留空＝自动检测／需要时下载）" style="width:240px"><button class="btn btn-ghost btn-sm" id="btn-ffmpeg-browse">浏览…</button><span class="chip chip-muted" id="ff-detected" hidden>已检测</span></div></div>
+            <div class="with-browse"><input class="input mono" id="set-ffmpeg" placeholder="（留空＝自动检测／需要时下载）" style="width:240px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-ffmpeg-browse">浏览…</button><span class="chip chip-muted" id="ff-detected" hidden>已检测</span></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.theme">外观主题</div></div>
             <div class="seg" id="set-theme"><button class="on" data-v="light" data-i18n="set.themeLight">浅色</button><button data-v="dark" data-i18n="set.themeDark">深色</button><button data-v="system" data-i18n="set.themeSystem">跟随系统</button></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.lang">界面语言</div></div>

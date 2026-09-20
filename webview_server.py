@@ -251,6 +251,12 @@ class WebViewServer:
                         return self._transcribe()
                     if path == "/api/cancel":
                         return self._json({"ok": server.backend.cancel()})
+                    if path == "/api/record-state":   # 录音开始/结束 → 后端同步（关窗确认用）
+                        body = self._read_json_body()
+                        server.backend.set_recording(bool(body.get("on")))
+                        return self._json({"ok": True})
+                    if path == "/api/shutdown":       # 用户确认关闭 → 立即结束进程
+                        return self._shutdown()
                     if path == "/api/open-output":
                         return self._json({"ok": server.backend.open_output_dir()})
                     if path == "/api/check-update":
@@ -258,6 +264,26 @@ class WebViewServer:
                     return self._err(404, "unknown api")
                 except Exception as e:
                     return self._err(500, str(e))
+
+            # ── 用户已确认关闭：回个 OK 让前端不等响应失败也无所谓，
+            #    随后停止 server、硬退出进程（app_webview.main 的 finally 兜底）。
+            def _shutdown(self):
+                import threading as _t
+
+                def _kill():
+                    try:
+                        self._json({"ok": True})
+                    except Exception:
+                        pass
+                    try:
+                        server.stop()
+                    except Exception:
+                        pass
+                    import os
+                    os._exit(0)
+
+                _t.Thread(target=_kill, daemon=True).start()
+                return None
 
             # ── 静态档 ────────────────────────────────────────
             def _static(self, path):

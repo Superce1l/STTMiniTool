@@ -116,6 +116,16 @@
       if (MODE === "web") { try { await apiPost("/api/cancel", {}); } catch {} return true; }
       MOCK.cancelled = true; return true;
     },
+    // 录音开始/结束 → 同步给后端（关窗确认依据之一）；失败不影响录音
+    async recordState(on) {
+      if (MODE === "web") { try { await apiPost("/api/record-state", { on: !!on }); } catch {} }
+      return true;
+    },
+    // 用户已确认关闭 → 请求后端结束进程（浏览器/Edge 模式下关窗不经过 pywebview）
+    async shutdown() {
+      if (MODE === "web") { try { await apiPost("/api/shutdown", {}); } catch {} }
+      return true;
+    },
 
     async openOutputDir() {
       if (MODE === "web") { try { await apiPost("/api/open-output", {}); } catch {} return true; }

@@ -1038,6 +1038,7 @@
     REC.analyser = REC.ctx.createAnalyser(); REC.analyser.fftSize = 1024;
     src.connect(REC.analyser);
     REC.on = true; REC.sec = 0;
+    API.recordState(true);          // 同步后端：录音中 → 关窗需确认
     $("#rec-btn").classList.add("recording");
     const lw = $("#rec-live-wave"); lw.hidden = false;
     lw.innerHTML = Array.from({ length: 28 }, () => `<div class="b" style="height:4px"></div>`).join("");
@@ -1094,6 +1095,7 @@
   }
   function stopRec() {
     REC.on = false; $("#rec-btn").classList.remove("recording");
+    API.recordState(false);         // 同步后端：录音已结束
     if (REC.raf) cancelAnimationFrame(REC.raf);
     clearInterval(REC.timer);
     $("#rec-live-wave").hidden = true;
@@ -1182,6 +1184,16 @@
   }
 
   // ── 启动 ────────────────────────────────────────────────
+  // 关闭兜底（Edge --app / 浏览器访问本地端点时无原生确认框）：
+  // 有任务进行中 → 触发浏览器原生「确定要离开吗」提示。
+  // 桌面原生窗口（URL 带 ?native=1）的关闭确认由 app_webview 的 closing
+  // 事件处理（原生 MessageBox），这里不注册，避免确认后二次弹窗。
+  if (!new URLSearchParams(location.search).has("native")) {
+    window.addEventListener("beforeunload", (e) => {
+      const busy = running || REC.on || _modelLoading;
+      if (busy) { e.preventDefault(); e.returnValue = ""; }
+    });
+  }
   // 加载完成 → 更新就绪灯 + 语言清单（依引擎）；若为「就地下载并加载」流程 → 收尾
   API.on("status", async (s) => {
     refreshStatus(); loadLanguages();

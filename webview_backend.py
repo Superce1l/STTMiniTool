@@ -321,6 +321,8 @@ class WebBackend:
         self._load_err = None
         self._loading = False
         self._cancel = False
+        self._transcribing = False       # 单文件识别进行中（关闭确认用）
+        self._recording = False          # 前端录音进行中（由 /api/record-state 同步）
         self._on_event = on_event
         self._theme_cb = None            # 主题变更回调（app_webview 用来同步窗口标题栏深浅）
         self._lock = threading.Lock()
@@ -669,9 +671,10 @@ class WebBackend:
         if not getattr(self.engine, "ready", False):
             raise RuntimeError("模型尚未加载完成，请稍候再试。")
         path = opts.get("path")
-        if not path or not Path(path).exists():
+        if not Path(path).exists():
             raise RuntimeError("找不到音频文件。")
         self._cancel = False
+        self._transcribing = True
 
         def _cb(i, total, msg):
             if progress_cb:
@@ -762,6 +765,7 @@ class WebBackend:
                         out_format="srt",
                     )
         finally:
+            self._transcribing = False
             if tmp_extra:
                 try:
                     Path(tmp_extra).unlink(missing_ok=True)
@@ -973,6 +977,27 @@ class WebBackend:
     def cancel(self):
         self._cancel = True
         return True
+
+    # ── 关闭流程：任务状态查询／录音状态同步 ─────────────────
+    #   关窗时 app_webview 的 closing 处理先查 has_running_tasks()：
+    #   有任务 → 弹原生确认框；确认放弃 → 前端先调 /api/cancel 再走 shutdown。
+    def has_running_tasks(self) -> bool:
+        """是否有不可中断丢失的工作进行中（转录／模型下载加载／录音）。"""
+        return bool(self._transcribing or self._loading or self._recording)
+
+    def running_task_label(self) -> str:
+        """当前进行中任务的可读描述（弹窗正文用）；无任务回空串。"""
+        if self._transcribing:
+            return "正在识别音频"
+        if self._loading:
+            return "正在下载／加载模型"
+        if self._recording:
+            return "正在录音"
+        return ""
+
+    def set_recording(self, on: bool):
+        """前端录音开始／结束 → 同步到后端（关窗确认依据之一）。"""
+        self._recording = bool(on)
 
     def open_output_dir(self) -> bool:
         import os

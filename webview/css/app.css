@@ -184,7 +184,9 @@ button { font-family: inherit; }
 .topbar .ctx { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 10px; }
 
 .view-host { flex: 1; overflow-y: auto; }
-.view { display: none; padding: 26px 28px 40px; max-width: 1080px; }
+/* 内容随界面宽度自适应：窄窗口撑满、宽窗口居中封顶 */
+.view { display: none; width: 100%; max-width: 1080px; margin: 0 auto;
+  padding: clamp(16px, 2.4vw, 26px) clamp(16px, 2.4vw, 28px) 40px; }
 .view.active { display: block; }
 
 /* 区段标题 */
@@ -279,15 +281,16 @@ button { font-family: inherit; }
 .chip-muted { background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
 .chip-live { background: var(--live-soft); color: var(--live); }
 
-/* 行：左标签右控制 */
+/* 行：左标签右控制；窄窗口时标签与控制换行堆叠 */
 .row {
   display: flex; align-items: center; gap: 14px;
   padding: 13px 2px; border-bottom: 1px solid var(--line);
 }
 .row:last-child { border-bottom: 0; }
-.row .label { flex: 1; }
+.row .label { flex: 1; min-width: 200px; }
 .row .label .t { font-size: 13.5px; font-weight: 500; color: var(--ink); }
 .row .label .d { font-size: 12px; color: var(--muted); margin-top: 1px; }
+.row > .select, .row > .seg, .row > .with-browse, .row > .slider, .row > .slider-val { flex: 0 0 auto; }
 
 /* 控制列（按钮＋开关水平排）*/
 .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 14px; margin-top: 14px; }
@@ -590,7 +593,7 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
    ============================================================ */
 .settings .card { padding: 6px 18px; }
 .slider {
-  -webkit-appearance: none; appearance: none; width: 180px; height: 5px;
+  -webkit-appearance: none; appearance: none; width: 180px; min-width: 120px; height: 5px;
   border-radius: 4px; background: var(--line-strong); cursor: pointer;
 }
 .slider::-webkit-slider-thumb {
@@ -598,8 +601,8 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
   background: var(--accent); box-shadow: var(--shadow-sm); cursor: pointer;
 }
 .slider-val { font-family: var(--font-mono); font-size: 12px; color: var(--muted); min-width: 42px; text-align: right; }
-.with-browse { display: flex; gap: 8px; align-items: center; }
-.with-browse .input { width: 240px; }
+.with-browse { display: flex; gap: 8px; align-items: center; max-width: 100%; }
+.with-browse .input { width: 240px; max-width: 100%; flex: 1 1 auto; min-width: 120px; }
 
 /* ============================================================
    卡拉OK舞台（逐字高亮放大跳动）
@@ -638,7 +641,26 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
    ============================================================ */
 @media (max-width: 1100px) {
   .ep-grid { grid-template-columns: 1fr; }
-  .with-browse .input { width: 170px; }
+}
+/* 中窄窗口：路径输入、进度条收紧，双栏自检并排改单栏 */
+@media (max-width: 900px) {
+  .health-panel { grid-template-columns: 1fr; }
+  .b-row .pbar { width: 90px; flex: 0 0 90px; }
+}
+/* 更窄（侧栏版面挤压主区，或手机竖屏访问本地服务）：整体换行堆叠 */
+@media (max-width: 720px) {
+  .row, .with-browse { flex-wrap: wrap; }
+  .row > .select, .row > .seg, .row > .with-browse, .row > .slider, .row > .slider-val { flex: 0 1 auto; }
+  .with-browse .input { flex: 1 1 140px; }
+  .controls { gap: 10px; }
+  .b-row { flex-wrap: wrap; }
+  .b-row .pbar { flex: 1 1 100%; width: auto; order: 3; }
+  .ep-grid { grid-template-columns: 1fr; }
+  .qr-row { flex-direction: column; align-items: stretch; }
+  .qr { margin: 0 auto; }
+  .topbar { padding: 0 16px; }
+  .sub-card { gap: 10px; padding: 10px 12px; }
+  .sub-card .tc { min-width: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
