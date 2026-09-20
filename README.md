@@ -1,12 +1,16 @@
 # 语音识别小工具（QwenASR WebView 简体版）
 
 本地语音识别字幕生成工具 —— **数据不离开你的电脑**。以 Qwen3-ASR / OpenAI Whisper 为核心，
-音频、视频、麦克风录音都能转成 SRT 字幕。全新 **WebView 界面**（浅色 teal 风格、原生 WebView2 窗口），
-支持纯 CPU（OpenVINO INT8）与 GPU 加速（CrispASR：CUDA / Vulkan，NVIDIA / AMD / Intel 通吃）。
+音频、视频、麦克风录音都能转成 SRT 字幕。**WebView 界面**（浅色·图标同款蓝色、原生 WebView2 窗口），
+支持纯 CPU（OpenVINO INT8）与 GPU 加速（CrispASR：CUDA / Vulkan，NVIDIA / AMD / Intel）。
 
-> 目标很单纯：让你的同事、你的同学，都能免费、离线、在自己的电脑上做语音识别。
+> **上游项目**：本仓库是 [dseditor/QwenASRMiniTool](https://github.com/dseditor/QwenASRMiniTool)
+> 的本地改进分支（fork 起点 v2.0.0，现行版本 2.1.0）。上游的繁体中文界面、批量识别、
+> 端点服务、TEA-ASR / Breeze 模型等内容在本分支中已按需移除或替换，详见下方变更表。
+> 界面中的「检查更新」链接暂未指向新仓库，待本仓库发布地址确定后配置。
 
-- 界面标题：**语音识别小工具**（声波麦克风图标）
+
+- 界面标题：**语音识别小工具**
 - 版本：**2.1.0**
 - 界面语言：**简体中文**（可切 English），识别输出默认简体
 
@@ -22,7 +26,7 @@
 | ⚡ **核心升级** | CrispASR v0.8.32 → **v0.8.33**；OpenVINO 依赖 → **2026.4**；chatllm 向下兼容层对齐 **v24** |
 | 🟢 **CUDA 优先** | NVIDIA 显卡用户默认推荐 **CUDA**（依驱动版本自动选 CUDA 13 / CUDA 12，自带 runtime 免装 Toolkit）；AMD / Intel 仍走 Vulkan |
 | ✂️ **长音频切片转录** | 超过 2 小时的音频自动用 FFmpeg 按 30 分钟切片（相邻片 15 秒重叠防切点截字），逐片转录后时间轴平移合并 —— 内存峰值大幅降低 |
-| 🎨 **全新图标** | teal 渐变「声波麦克风」图标，程序化生成（`assets/make_icon.py`） |
+| 🎨 **全新图标** | Streamline「语音转文字」（麦克风→A）彩色图标，由 SVG 生成（`assets/make_icon.py`） |
 | 🐛 **Bug 修复** | 语言下拉 title 误绑说话者分离、模型页 500（误删 `_persist_setting`）、默认界面语言等 |
 
 ---
@@ -161,7 +165,7 @@ cli_mode.py             # 无头 CLI（transcribe / apply / status / profiles）
 proc_guard.py           # Windows Job Object：主进程退出连带终止子进程
 version.py              # 版本单一事实来源
 build_webview.bat       # PyInstaller onefile 打包（WebView EXE）
-assets/make_icon.py     # 图标生成（teal 声波麦克风）
+assets/make_icon.py     # 图标生成（SVG → PNG/ICO，语音转文字图标）
 ```
 
 > 旧 CustomTkinter 桌面版（app-gpu.py / model_tab.py / setting.py /
@@ -219,6 +223,8 @@ build_webview.bat              # 产出 dist2\QwenASR-WebView\QwenASR-WebView.ex
 
 ---
 
-## 授权
+## 授权与致谢
 
-本项目代码以 **MIT** 授权释出。模型权重与第三方预编译二进制依各自来源的授权条款。
+本分支基于 [dseditor/QwenASRMiniTool](https://github.com/dseditor/QwenASRMiniTool)
+（MIT 授权）修改而成，原项目的设计与实现是本分支的基础。本项目代码继续以 **MIT** 授权释出。
+模型权重与第三方预编译二进制依各自来源的授权条款。

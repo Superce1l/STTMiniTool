@@ -129,6 +129,7 @@ SRT_DIR.mkdir(exist_ok=True)
 # ── 常数 ────────# 常数
 SAMPLE_RATE   = 16000
 VAD_CHUNK     = 512
+VAD_CONTEXT_SAMPLES = 64   # silero-vad v5（master onnx）：每窗需附带上窗末 64 样本 context
 VAD_THRESHOLD = 0.5   # 可由设置页调整（降低可减少掴字）
 MAX_GROUP_SEC = 20
 MIN_SUB_SEC   = 0.6
@@ -148,21 +149,43 @@ ALIGNER_MODEL_NAME = "Qwen3-ForcedAligner-0.6B"
 # 共享工具函数
 # ══════════════════════════════════════════════════════
 
+def _vad_is_v5(vad_sess) -> bool:
+    """判断 VAD 会话是 v5 接口（state/stateN）还是 v4 接口（h/c）。
+
+    上游仓库不随包附带 silero onnx（.gitignore 排除），用户环境里既可能是
+    v4 老文件也可能是 v5 新文件 —— 两种输入名不同，按会话实际输入自动适配。
+    """
+    names = {i.name for i in vad_sess.get_inputs()}
+    return "state" in names and "h" not in names
+
+
 def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_GROUP_SEC,
                           stats: dict | None = None) -> list[tuple[float, float, np.ndarray]]:
     """Silero VAD 分段，返回 [(start_s, end_s, chunk), ...]
 
     可传入 stats dict，函数会填入 n_chunks / max_prob / mean_prob / threshold /
     n_segments，供上层在「未检测到人声」时产生明确诊断（见 format_vad_diag）。
+    兼容 v4（输入 h/c/sr，状态 [2,1,64]）与 v5（输入 state/sr，状态 [2,N,128]）。
     """
+    v5 = _vad_is_v5(vad_sess)
     h  = np.zeros((2, 1, 64), dtype=np.float32)
     c  = np.zeros((2, 1, 64), dtype=np.float32)
-    sr = np.array(SAMPLE_RATE, dtype=np.int64)
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    context = np.zeros(VAD_CONTEXT_SAMPLES, dtype=np.float32)
+    sr = SAMPLE_RATE          # v5 的 sr 需列表可迭代；v4 用 np 标量
     n  = len(audio) // VAD_CHUNK
     probs = []
     for i in range(n):
         chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
-        out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
+        if v5:
+            # silero-vad master（v5）是「外部 context」版：每窗输入 =
+            # [上一窗末 64 样本] + [512 新样本]，共 576 样本。
+            x = np.concatenate([context, chunk[0]])[np.newaxis, :]
+            out, state = vad_sess.run(
+                None, {"input": x, "state": state, "sr": [sr]})
+            context = chunk[0][-VAD_CONTEXT_SAMPLES:]
+        else:
+            out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
         probs.append(float(out[0, 0]))
     if stats is not None:
         stats["n_chunks"]  = len(probs)

@@ -39,6 +39,7 @@ def _opencc_config() -> str:
 # ── 共享常数（与 app.py 保持同步）─────────────────────────────────────
 SAMPLE_RATE   = 16000
 VAD_CHUNK     = 512
+VAD_CONTEXT_SAMPLES = 64   # silero-vad v5（master onnx）：每窗需附带上窗末 64 样本 context
 VAD_THRESHOLD = 0.5
 MAX_GROUP_SEC = 20
 MAX_CHARS     = 20
@@ -531,14 +532,26 @@ class _DLLASRRunner:
 
 def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_GROUP_SEC,
                           stats: dict | None = None):
+    """Silero VAD 分段（兼容 v4 h/c 接口与 v5 state 接口，见 app.py 同名函数）。"""
+    v5 = "state" in {i.name for i in vad_sess.get_inputs()} and "h" not in {
+        i.name for i in vad_sess.get_inputs()}
     h  = np.zeros((2, 1, 64), dtype=np.float32)
     c  = np.zeros((2, 1, 64), dtype=np.float32)
-    sr = np.array(SAMPLE_RATE, dtype=np.int64)
+    state = np.zeros((2, 1, 128), dtype=np.float32)
+    context = np.zeros(VAD_CONTEXT_SAMPLES, dtype=np.float32)
+    sr = SAMPLE_RATE
     n  = len(audio) // VAD_CHUNK
     probs = []
     for i in range(n):
         chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
-        out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
+        if v5:
+            # v5（master onnx）外部 context 版：576 = 64 context + 512 新样本
+            x = np.concatenate([context, chunk[0]])[np.newaxis, :]
+            out, state = vad_sess.run(
+                None, {"input": x, "state": state, "sr": [sr]})
+            context = chunk[0][-VAD_CONTEXT_SAMPLES:]
+        else:
+            out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
         probs.append(float(out[0, 0]))
     if stats is not None:
         stats["n_chunks"]  = len(probs)

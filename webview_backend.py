@@ -458,6 +458,13 @@ class WebBackend:
             if not quick_check_1p7b(model_dir):
                 self._st("下载 1.7B 模型（约 4.3 GB）…")
                 download_1p7b(model_dir, progress_cb=self._dl_progress)
+        else:
+            # 0.6B：文件缺失时按需补齐（含 VAD onnx）。此前只靠开发环境手工放置，
+            # 干净机器上选 0.6B 会直接在 eng.load 崩溃（找不到 audio_encoder_model.xml）。
+            from downloader import quick_check, download_all
+            if not quick_check(model_dir):
+                self._st("下载 0.6B 模型（约 1.2 GB）…")
+                download_all(model_dir, progress_cb=self._dl_progress)
         eng = core.ASREngine1p7B() if use_17b else core.ASREngine()
         eng.load(device="CPU", model_dir=model_dir, cb=self._st, cpu_threads=cpu_threads)
         self.engine = eng
