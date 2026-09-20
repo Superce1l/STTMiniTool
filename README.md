@@ -1,4 +1,4 @@
-# 语音识别小工具（QwenASR WebView 简体版）
+# STTMiniTool（语音识别小工具）
 
 本地语音识别字幕生成工具 —— **数据不离开你的电脑**。以 Qwen3-ASR / OpenAI Whisper 为核心，
 音频、视频、麦克风录音都能转成 SRT 字幕。**WebView 界面**（浅色·图标同款蓝色、原生 WebView2 窗口），
@@ -7,7 +7,7 @@
 > **上游项目**：本仓库是 [dseditor/QwenASRMiniTool](https://github.com/dseditor/QwenASRMiniTool)
 > 的本地改进分支（fork 起点 v2.0.0，现行版本 2.1.0）。上游的繁体中文界面、批量识别、
 > 端点服务、TEA-ASR / Breeze 模型等内容在本分支中已按需移除或替换，详见下方变更表。
-> 界面中的「检查更新」链接暂未指向新仓库，待本仓库发布地址确定后配置。
+> 本仓库地址：https://github.com/Superce1l/STTMiniTool
 
 
 - 界面标题：**语音识别小工具**
@@ -128,14 +128,14 @@
 
 ## 命令行模式（给 Agent／脚本）
 
-`QwenASR-WebView.exe` **带子命令执行时是无头 CLI**：不开窗口、执行完即退出。
+`STTMiniTool.exe` **带子命令执行时是无头 CLI**：不开窗口、执行完即退出。
 不带子命令则照旧开图形界面。
 
 ```bash
-QwenASR-WebView.exe status --json                  # 核心／模型／加速版本状态
-QwenASR-WebView.exe profiles --json                # 可用模型（含硬件判断）
-QwenASR-WebView.exe transcribe audio.mp3 --json    # 转录 → 干净 JSON
-QwenASR-WebView.exe apply fixed.json --base work.json -o final.srt
+STTMiniTool.exe status --json                  # 核心／模型／加速版本状态
+STTMiniTool.exe profiles --json                # 可用模型（含硬件判断）
+STTMiniTool.exe transcribe audio.mp3 --json    # 转录 → 干净 JSON
+STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 ```
 
 常用选项：`-l Chinese`（指定语言）、`--profile zh|ja|whisper`（依用途换模型，
@@ -178,8 +178,8 @@ assets/make_icon.py     # 图标生成（SVG → PNG/ICO，语音转文字图标
 ### 源码执行
 
 ```bash
-git clone <本仓库>
-cd QwenASRMiniTool
+git clone https://github.com/Superce1l/STTMiniTool.git
+cd STTMiniTool
 python -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt
 python app_webview.py          # 启动 WebView 界面
@@ -188,10 +188,10 @@ python app_webview.py          # 启动 WebView 界面
 ### 打包 EXE
 
 ```bash
-build_webview.bat              # 产出 dist2\QwenASR-WebView\QwenASR-WebView.exe
+build_webview.bat              # 产出 dist2\STTMiniTool\STTMiniTool.exe
 ```
 
-> ⚠️ 安装路径请使用**全英文**（例如 `C:\QwenASR`），含中文字符可能无法正常运行。
+> ⚠️ 安装路径请使用**全英文**（例如 `C:\STTMiniTool`），含中文字符可能无法正常运行。
 
 ---
 

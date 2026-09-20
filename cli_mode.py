@@ -337,7 +337,7 @@ def cmd_profiles(args) -> int:
 # ══════════════════════════════════════════════════════════════════════
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="QwenASR", add_help=True,
+        prog="STTMiniTool", add_help=True,
         description="语音识别小工具 — 无头命令行模式（给 Agent／脚本使用）。"
                     "不带子命令执行则开启图形界面。")
     ap.add_argument("--json", action="store_true",

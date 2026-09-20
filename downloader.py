@@ -60,7 +60,7 @@ _HF_BASE_FALLBACK = f"https://huggingface.co/{_HF_REPO_FALLBACK}/resolve/main"
 _HF_REPO  = _HF_REPO_PRIMARY   # 兼容旧版引用
 _HF_BASE  = _HF_BASE_PRIMARY   # 兼容旧版引用
 _VAD_URL  = "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx"
-_UA       = "Mozilla/5.0 (compatible; QwenASR-downloader)"
+_UA       = "Mozilla/5.0 (compatible; STTMiniTool-downloader)"
 
 # ── HuggingFace 镜像站 ─────────────────────────────────────────────────
 # 中国大陆等地直连 huggingface.co 常逾时；可改走镜像（如 hf-mirror.com）。

@@ -136,7 +136,7 @@ def _find_app_hwnd() -> int:
 #   python 默认图标。pywebview 6.x 也没有可靠的 per-window 图标 API。故改用
 #   Win32 `WM_SETICON` 在窗口建立后把 icon.ico 套上去（标题栏小图 + 任务栏大图），
 #   并设置独立的 AppUserModelID，让任务栏不与 python.exe 共享同一颗按钮／图标。
-_APP_USER_MODEL_ID = "dseditor.QwenASR.VoiceTool"
+_APP_USER_MODEL_ID = "Superce1l.STTMiniTool"
 _WM_SETICON = 0x0080
 _ICON_SMALL, _ICON_BIG = 0, 1
 _IMAGE_ICON = 1

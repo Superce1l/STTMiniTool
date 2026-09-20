@@ -494,7 +494,7 @@ class WebBackend:
         self._st("下载 chatllm 模型（~2.3 GB）…")
         url = "https://huggingface.co/dseditor/Collection/resolve/main/qwen3-asr-1.7b.bin"
         model_path.parent.mkdir(parents=True, exist_ok=True)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; QwenASR)"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; STTMiniTool)"})
         with urllib.request.urlopen(req, context=_ssl_ctx()) as resp, \
                 open(str(model_path) + ".tmp", "wb") as out:
             total = int(resp.headers.get("Content-Length", 0))
@@ -1032,13 +1032,14 @@ class WebBackend:
         except Exception as e:
             return {"ok": False, "path": "", "error": str(e)}
 
-    # 「检查更新」目标链接：新仓库地址确定后填入（空 = 暂不跳转）
-    RELEASES_URL = ""
-
     def open_releases(self) -> dict:
-        """「检查更新」→ 以系统浏览器开启发行页；链接未配置时不跳转。"""
+        """「检查更新」→ 以系统浏览器开启 GitHub Releases 页。"""
         import webbrowser
-        url = self.RELEASES_URL
+        try:
+            import version
+            url = getattr(version, "GITHUB_RELEASES_PAGE", "")
+        except Exception:
+            url = ""
         if not url:
             return {"ok": False, "url": "", "error": "未配置更新链接"}
         try:

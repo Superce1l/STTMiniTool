@@ -33,15 +33,6 @@ WEBVIEW_VERSION = __version__
 #   修复：删除端点模块时误删 _persist_setting 导致基础模式页 500；语言下拉
 #         title 误绑「说话者分离」；uiLang 默认值改为简体中文。
 
-# 自动更新来源：GitHub repo（owner/name）
-# TODO: 迁移到新仓库后填入新地址；updater.py 已随旧版桌面版移除，
-#       这些常量目前仅作占位（webview_backend.RELEASES_URL 为空 = 不跳转）。
-GITHUB_REPO = ""   # 待新仓库确定后填入，如 "yourname/yourrepo"
-
-# GitHub Releases API（latest 端点，返回最新「非预发布」版本）
-GITHUB_API_LATEST = (f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-                     if GITHUB_REPO else "")
-
-# 发行页（供「前往下载页」按钮使用）
-GITHUB_RELEASES_PAGE = (f"https://github.com/{GITHUB_REPO}/releases/latest"
-                        if GITHUB_REPO else "")
+# 自动更新来源：GitHub repo（owner/name）+ 发行页
+GITHUB_REPO = "Superce1l/STTMiniTool"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
