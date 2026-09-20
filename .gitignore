@@ -117,3 +117,5 @@ UI.txt
 !Readme/*.png
 !Readme/webview/*.jpg
 !Readme/webview/*.png
+release_pkg/
+*.zip
