@@ -61,6 +61,12 @@ else:
 # Windows：隐藏子程序控制台窗口（避免识别时画面闪烁）
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _STARTUP_INFO: "subprocess.STARTUPINFO | None" = None
+
+# 实时/单段转录子进程超时：单段音频通常 <30s，crispasr 处理应在几分钟内完成。
+# 超时即认为挂死（Vulkan 初始化卡死等），杀进程并抛错，避免永久持有 self._lock。
+_RT_PROC_TIMEOUT_SECS = 600
+# 流式模式收尾宽限：正常退出等待上限（秒）；超时强杀。
+_PROC_SHUTDOWN_GRACE_SECS = 30
 if sys.platform == "win32":
     _STARTUP_INFO = subprocess.STARTUPINFO()
     _STARTUP_INFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -271,7 +277,7 @@ class CrispWhisperEngine:
         whisper native 时间轴。
 
         backend：crispasr 后端名（whisper / qwen3 / qwen3-1.7b …）。None 时依
-        模型文件名自动推断（Breeze→whisper、qwen3*.gguf→qwen3-1.7b）。
+        模型文件名自动推断（whisper GGML→whisper、qwen3*.gguf→qwen3-1.7b）。
 
         gpu_backend：crispasr.exe 的 `--gpu-backend`（vulkan / cuda）。传 None
         代表这份核心是 CPU 版或使用者选了纯 CPU 推理 → 改挂 `-ng`。调用端应
@@ -295,7 +301,7 @@ class CrispWhisperEngine:
         if not model_path.exists():
             raise FileNotFoundError(
                 f"找不到 Whisper 模型：{model_path}\n"
-                f"请放入 {_DEFAULT_MODEL_NAME}（Breeze-ASR-26 GGML）。"
+                f"请放入 {_DEFAULT_MODEL_NAME}（OpenAI Whisper Base GGML）。"
             )
         self._model_path = model_path
         self._device_id  = int(device_id)
@@ -421,8 +427,12 @@ class CrispWhisperEngine:
         crispasr 一次处理整档（内部切 N 个 slice），`-pp` 会输出
         「crispasr: progress = NN% (x/N slices)」。据此把单一阻塞子程序变成
         会动的进度条（granularity = slice 数，长档较细、短档较粗）。
-        stderr 并入 stdout 一起读；无 `-pp` 或解析不到时，行为等同旧版（只是
-        进度条不动）——故对 Breeze/实时模式皆安全。
+        stderr 并入 stdout 一起读；无 `-pp` 或解析不到时，行为等同旧版。
+
+        超时保护：Vulkan 初始化已知可能卡死（probe 路径为此用 10-15s 超时）。
+        转录本身可长达数十分钟，故超时按「无输出行间隔」计（_PROC_TIMEOUT_SECS
+        内没有任何新输出视为挂死）：超时杀掉子进程并抛 RuntimeError，
+        避免永久持有 self._lock 把整个引擎卡死。
         """
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -438,7 +448,16 @@ class CrispWhisperEngine:
                     # 上限 99：留「完成」给写档后的最终回报，避免 100% 却还在写字幕
                     progress_cb(min(99, p), 100, f"CrispASR 转录中… {p}%")
         finally:
-            proc.wait()
+            try:
+                proc.wait(timeout=_PROC_SHUTDOWN_GRACE_SECS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"crispasr.exe 异常退出（返回码 {proc.returncode}）。\n"
+                "请检查显存是否充足、加速版本是否与显卡匹配，"
+                "或改用 CPU 推理版本重试。")
         return proc.returncode
 
     # ══ 文件转录 → SRT（字级时间轴 → 共享分行器，与 Qwen 路径统一）════════
@@ -561,10 +580,16 @@ class CrispWhisperEngine:
             out_base = Path(td) / "seg_out"
             cmd = self._build_cmd(wav, out_base, language, word_level=False)
             with self._lock:
-                subprocess.run(
-                    cmd, capture_output=True, stdin=subprocess.DEVNULL,
-                    creationflags=_CREATE_NO_WINDOW, startupinfo=_STARTUP_INFO,
-                )
+                try:
+                    subprocess.run(
+                        cmd, capture_output=True, stdin=subprocess.DEVNULL,
+                        creationflags=_CREATE_NO_WINDOW, startupinfo=_STARTUP_INFO,
+                        timeout=_RT_PROC_TIMEOUT_SECS,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(
+                        f"crispasr.exe 实时转录超时（>{_RT_PROC_TIMEOUT_SECS}s），"
+                        "已终止子进程。请检查显卡驱动或改用 CPU 版本。")
             txt = out_base.with_suffix(".txt")
             text = txt.read_text(encoding="utf-8", errors="replace").strip() if txt.exists() else ""
         # 日语跳过繁化（同 process_file 理由）；中文/台语维持 s2twp/s2t。
@@ -665,9 +690,3 @@ def _parse_srt_words(srt_text: str, drop_punct: bool = False
     return items, "".join(raw_parts)
 
 
-def _write_srt_lines(out: Path, lines: list[tuple[float, float, str, str | None]]):
-    """[(start,end,text,spk), ...] → SRT 档（与 Qwen 路径相同格式）。"""
-    with open(out, "w", encoding="utf-8") as f:
-        for idx, (s, e, text, spk) in enumerate(lines, 1):
-            prefix = f"{spk}：" if spk else ""
-            f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{text}\n\n")

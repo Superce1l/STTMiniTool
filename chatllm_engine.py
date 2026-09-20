@@ -12,22 +12,21 @@ chatllm_engine.py — ChatLLM.cpp + Vulkan 推理后端
 from __future__ import annotations
 
 import ctypes
-import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 # ── 输出语言标志（由 app.py / app-gpu.py 切换时同步设置）──────────────
-# True = 直接输出模型原始简体；False = 经 OpenCC 转为繁体
-_output_simplified: bool = False
+# True = 直接输出模型原始简体；False = 经 OpenCC 转为繁体。
+# 本分支所有引擎固定简体输出（webview_backend._apply_output_flags 启动时钉为 True）。
+_output_simplified: bool = True
 
 # 繁体输出时是否启用「简繁词汇转换」：
 #   True  → OpenCC "s2twp"（含台湾惯用词）；False → "s2t"（仅字形）
@@ -633,7 +632,10 @@ def detect_degenerate_asr(text: str) -> str | None:
     # 2) 整段就是语言标记 'language xx'（exact，避免误判 'Language is power'）
     if re.fullmatch(r"language\s+[a-z]{2}", low):
         return "模型仅复诵语言标记，未产生转录内容"
-    if low.count("language ") >= 3:
+    # 2b) 反复复诵语言标记：要求短语占输出绝对主导（去空白后 <60 字符），
+    #     避免误杀「一段提到 language 三次以上的正常英文讲座」。
+    compact = re.sub(r"\s+", "", t)
+    if low.count("language ") >= 3 and len(compact) < 60:
         return "模型反复复诵语言标记（疑似推理退化）"
     # 3) 单一字符高度重复
     compact = re.sub(r"\s+", "", t)
@@ -873,7 +875,6 @@ class ChatLLMASREngine:
     # ── ForcedAligner 加载 ────────────────────────────────────────────
 
     # FA chatllm 模型文件名（与 ASR .bin 同文件夹）
-    FA_BIN_NAME = "qwen3-focedaligner-0.6b.bin"
 
     def _load_aligner(self, cb=None):
         """检测 chatllm 版 ForcedAligner .bin（委派共享 fa_aligner，无需 torch）。
@@ -930,7 +931,12 @@ class ChatLLMASREngine:
                 pos = 0
                 while pos < len(chunk):
                     piece = chunk[pos: pos + max_samples]
-                    if len(piece) < SAMPLE_RATE:
+                    if len(piece) < SAMPLE_RATE and result:
+                        # 尾部不足 1 秒：并入上一片（超过 max_chunk_secs 上限约 1s，
+                        # 远好于把这段尾部语音静默丢弃、字幕凭空少一句）。
+                        pt0, pt1, ppiece, pspk = result[-1]
+                        result[-1] = (pt0, pt1 + len(piece) / SAMPLE_RATE,
+                                      np.concatenate([ppiece, piece]), pspk)
                         break
                     piece_t0 = t0 + pos / SAMPLE_RATE
                     piece_t1 = min(t1, piece_t0 + len(piece) / SAMPLE_RATE)
@@ -1023,7 +1029,15 @@ class ChatLLMASREngine:
             raw_text = ""
             try:
                 sf.write(tmp_path, chunk, SAMPLE_RATE, subtype="PCM_16")
-                raw_text = self._runner.transcribe(tmp_path, sys_prompt=sys_prompt)
+                try:
+                    raw_text = self._runner.transcribe(tmp_path, sys_prompt=sys_prompt)
+                except RuntimeError as e:
+                    # 单片段推理失败（常见：退化检测命中 / GPU 偶发失败）→
+                    # 跳过该片段继续后续片段，不让已完成的字幕全部作废。
+                    print(f"[chatllm] 警告：第 {i} 段推理失败，跳过该段。"
+                          f"{str(e).splitlines()[0][:120]}",
+                          file=sys.stderr, flush=True)
+                    continue
 
                 if not raw_text:
                     continue
