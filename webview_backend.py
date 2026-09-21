@@ -1698,23 +1698,43 @@ class WebBackend:
             }
             cores.append(chatllm)
 
-        # Faster-Whisper-XXL（向下兼容式呈现）：引擎目录存在才列出，避免
-        # 未下载过的使用者看到一栏「未下载 1.3GB」噪音（模型页选了才下载）。
+        # Faster-Whisper-XXL：独立组件状态栏——引擎、7z 解压器、各尺寸模型
+        # 缓存逐项显示。引擎未下载时也常驻列出（模型页选了才会触发 1.3GB
+        # 下载），让使用者在下载前就能看到这套组件的全貌与大小。
         try:
-            from downloader import quick_check_fwxxl, fwxxl_dir, _FWXXL_SIZE_MB
+            from downloader import (quick_check_fwxxl, fwxxl_dir,
+                                    fwxxl_models_status, _FWXXL_SIZE_MB,
+                                    _FWWHISPER_CACHE_NAMES)
+            fw_dir = fwxxl_dir(model_dir)
             fw_ready = quick_check_fwxxl(model_dir)
-            if fw_ready or s.get("backend") == "fastwhisper":
-                cores.append({
-                    "label": "Faster-Whisper-XXL（CTranslate2）",
-                    "backend": "fastwhisper",
-                    "items": [
-                        item("fwxxl_core", "引擎（faster-whisper-xxl.exe）",
-                             fw_ready, "已下载",
-                             f"未下载（约 {_FWXXL_SIZE_MB}MB，选用时下载）"),
-                        item("fwxxl_models", "Whisper 模型（引擎自管）", fw_ready,
-                             "随用随取", "首次转录所选尺寸时自动下载"),
-                    ],
-                })
+            models_ok = fwxxl_models_status(model_dir) if fw_ready \
+                else {k: False for k in _FWWHISPER_CACHE_NAMES}
+            size_label = {"base": "Base", "small": "Small", "medium": "Medium",
+                          "large": "Large（large-v2）", "turbo": "Large Turbo（large-v3-turbo）"}
+            fw_items = [
+                item("fwxxl_core", f"引擎（faster-whisper-xxl.exe，约 {_FWXXL_SIZE_MB}MB）",
+                     fw_ready, "已下载",
+                     f"未下载（模型页选用时自动下载）"),
+                item("fwxxl_models", "Whisper 模型（引擎自管，随用随取）",
+                     any(models_ok.values()), "已有缓存", "未缓存（首次转录所选尺寸时下载）"),
+            ]
+            if fw_ready:
+                # 引擎就绪才逐尺寸展开——未下载时逐项全是「未缓存」没有信息量
+                fw_items += [
+                    item(f"fwxxl_m_{size}", f"　├ {size_label[size]} 模型缓存",
+                         ok, "已缓存",
+                         "未缓存（转录该尺寸时自动下载）")
+                    for size, ok in models_ok.items()
+                ]
+                fw_items.append(item(
+                    "fwxxl_ffmpeg", "FFmpeg（XXL 自带，含 ffmpeg.exe）",
+                    (fw_dir / "ffmpeg.exe").is_file(), "已内置", "缺失（重新下载引擎可修复）",
+                    downloadable=False))
+            cores.append({
+                "label": "Faster-Whisper-XXL（CTranslate2）",
+                "backend": "fastwhisper",
+                "items": fw_items,
+            })
         except Exception:
             traceback.print_exc()
 

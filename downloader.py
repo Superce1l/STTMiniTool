@@ -849,6 +849,33 @@ def quick_check_fwxxl(model_dir: Path) -> bool:
         or any(d.glob("**/faster-whisper-xxl.exe"))
 
 
+# UI 尺寸代码 → XXL 模型缓存目录名（_models/ 下）。XXL 从 HuggingFace 取
+# Systran/faster-whisper-<size>；turbo 用 Purview 官方仓库 large-v3-turbo。
+# 与 webview_backend._FWWHISPER_MODEL_ARG 的 --model 参数保持同源语义。
+_FWWHISPER_CACHE_NAMES = {
+    "base":   "faster-whisper-base",
+    "small":  "faster-whisper-small",
+    "medium": "faster-whisper-medium",
+    "large":  "faster-whisper-large-v2",
+    "turbo":  "faster-whisper-large-v3-turbo",
+}
+
+
+def fwxxl_model_present(model_dir: Path, size: str) -> bool:
+    """指定尺寸的 Whisper 模型是否已缓存（_models/<名字>/model.bin 存在）。"""
+    name = _FWWHISPER_CACHE_NAMES.get(size)
+    if not name:
+        return False
+    d = fwxxl_dir(model_dir) / "_models" / name
+    return (d / "model.bin").is_file()
+
+
+def fwxxl_models_status(model_dir: Path) -> dict[str, bool]:
+    """五个尺寸的模型缓存状态（自检面板逐项显示用）。"""
+    return {size: fwxxl_model_present(model_dir, size)
+            for size in _FWWHISPER_CACHE_NAMES}
+
+
 def _ensure_7zr(tools_dir: Path, progress_cb=None) -> Path:
     """确保 7zr.exe 存在（缺则自 7-zip.org 下载）；返回其路径。"""
     exe = Path(tools_dir) / "7zr.exe"
