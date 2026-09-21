@@ -181,8 +181,63 @@ def _qwen_casr_dl(crisp_model: str):
 #   逐片转录，再把各片 SRT 解析后按片起点平移、重叠区去重合并成整份结果。
 #   说话者分离只在单片内做（跨片依时间中点指派，与整段行为一致）。
 _SLICE_THRESHOLD_SECS = 2 * 3600     # 超过 2 小时启用切片
-_SLICE_WINDOW_SECS = 30 * 60         # 每片 30 分钟
+_SLICE_WINDOW_SECS = 30 * 60         # 每片 30 分钟（内存充足时的上限）
 _SLICE_OVERLAP_SECS = 15             # 相邻片段重叠 15 秒
+
+# ── 切片时长自适应（依可用内存）────────────────────────────
+# 内存依据：切片解码进内存后是 16kHz float32 mono（64KB/s），VAD/引擎处理
+# 还会产生数份拷贝（按 ~5 倍估算）。默认 30 分钟片 ≈ 110MB 原始 ≈ 550MB
+# 实占，8GB 空闲内存的机器毫无压力；空闲内存只有几百 MB 的机器若仍切
+# 30 分钟，转录中易触发系统交换甚至 OOM。故按可用物理内存收缩片长：
+#   预算 = 可用内存 × 25%（给引擎/OS 留大头）→ 秒数 = 预算 ÷ 每秒实占
+# 夹紧 [5 分钟, 30 分钟]：下限保证重叠区（15s）不退化，上限即原行为。
+_SLICE_MEM_BUDGET_FRAC = 0.25
+_SLICE_MEM_PER_SEC = 65536 * 5       # 64KB/s 原始 × ~5 份处理拷贝
+_SLICE_WINDOW_MIN_SECS = 5 * 60
+
+
+def _avail_phys_bytes() -> int | None:
+    """可用物理内存（字节）；Windows GlobalMemoryStatusEx，失败回 None。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = _MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return None
+        return int(st.ullAvailPhys)
+    except Exception:
+        return None
+
+
+def _slice_window_secs() -> int:
+    """依可用物理内存智能决定切片时长（秒）。
+
+    内存充足 → 30 分钟（与原固定值一致，行为不变）；空闲内存紧张时按
+    预算公式收缩，最低 5 分钟。查询失败（非 Windows 等）回默认上限。
+    """
+    avail = _avail_phys_bytes()
+    if not avail:
+        return _SLICE_WINDOW_SECS
+    budget = avail * _SLICE_MEM_BUDGET_FRAC
+    secs = int(budget / _SLICE_MEM_PER_SEC)
+    return max(_SLICE_WINDOW_MIN_SECS, min(_SLICE_WINDOW_SECS, secs))
 
 
 def _ffprobe_duration(ff: Path, audio: Path) -> float | None:
@@ -203,13 +258,17 @@ def _ffprobe_duration(ff: Path, audio: Path) -> float | None:
         return None
 
 
-def _slice_plan(duration: float) -> list[tuple[float, float]]:
-    """总时长 → [(片起点, 片终点)]，相邻片重叠 _SLICE_OVERLAP_SECS。"""
-    step = _SLICE_WINDOW_SECS - _SLICE_OVERLAP_SECS
+def _slice_plan(duration: float, window_secs: int | None = None) -> list[tuple[float, float]]:
+    """总时长 → [(片起点, 片终点)]，相邻片重叠 _SLICE_OVERLAP_SECS。
+
+    window_secs 省略时依可用内存自适应（_slice_window_secs）。
+    """
+    window = window_secs if window_secs is not None else _slice_window_secs()
+    step = window - _SLICE_OVERLAP_SECS
     spans = []
     start = 0.0
     while start < duration - 0.5:
-        end = min(start + _SLICE_WINDOW_SECS, duration)
+        end = min(start + window, duration)
         spans.append((start, end))
         if end >= duration:
             break
