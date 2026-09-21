@@ -9,12 +9,27 @@
 """
 from __future__ import annotations
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.2.0 更新汇总（本地改进版，基于上游 2.0.0）────────────────────────────
+#   新引擎：引入 Faster-Whisper-XXL（Purfview，CTranslate2）第四推理核心——
+#         Whisper 全系模型（Base/Small/Medium/Large-v2/Large-v3-Turbo），
+#         CPU／NVIDIA 自动适配；引擎 1.3GB 按需自动下载，自检面板独立
+#         组件状态栏（引擎／各尺寸模型缓存／自带 FFmpeg）。
+#   修复：长视频（>2 小时，如 .mov）转录报
+#         「TypeError: missing 1 required positional argument: 'msg'」
+#         —— 长音频切片进度回调签名不匹配；并恢复跨片进度聚合
+#         （进度条不再逐片回跳）。
+#   智能：长音频切片时长依可用物理内存自适应（5–30 分钟），小内存
+#         机器不再有转录中 OOM 风险；内存充裕行为不变。
+#   下载：CrispASR 核心不再固定 v0.8.33，自动获取 GitHub 最新 release
+#         （离线回退 0.8.33）；旧版安装下次加载时自动升级；FWXXL 下载
+#         失败自动清理损坏压缩包，重试无需手动删文件。
 
 # ── 2.1.1 更新汇总（本地改进版，基于上游 2.0.0）────────────────────────────
 #   界面自适应：主内容区随窗口宽度伸缩（窄窗撑满、宽窗居中封顶）；设置页
