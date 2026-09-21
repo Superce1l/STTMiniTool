@@ -183,7 +183,8 @@ button { font-family: inherit; }
 }
 .topbar .ctx { font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 10px; }
 
-.view-host { flex: 1; overflow-y: auto; }
+/* 容器查询锚点：自检面板等依内容区实际宽度（而非窗口）自适应 */
+.view-host { flex: 1; overflow-y: auto; container-type: inline-size; }
 /* 内容随界面宽度自适应：窄窗口撑满、宽窗口居中封顶 */
 .view { display: none; width: 100%; max-width: 1080px; margin: 0 auto;
   padding: clamp(16px, 2.4vw, 26px) clamp(16px, 2.4vw, 28px) 40px; }
@@ -512,6 +513,7 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .health-core {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--r-card); padding: 12px 14px; box-shadow: var(--shadow-sm);
+  min-width: 0;              /* grid 子项默认 min-width:auto，长 nowrap 文本会撑破列宽 */
 }
 .hc-title { font-size: 13px; font-weight: 600; color: var(--ink); margin-bottom: 9px; }
 .hc-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
@@ -522,7 +524,13 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .hdot-green { background: #2BB673; box-shadow: 0 0 0 3px rgba(43,182,115,.15); }
 .hdot-yellow { background: #E0A53B; box-shadow: 0 0 0 3px rgba(224,165,59,.15); }
 .hdot-red { background: #D7574B; box-shadow: 0 0 0 3px rgba(215,87,75,.15); }
-@media (max-width: 760px) { .health-panel { grid-template-columns: 1fr; } }
+/* 窄窗口：卡片改单列竖排，行内 label+detail 允许换行（两段 nowrap 并排必溢出） */
+@container (max-width: 520px) {
+  .health-panel { grid-template-columns: 1fr; }
+  .hc-item { flex-wrap: wrap; }
+  .hc-item .hi-label { white-space: normal; }
+  .hc-item .hi-detail { max-width: 100%; white-space: normal; margin-left: 26px; text-align: left; }
+}
 
 /* QR + 网址并排 */
 .qr-row { display: flex; gap: 14px; align-items: center; }
@@ -642,9 +650,8 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 @media (max-width: 1100px) {
   .ep-grid { grid-template-columns: 1fr; }
 }
-/* 中窄窗口：路径输入、进度条收紧，双栏自检并排改单栏 */
+/* 中窄窗口：路径输入、进度条收紧（自检面板单列已由容器查询按内容宽度接管） */
 @media (max-width: 900px) {
-  .health-panel { grid-template-columns: 1fr; }
   .b-row .pbar { width: 90px; flex: 0 0 90px; }
 }
 /* 更窄（侧栏版面挤压主区，或手机竖屏访问本地服务）：整体换行堆叠 */
