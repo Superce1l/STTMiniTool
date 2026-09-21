@@ -29,7 +29,7 @@ from pathlib import Path
 # 与 Qwen/Whisper 路径统一的字幕分行（全引擎共享）
 from subtitle_lines import _ts_chatllm_to_subtitle_lines
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 16000     # 说话者分离解码用（load_audio_16k_mono），保持引擎契约
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).parent
@@ -47,9 +47,7 @@ _PROC_SHUTDOWN_GRACE_SECS = 30
 
 # 上游「语言名 → ISO 码」由 exe 自行接受全名/码，这里只需把 UI 的
 # 语言值（Chinese/English/...）直接透传即可，无需映射表。
-
-# Whisper 无标点语言处理与 crisp_engine 一致：日语跳过 OpenCC
-_LANG_TO_JA = {"ja", "japanese", "jw", "javanese"}
+# （本引擎不做 OpenCC 转换，无日语特判；与 crisp_engine 的差异见 process_file。）
 
 
 class FastWhisperEngine:
@@ -167,7 +165,6 @@ class FastWhisperEngine:
         # _parse_srt_words / _fix_leading_punct 定义在 crisp_engine（Whisper 系
         # SRT 解析与断句修正的既有归属），直接复用避免复制逻辑。
         from crisp_engine import _parse_srt_words, _fix_leading_punct
-        from subtitle_lines import write_transcript
 
         audio_path = Path(audio_path)
         if progress_cb:
@@ -206,19 +203,23 @@ class FastWhisperEngine:
         if diarize and self.diar_engine is not None and getattr(self.diar_engine, "ready", False):
             lines = self._apply_diarization(audio_path, lines, n_speakers, progress_cb)
 
-        # 字级 rich（卡拉OK）：与 crisp_engine 相同的 words 结构
+        # 字级 rich（卡拉OK）：与 crisp_engine 相同的 words 结构。
+        # speaker 取 diarize 后的 lines、words 取 lines5（两者行数一致，zip 对齐），
+        # 否则开启分离时侧通道丢失说话者标签，与落盘 SRT 不一致。
         try:
             self._last_segments_rich = [
-                {"start": s, "end": e, "text": t, "speaker": sp, "words": w}
-                for (s, e, t, sp, w) in lines5]
+                {"start": a[0], "end": a[1], "text": a[2], "speaker": a[3], "words": b[4]}
+                for a, b in zip(lines, lines5)]
         except Exception:
             self._last_segments_rich = None
 
         # 写出 SRT：write_transcript 的 ref 决定落盘名（与 crispasr 的
         # original_path 语义一致——上层传 subtitles/<原始文件名>）。
+        # out_format 转发给 write_transcript（与 crisp_engine 契约一致）；
+        # 走 transcribe() 兼容入口时已显式固定 "srt"。
         from subtitle_lines import write_transcript as _wt
         out_ref = Path(original_path) if original_path else audio_path
-        return _wt(out_ref, lines, out_format="srt")
+        return _wt(out_ref, lines, out_format=out_format or "srt")
 
     # ── 说话者分离（与 crisp_engine 相同的指派逻辑）─────────
     def _apply_diarization(self, audio_path, lines, n_speakers, progress_cb):
@@ -226,7 +227,11 @@ class FastWhisperEngine:
         if progress_cb:
             progress_cb(1, 1, "说话者分离中…")
         try:
-            diar_segs = self.diar_engine.diarize(audio_path, n_speakers=n_speakers)
+            # diar_engine.diarize 需要 16kHz float32 ndarray（与 crisp_engine 一致，
+            # 先解码再传入；直接传 Path 会在引擎内抛错被 except 吞掉 → 静默无标签）。
+            from audio_io import load_audio_16k_mono
+            audio, _ = load_audio_16k_mono(Path(audio_path), SAMPLE_RATE)
+            diar_segs = self.diar_engine.diarize(audio, n_speakers=n_speakers)
         except Exception:
             return lines
         if not diar_segs:
@@ -252,10 +257,11 @@ class FastWhisperEngine:
     # ── 实时/单段（录制视图逐段上传走 process_file，无需单独实现）───
     def transcribe(self, audio_path: Path, language=None, hint=None):
         """兼容旧接口：返回文本列表（录制路径目前只走 process_file）。"""
-        srt = self.process_file(audio_path, language=language, context=hint)
+        srt = self.process_file(audio_path, language=language, context=hint,
+                                out_format="srt")   # 显式 srt：不受全域 txt 设置影响
         if not srt:
             return []
-        from subtitle_lines import parse_srt_to_segments
+        from webview_backend import parse_srt_to_segments   # 实际定义处；延迟导入避免循环
         return parse_srt_to_segments(srt)
 
     def rebuild_cc(self):

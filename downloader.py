@@ -876,6 +876,15 @@ def fwxxl_models_status(model_dir: Path) -> dict[str, bool]:
             for size in _FWWHISPER_CACHE_NAMES}
 
 
+def fwxxl_model_present_dir(engine_dir: Path, size: str) -> bool:
+    """同 fwxxl_model_present，但直接给定引擎目录（嵌套布局下与 load() 的
+    exe 解析结果保持一致，供自检面板对齐实际引擎位置）。"""
+    name = _FWWHISPER_CACHE_NAMES.get(size)
+    if not name:
+        return False
+    return ((Path(engine_dir) / "_models" / name / "model.bin").is_file())
+
+
 def _ensure_7zr(tools_dir: Path, progress_cb=None) -> Path:
     """确保 7zr.exe 存在（缺则自 7-zip.org 下载）；返回其路径。"""
     exe = Path(tools_dir) / "7zr.exe"
@@ -921,8 +930,15 @@ def download_fwxxl(model_dir: Path, progress_cb=None):
     proc = _sp.run([str(sevenzr), "x", "-y", f"-o{dest}", str(zpath)],
                    capture_output=True, creationflags=_CREATE_NO_WINDOW)
     if proc.returncode != 0 or not quick_check_fwxxl(dest):
+        # 坏包/坏解压器不保留：尺寸门槛拦不住「截断到 98.5%」的残档，留着只会
+        # 让每次重试都跳过下载、在同一处失败。删除后下次自动重新下载。
+        for bad in (zpath, sevenzr):
+            try:
+                bad.unlink(missing_ok=True)
+            except OSError:
+                pass
         err = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
-        raise RuntimeError("Faster-Whisper-XXL 解压失败："
+        raise RuntimeError("Faster-Whisper-XXL 解压失败（已清理损坏文件，重试将重新下载）："
                            + (err[-1] if err else f"7zr 返回码 {proc.returncode}"))
     try:
         zpath.unlink(missing_ok=True)       # 解压成功即删 7z 省空间

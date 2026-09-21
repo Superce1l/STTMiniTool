@@ -603,13 +603,13 @@ class WebBackend:
         （downloader.download_fwxxl，7zr 解压）。模型为 HuggingFace Systran
         系，由 exe 按 --model_dir 自取（首次转录该尺寸时下载）。
         """
-        from downloader import quick_check_fwxxl, download_fwxxl, fwxxl_dir
+        from downloader import quick_check_fwxxl, download_fwxxl, fwxxl_dir, _FWXXL_SIZE_MB
         from fastwhisper_engine import FastWhisperEngine
         s = self._settings_raw()
         model_dir = Path(s.get("model_dir", str(getattr(core, "_DEFAULT_MODEL_DIR",
                                                         BASE_DIR / "ov_models"))))
         if not quick_check_fwxxl(model_dir):
-            self._st(f"下载 Faster-Whisper-XXL 引擎（约 1358 MB，首次需数分钟）…")
+            self._st(f"下载 Faster-Whisper-XXL 引擎（约 {_FWXXL_SIZE_MB} MB，首次需数分钟）…")
             download_fwxxl(model_dir, progress_cb=self._dl_progress)
         size = s.get("fw_model", "small")
         eng = FastWhisperEngine()
@@ -904,10 +904,13 @@ class WebBackend:
                         f"{err[-1] if err else '未知错误'}")
 
                 def _slice_cb(done, total, msg, _i=i, _n=len(plan)):
-                    # engine.process_file 的进度回调是 (i, total, msg) 三参；
-                    # done/total 在此已是「片内段进度」语义，直接转发给 _cb
-                    # 由它统一换算成百分比（此前按 2 参调用 → TypeError）。
-                    _cb(done, total,
+                    # engine 的回调是 (i, total, msg) 三参；这里先把片内进度换算成
+                    # 「全局百分比」再以 (pct, 100, msg) 交给 _cb——直接转发 done/total
+                    # 会让进度条在每片边界从 0 重爬（N 片来回跳 N 次）。
+                    base = (_i - 1) / _n
+                    span = 1.0 / _n
+                    frac = (done / max(total, 1)) if total else 0
+                    _cb(min(99, int((base + span * frac) * 100)), 100,
                         f"切片转录 {msg}（第 {_i}/{_n} 片）")
 
                 part_srt = self.engine.process_file(
@@ -1703,11 +1706,20 @@ class WebBackend:
         # 下载），让使用者在下载前就能看到这套组件的全貌与大小。
         try:
             from downloader import (quick_check_fwxxl, fwxxl_dir,
-                                    fwxxl_models_status, _FWXXL_SIZE_MB,
-                                    _FWWHISPER_CACHE_NAMES)
+                                    _FWWHISPER_CACHE_NAMES, _FWXXL_SIZE_MB,
+                                    fwxxl_model_present_dir)
             fw_dir = fwxxl_dir(model_dir)
             fw_ready = quick_check_fwxxl(model_dir)
-            models_ok = fwxxl_models_status(model_dir) if fw_ready \
+            # 状态检查与 load() 用同一套 exe 解析：load() 会在嵌套子目录里找 exe
+            # （用户手工解压带包装目录时），模型缓存跟 exe 同层——状态栏若只看
+            # 顶层会对该布局永远显示「未缓存」。找到实际引擎目录后按它检查。
+            fw_engine_dir = fw_dir
+            if fw_ready and not (fw_dir / "faster-whisper-xxl.exe").is_file():
+                found = list(fw_dir.glob("**/faster-whisper-xxl.exe"))
+                if found:
+                    fw_engine_dir = found[0].parent
+            models_ok = {size: fwxxl_model_present_dir(fw_engine_dir, size)
+                         for size in _FWWHISPER_CACHE_NAMES} if fw_ready \
                 else {k: False for k in _FWWHISPER_CACHE_NAMES}
             size_label = {"base": "Base", "small": "Small", "medium": "Medium",
                           "large": "Large（large-v2）", "turbo": "Large Turbo（large-v3-turbo）"}
