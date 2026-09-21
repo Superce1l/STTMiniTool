@@ -853,10 +853,10 @@ class WebBackend:
                         f"{err[-1] if err else '未知错误'}")
 
                 def _slice_cb(done, total, msg, _i=i, _n=len(plan)):
-                    base = (_i - 1) / _n
-                    span = 1.0 / _n
-                    frac = (done / max(total, 1)) if total else 0
-                    _cb(min(99, int((base + span * frac) * 100)),
+                    # engine.process_file 的进度回调是 (i, total, msg) 三参；
+                    # done/total 在此已是「片内段进度」语义，直接转发给 _cb
+                    # 由它统一换算成百分比（此前按 2 参调用 → TypeError）。
+                    _cb(done, total,
                         f"切片转录 {msg}（第 {_i}/{_n} 片）")
 
                 part_srt = self.engine.process_file(
