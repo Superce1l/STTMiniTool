@@ -823,6 +823,95 @@ def download_ffmpeg(dest_dir: Path, progress_cb=None):
 
 
 
+# ── Faster-Whisper-XXL 引擎（Purfview，独立下载的第三条 Whisper 路径）────
+# faster-whisper-xxl.exe：CTranslate2 (faster-whisper) 的 standalone 打包，
+# 自带全部依赖与 ffmpeg，比 whisper.cpp 系更快且自带 VAD/对齐。不进安装包
+# —— 1.3GB 7z 按需下载，解压后放 <model_dir>/Faster-Whisper-XXL/。
+# 压缩格式是 BCJ2 滤镜的 .7z：py7zr 不支持，须用官方独立解压器 7zr.exe
+# （约 0.6MB，仅处理 .7z），缺则自动下载到 tools/。
+_FWXXL_URL = ("https://github.com/Purfview/whisper-standalone-win/releases/"
+              "download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z")
+_FWXXL_VERSION = "r245.4"
+_FWXXL_DIRNAME = "Faster-Whisper-XXL"          # 解压后的目录名（含 exe）
+_FWXXL_7ZR_URL = "https://www.7-zip.org/a/7zr.exe"
+_FWXXL_SIZE_MB = 1358
+
+
+def fwxxl_dir(model_dir: Path) -> Path:
+    """Faster-Whisper-XXL 引擎目录：<model_dir>/Faster-Whisper-XXL/。"""
+    return Path(model_dir) / _FWXXL_DIRNAME
+
+
+def quick_check_fwxxl(model_dir: Path) -> bool:
+    """faster-whisper-xxl.exe 是否已就绪（目录根或子层，排除空壳）。"""
+    d = fwxxl_dir(model_dir)
+    return (d / "faster-whisper-xxl.exe").is_file() \
+        or any(d.glob("**/faster-whisper-xxl.exe"))
+
+
+def _ensure_7zr(tools_dir: Path, progress_cb=None) -> Path:
+    """确保 7zr.exe 存在（缺则自 7-zip.org 下载）；返回其路径。"""
+    exe = Path(tools_dir) / "7zr.exe"
+    if exe.is_file() and exe.stat().st_size > 100_000:
+        return exe
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    if progress_cb:
+        progress_cb(0.0, "下载 7z 解压工具…")
+    _download_file(_FWXXL_7ZR_URL, exe, progress_cb=None)
+    return exe
+
+
+def download_fwxxl(model_dir: Path, progress_cb=None):
+    """下载 Faster-Whisper-XXL r245.4（1.3GB 7z）并解压至 <model_dir>/。
+
+    progress_cb(pct: float, msg: str)。GitHub 来源不套用 HF 镜像。
+    解压用 7zr.exe（BCJ2 滤镜 py7zr 不支持）；解压目标为 <model_dir> 根、
+    归档内自带 Faster-Whisper-XXL/ 顶层目录。下载的 .7z 落在 model_dir
+    （约 1.3GB，解压完删除以省空间；断点续传友好——中断后重跑继续）。
+    """
+    import subprocess as _sp
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    zpath = model_dir / f"Faster-Whisper-XXL_{_FWXXL_VERSION}_windows.7z"
+
+    def _cb(done: int, total_b: int):
+        if progress_cb and total_b > 0:
+            progress_cb(
+                0.9 * done / total_b,
+                f"下载 Faster-Whisper-XXL…  {done/1_048_576:.0f} / {total_b/1_048_576:.0f} MB",
+            )
+
+    if not (zpath.is_file() and zpath.stat().st_size >= _FWXXL_SIZE_MB * 1024 * 1024 * 0.98):
+        if progress_cb:
+            progress_cb(0.0, f"下载 Faster-Whisper-XXL {_FWXXL_VERSION}（约 {_FWXXL_SIZE_MB} MB）…")
+        _download_file(_FWXXL_URL, zpath, progress_cb=_cb)
+
+    if progress_cb:
+        progress_cb(0.92, "解压 Faster-Whisper-XXL（约 3.5 GB，需数分钟）…")
+    sevenzr = _ensure_7zr(BASE_DIR_TOOLS(), progress_cb=progress_cb)
+    dest = model_dir
+    dest.mkdir(parents=True, exist_ok=True)
+    proc = _sp.run([str(sevenzr), "x", "-y", f"-o{dest}", str(zpath)],
+                   capture_output=True, creationflags=_CREATE_NO_WINDOW)
+    if proc.returncode != 0 or not quick_check_fwxxl(dest):
+        err = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
+        raise RuntimeError("Faster-Whisper-XXL 解压失败："
+                           + (err[-1] if err else f"7zr 返回码 {proc.returncode}"))
+    try:
+        zpath.unlink(missing_ok=True)       # 解压成功即删 7z 省空间
+    except Exception:
+        pass
+    if progress_cb:
+        progress_cb(1.0, f"Faster-Whisper-XXL {_FWXXL_VERSION} 就绪")
+
+
+def BASE_DIR_TOOLS() -> Path:
+    """7zr.exe 的存放目录：frozen 时 EXE 旁 tools/，开发时项目 tools/。"""
+    if getattr(_sys, "frozen", False):
+        return Path(_sys.executable).parent / "tools"
+    return Path(__file__).parent / "tools"
+
+
 # ── qwen3 ForcedAligner GGUF（CrispASR -am 对齐器，Whisper 核心专用 FA）──
 # crispasr.exe -am <gguf> -falign：用 CTC 对齐器的字级时间轴覆盖 whisper 自带
 # 的（较粗）时间戳。同作者(cstr)上传，与 crispasr 的 -am 界面兼容。

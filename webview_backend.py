@@ -49,6 +49,21 @@ _WHISPER_LABEL_BY_SIZE = {
     "base": "Whisper Base", "small": "Whisper Small", "medium": "Whisper Medium",
     "large": "Whisper Large", "turbo": "Whisper Large Turbo",
 }
+# Faster-Whisper-XXL 引擎（Purfview standalone，CTranslate2）：挂在 Whisper
+# 核心下的独立引擎选项。模型为 HuggingFace Systran 系（引擎自行管理/下载），
+# 5 档尺寸与 CrispASR whisper 路径对齐，另附 turbo 说明。
+_FWWHISPER_CORE = "Faster-Whisper-XXL"
+_FWWHISPER_SIZES = ("base", "small", "medium", "large", "turbo")
+_FWWHISPER_LABEL_BY_SIZE = {
+    "base": "Whisper Base (FWXXL)", "small": "Whisper Small (FWXXL)",
+    "medium": "Whisper Medium (FWXXL)", "large": "Whisper Large (FWXXL)",
+    "turbo": "Whisper Large Turbo (FWXXL)",
+}
+# UI 尺寸代码 → XXL --model 参数（turbo=large-v3-turbo）
+_FWWHISPER_MODEL_ARG = {
+    "base": "base", "small": "small", "medium": "medium",
+    "large": "large-v2", "turbo": "large-v3-turbo",
+}
 _MODEL_CATALOG = [
     ("Qwen", "Qwen3-ASR-0.6B",              "openvino", {"cpu_model_size": "0.6B"}),
     ("Qwen", "Qwen3-ASR-1.7B INT8",         "openvino", {"cpu_model_size": "1.7B"}),
@@ -66,6 +81,13 @@ _MODEL_CATALOG = [
     (_WHISPER_CORE, _WHISPER_LABEL_BY_SIZE[size], "crispasr",
      {"crisp_model": "whisper", "whisper_size": size})
     for size in _WHISPER_SIZES
+] + [
+    # Faster-Whisper-XXL（Purfview standalone，CTranslate2）：第三条 Whisper
+    # 路径。引擎 1.3GB 按需下载（downloader.download_fwxxl），模型由引擎自行
+    # 取自 HuggingFace Systran 系。CPU／NVIDIA 皆可（--device auto 自适配）。
+    (_FWWHISPER_CORE, _FWWHISPER_LABEL_BY_SIZE[size], "fastwhisper",
+     {"fw_model": size})
+    for size in _FWWHISPER_SIZES
 ]
 _QWEN_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B Q4 (CRISPASR)",
                           "q8": "Qwen3-ASR-1.7B Q8 (CRISPASR)"}
@@ -371,12 +393,14 @@ class WebBackend:
     def _load_worker(self):
         # 依 settings.backend 全新加载对应引擎。因「切换=重启」，每次启动只加载
         # 一个核心、且为全新进程，天然避开 chatllm Vulkan 双 context 切换死机。
-        backend = self._persisted_backend()           # openvino / chatllm / crispasr
+        backend = self._persisted_backend()           # openvino / chatllm / crispasr / fastwhisper
         try:
             if backend == "chatllm":
                 self._load_chatllm()
             elif backend == "crispasr":
                 self._load_crispasr()
+            elif backend == "fastwhisper":
+                self._load_fastwhisper()
             else:
                 backend = "openvino"
                 self._load_openvino()
@@ -572,6 +596,28 @@ class WebBackend:
                  gpu_backend=crispasr_gpu_backend(variant))
         self.engine = eng
 
+    def _load_fastwhisper(self):
+        """Faster-Whisper-XXL 引擎加载分支（catalog backend='fastwhisper'）。
+
+        引擎目录钉在模型目录下 Faster-Whisper-XXL/；1.3GB 7z 缺则自动下载
+        （downloader.download_fwxxl，7zr 解压）。模型为 HuggingFace Systran
+        系，由 exe 按 --model_dir 自取（首次转录该尺寸时下载）。
+        """
+        from downloader import quick_check_fwxxl, download_fwxxl, fwxxl_dir
+        from fastwhisper_engine import FastWhisperEngine
+        s = self._settings_raw()
+        model_dir = Path(s.get("model_dir", str(getattr(core, "_DEFAULT_MODEL_DIR",
+                                                        BASE_DIR / "ov_models"))))
+        if not quick_check_fwxxl(model_dir):
+            self._st(f"下载 Faster-Whisper-XXL 引擎（约 1358 MB，首次需数分钟）…")
+            download_fwxxl(model_dir, progress_cb=self._dl_progress)
+        size = s.get("fw_model", "small")
+        eng = FastWhisperEngine()
+        eng.load(engine_dir=fwxxl_dir(model_dir),
+                 model_size=_FWWHISPER_MODEL_ARG.get(size, size),
+                 cb=self._st)
+        self.engine = eng
+
     # ── 状态 ────────────────────────────────────────────────
     def get_status(self) -> dict:
         active = getattr(self, "_active_backend", "openvino")
@@ -619,6 +665,11 @@ class WebBackend:
             if be == "chatllm":
                 return ((self._chatllm_dir() / "qwen3-asr-1.7b.bin").exists()
                         or (model_dir / "qwen3-asr-1.7b.bin").exists())
+            if be == "fastwhisper":
+                # 引擎 exe 就绪即视为「已就绪」：模型由 XXL 按需自动下载，
+                # 首次转录对应尺寸时会拉取（不阻塞启动页决策）。
+                from downloader import quick_check_fwxxl
+                return quick_check_fwxxl(model_dir)
         except Exception:
             traceback.print_exc()
         return False
@@ -1205,6 +1256,7 @@ class WebBackend:
         # CRISPASR 的加速版本可切（Vulkan/CUDA/CPU）→ 实际标签由 _backend_label()
         # 依 crisp_variant 补上；这里只留字典的默认值供旧调用端使用。
         "crispasr": "GPU · CRISPASR",
+        "fastwhisper": "Faster-Whisper-XXL（CTranslate2）",
     }
 
     @staticmethod
@@ -1281,6 +1333,8 @@ class WebBackend:
                 extra = s.get("crisp_qwen_quant", "q8")   # qwen3 量化也纳入识别
             # 加速版本也纳入识别：换 Vulkan↔CUDA 等同换核心，需重启才生效
             return ("crispasr", cm, extra, self._crisp_variant())
+        if backend == "fastwhisper":
+            return ("fastwhisper", s.get("fw_model", "small"))
         return ("chatllm",)
 
     def _current_selection(self):
@@ -1299,6 +1353,11 @@ class WebBackend:
             if size not in _WHISPER_SIZES:
                 size = "base"
             return (_WHISPER_CORE, _WHISPER_LABEL_BY_SIZE[size])
+        if be == "fastwhisper":
+            size = s.get("fw_model", "small")
+            if size not in _FWWHISPER_SIZES:
+                size = "small"
+            return (_FWWHISPER_CORE, _FWWHISPER_LABEL_BY_SIZE[size])
         if be == "chatllm":
             return ("Qwen", _CHATLLM_LABEL)
         sz = s.get("cpu_model_size", "0.6B")
@@ -1638,6 +1697,26 @@ class WebBackend:
                 ],
             }
             cores.append(chatllm)
+
+        # Faster-Whisper-XXL（向下兼容式呈现）：引擎目录存在才列出，避免
+        # 未下载过的使用者看到一栏「未下载 1.3GB」噪音（模型页选了才下载）。
+        try:
+            from downloader import quick_check_fwxxl, fwxxl_dir, _FWXXL_SIZE_MB
+            fw_ready = quick_check_fwxxl(model_dir)
+            if fw_ready or s.get("backend") == "fastwhisper":
+                cores.append({
+                    "label": "Faster-Whisper-XXL（CTranslate2）",
+                    "backend": "fastwhisper",
+                    "items": [
+                        item("fwxxl_core", "引擎（faster-whisper-xxl.exe）",
+                             fw_ready, "已下载",
+                             f"未下载（约 {_FWXXL_SIZE_MB}MB，选用时下载）"),
+                        item("fwxxl_models", "Whisper 模型（引擎自管）", fw_ready,
+                             "随用随取", "首次转录所选尺寸时自动下载"),
+                    ],
+                })
+        except Exception:
+            traceback.print_exc()
 
         # 红灯：缺且不可自动补（目前仅 VAD/ffmpeg 属此类）
         reds = sum(1 for c in cores for it in c["items"] if it["status"] == "red")

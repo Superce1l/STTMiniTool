@@ -119,3 +119,10 @@ UI.txt
 !Readme/webview/*.png
 release_pkg/
 *.zip
+
+# ── Faster-Whisper-XXL（1.3GB 引擎包 + 解压目录，按需下载不入库）──
+ov_models/fwxxl/
+ov_models/Faster-Whisper-XXL*
+ov_models/license.txt
+# 7zr.exe 独立解压器（缺则自动下载，也不入库）
+tools/7zr.exe
