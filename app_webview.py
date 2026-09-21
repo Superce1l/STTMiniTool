@@ -25,8 +25,8 @@ from proc_guard import setup_kill_on_close_job
 from webview_server import WebViewServer
 
 APP_NAME = "语音识别小工具"
-WIN_W, WIN_H = 1180, 820
-MIN_W, MIN_H = 960, 680
+WIN_W, WIN_H = 1024, 720          # 启动默认窗口（屏幕自适应会再按工作区收敛/居中）
+MIN_W, MIN_H = 900, 640           # 允许缩得更小；界面已做窄宽度自适应
 
 
 # ════════════════════════════════════════════════════════
