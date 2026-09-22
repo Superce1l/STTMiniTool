@@ -198,6 +198,8 @@ button { font-family: inherit; }
   margin: 26px 0 12px;
 }
 .sec-title:first-child { margin-top: 0; }
+/* 包在分组容器里的标题（如 #accel-section）不算页面顶层首节，保留统一上边距 */
+#accel-section > .sec-title:first-child { margin-top: 26px; }
 
 /* ============================================================
    通用组件
@@ -561,6 +563,13 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
    模型视图
    ============================================================ */
 .radio-cards { display: flex; flex-direction: column; gap: 10px; }
+/* 推理引擎卡：两列并排（窄窗回落单列） */
+.radio-cards.two-col {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+}
+@media (max-width: 720px) {
+  .radio-cards.two-col { grid-template-columns: 1fr; }
+}
 .radio-card {
   display: flex; align-items: flex-start; gap: 12px; cursor: pointer;
   padding: 14px 16px; border: 1.5px solid var(--line); border-radius: var(--r-card);

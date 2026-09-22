@@ -34,18 +34,10 @@ from pathlib import Path
 
 import numpy as np
 
-# ── chatllm 后端（可选，import 延迟到 load 时进行）────────────────────
-#   format_vad_diag / detect_degenerate_asr 被 ASREngine.process_file 的
-#   VAD 诊断路径直接使用；crisp_engine 自带实现，不经过这里。
-try:
-    from chatllm_engine import (
-        format_vad_diag, detect_degenerate_asr,
-    )
-    _CHATLLM_AVAILABLE = True
-except Exception:
-    _CHATLLM_AVAILABLE = False
-    def format_vad_diag(_stats): return "⚠ 未检测到人声，未产生字幕"
-    def detect_degenerate_asr(_text): return None
+# ── 诊断辅助（原属 chatllm_engine，供 ASREngine 的 VAD 诊断路径使用）────
+from chatllm_engine import (
+    format_vad_diag, detect_degenerate_asr,
+)
 
 # ── CrispASR 后端（可选，OpenAI Whisper / Qwen3 走 Vulkan）─────────────
 try:
@@ -68,7 +60,6 @@ def _resolve_backend(core: str, model_label: str):
 
     返回：
       ("crispasr", "base"|"small"|"medium"|"large"|"turbo") — OpenAI Whisper
-      ("chatllm",  None)            — Qwen 1.7B Q8 (Vulkan)
       ("openvino", "1.7B"|"0.6B")   — Qwen OpenVINO
     """
     if "Whisper" in core:
@@ -76,8 +67,6 @@ def _resolve_backend(core: str, model_label: str):
         size = next((s for s in ("turbo", "large", "medium", "small", "base")
                      if s in label), "base")
         return "crispasr", size
-    if "Q8 (Vulkan)" in model_label:
-        return "chatllm", None
     if "1.7B INT8" in model_label:
         return "openvino", "1.7B"
     return "openvino", "0.6B"
@@ -97,8 +86,6 @@ def _ui_core_model(settings: dict):
                  "medium": "Whisper Medium", "large": "Whisper Large",
                  "turbo": "Whisper Large Turbo"}.get(size, "Whisper Base")
         return "Whisper", label
-    if backend == "chatllm":
-        return "Qwen", "Qwen3-ASR-1.7B Q8 (Vulkan)"
     sz = settings.get("cpu_model_size", "0.6B")
     return "Qwen", ("Qwen3-ASR-1.7B INT8" if "1.7B" in sz else "Qwen3-ASR-0.6B")
 
@@ -115,15 +102,6 @@ _MEIPASS_DIR = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", Fals
 _DEFAULT_MODEL_DIR = BASE_DIR / "ov_models"
 SETTINGS_FILE      = BASE_DIR / "settings.json"
 SRT_DIR            = BASE_DIR / "subtitles"
-_CHATLLM_DIR       = BASE_DIR / "chatllm"
-# .bin 优先找 ov_models/（开发期），再找 GPUModel/（打包后下载位置）
-_BIN_PATH          = next(
-    (p for p in [
-        BASE_DIR / "ov_models"  / "qwen3-asr-1.7b.bin",
-        BASE_DIR / "GPUModel"   / "qwen3-asr-1.7b.bin",
-    ] if p.exists()),
-    BASE_DIR / "GPUModel" / "qwen3-asr-1.7b.bin",  # 默认（未下载时）
-)
 SRT_DIR.mkdir(exist_ok=True)
 
 # ── 常数 ────────# 常数
@@ -172,7 +150,7 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_
     c  = np.zeros((2, 1, 64), dtype=np.float32)
     state = np.zeros((2, 1, 128), dtype=np.float32)
     context = np.zeros(VAD_CONTEXT_SAMPLES, dtype=np.float32)
-    sr = SAMPLE_RATE          # v5 的 sr 需列表可迭代；v4 用 np 标量
+    sr = SAMPLE_RATE          # v5 的 sr 需列表可迭代；v4 用 0-d int64 张量
     n  = len(audio) // VAD_CHUNK
     probs = []
     for i in range(n):
@@ -185,7 +163,8 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_
                 None, {"input": x, "state": state, "sr": [sr]})
             context = chunk[0][-VAD_CONTEXT_SAMPLES:]
         else:
-            out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
+            out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c,
+                                            "sr": np.array(sr, dtype=np.int64)})
         probs.append(float(out[0, 0]))
     if stats is not None:
         stats["n_chunks"]  = len(probs)
@@ -517,20 +496,6 @@ def _rebuild_text_with_spaces(raw_chars: list[str]) -> str:
     return "".join(result).strip()
 
 
-# 全域：是否输出简体中文（True = 跳过 OpenCC 繁化）。本分支默认直接输出简体。
-_g_output_simplified: bool = True
-
-# 全域：繁体输出时是否启用「简繁词汇转换」
-#   True  → OpenCC "s2twp"：除字形外，连词汇也本地化（软件→软件、质量→质量）
-#   False → OpenCC "s2t"  ：仅字形转换，保留原始用词（软件、质量）
-# 仅在繁体模式（_g_output_simplified=False）下有意义。
-_g_vocab_convert: bool = True
-
-
-def _opencc_config() -> str:
-    """依目前词汇转换标志返回对应的 OpenCC 设置名称。"""
-    return "s2twp" if _g_vocab_convert else "s2t"
-
 # ══════════════════════════════════════════════════════
 # ASR 引擎
 # ══════════════════════════════════════════════════════
@@ -540,7 +505,7 @@ class ASREngine:
 
     max_chunk_secs: int = 30   # 每段最长音频（秒），子类别可覆盖
     _OV_SUBDIR: str = "qwen3_asr_int8"   # model_dir 下的 OV 模型子目录，子类别可覆盖
-    # 时间轴对齐改用 chatllm 原生 FA（无需 torch）；与 ChatLLMASREngine 共享
+    # 时间轴对齐用 chatllm 原生 FA（无需 torch）；OpenVINO 卡拉OK逐字模式依赖。
     # 同一文件名与下载流程，让「时间轴对齐」UI 在 CPU/GPU 后端行为一致。
     FA_BIN_NAME = "qwen3-focedaligner-0.6b.bin"
 
@@ -553,7 +518,6 @@ class ASREngine:
         self.dec_req     = None
         self.processor   = None   # LightProcessor（不含 torch）
         self.pad_id      = None
-        self.cc          = None
         self.diar_engine = None   # DiarizationEngine（可选）
         self.aligner     = None   # 兼容标志（chatllm FA 就绪时为 True）
         self.use_aligner = False  # 是否启用时间轴对齐
@@ -567,7 +531,6 @@ class ASREngine:
         """
         import onnxruntime as ort
         import openvino as ov
-        import opencc
         from processor_numpy import LightProcessor
 
         if model_dir is None:
@@ -616,10 +579,8 @@ class ASREngine:
         _s("加载 Processor（纯 numpy）…")
         self.processor = LightProcessor(ov_dir)
         self.pad_id    = self.processor.pad_id
-        self.cc        = opencc.OpenCC(_opencc_config())
 
-        # ── ForcedAligner（chatllm 原生，CPU -ngl 0，无需 torch）──────────
-        #    与 ChatLLMASREngine 共享 chatllm main.exe 子程序对齐逻辑。
+        # ── ForcedAligner（chatllm main.exe 子程序，CPU -ngl 0，无需 torch）──
         #    缺 .bin 时静默退回比例估算；UI 会引导使用者按需下载。
         self._load_aligner(cb=_s)
 
@@ -634,14 +595,6 @@ class ASREngine:
         self.ready     = True
         aligner_info = "  + ForcedAligner" if self.use_aligner else ""
         _s(f"编译完成（{device}{aligner_info}）")
-
-    def rebuild_cc(self):
-        """依目前的词汇转换标志重建 OpenCC 转换器（免重新加载模型）。"""
-        try:
-            import opencc
-            self.cc = opencc.OpenCC(_opencc_config())
-        except Exception:
-            pass
 
     # ── 时间轴对齐（chatllm 原生 FA，CPU -ngl 0）──────────────────────────
     def _load_aligner(self, cb=None):
@@ -751,7 +704,7 @@ class ASREngine:
             if "<asr_text>" in raw:
                 raw = raw.split("<asr_text>", 1)[1]
             text = raw.strip()
-            return text if _g_output_simplified else self.cc.convert(text)
+            return text
 
     def _enforce_chunk_limit(
         self,
@@ -895,8 +848,7 @@ class ASREngine:
                     ts_items = self._align_chunk(_tmp_wav, raw_text, align_lang)
                     if ts_items:
                         subs = _ts_chatllm_to_subtitle_lines(
-                            ts_items, raw_text, g0, spk,
-                            self.cc, _g_output_simplified, with_words=True,
+                            ts_items, raw_text, g0, spk, with_words=True,
                         )
                         if subs:
                             for (s, e, t, sp, words) in subs:
@@ -914,7 +866,7 @@ class ASREngine:
 
             if not aligned:
                 # ── 比例估算 Fallback ──────────────────────────────────────
-                text = raw_text if _g_output_simplified else self.cc.convert(raw_text)
+                text = raw_text
                 lines = _split_to_lines(text)
                 for s, e, line in _assign_ts(lines, g0, g1):
                     all_subs.append((s, e, line, spk))

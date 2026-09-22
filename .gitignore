@@ -78,7 +78,7 @@ test_audio/
 *.flac
 *.m4a
 
-# ── chatllm DLL 目录（二进制，体积大，从 GitHub Releases 获取）────────
+# ── chatllm 目录（FA 对齐器 main.exe 所在，从 GitHub Releases 获取）────
 chatllm/
 chatllmtest/
 
@@ -120,8 +120,6 @@ UI.txt
 release_pkg/
 *.zip
 
-# ── Faster-Whisper-XXL（1.3GB 引擎包 + 解压目录，按需下载不入库）──
-ov_models/Faster-Whisper-XXL*
-ov_models/license.txt
-# 7zr.exe 独立解压器（缺则自动下载，也不入库）
-tools/7zr.exe
+# 7zr.exe 独立解压器（运行时按需下载，不入库）
+tools/
+logs/

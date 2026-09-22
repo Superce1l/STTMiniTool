@@ -99,7 +99,7 @@
   let running = false;
   $("#btn-run").addEventListener("click", async () => {
     if (!picked || running) return;
-    running = true;
+    running = true; _switchBusy = true;    // 转录中 → 模型页切换禁用
     const btn = $("#btn-run");
     btn.disabled = true; btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>识别中…`;
     $("#result").hidden = true;
@@ -123,7 +123,7 @@
       $("#progress").hidden = true;
       logLine("✕ " + (err.message || err));
     } finally {
-      running = false;
+      running = false; _switchBusy = false;
       btn.disabled = false;
       btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>开始转换`;
     }
@@ -550,12 +550,7 @@
       _curCore = _modelOpt.current.core;
       renderCoreCards();
       populateModels(_curCore, _modelOpt.current.model);
-      // 已记住的选择 vs 实际加载的架构不同 → 提示重启
-      const curArch = selectedArch();
-      if (_modelOpt.activeArch && curArch && _modelOpt.activeArch !== curArch) {
-        modelMsg(`已记住「${_curCore} · ${$("#model-select").value}」（${curArch}），`
-          + `将于重新启动后套用（目前以 ${_modelOpt.activeArch} 运行）。`, "info");
-      } else modelMsg("", null);
+      modelMsg("", null);
       updateLoadBtn();              // 设置「下载并加载／前往转录」按钮初始状态
     } catch (e) {}
     // 检测设备 + 诊断
@@ -570,7 +565,6 @@
       host.appendChild(el);
     });
     await renderAccel();
-    await renderBasic();
     const diag = $("#gpu-diag");
     if (d.diag && d.diag.text) {
       diag.hidden = false;
@@ -608,87 +602,30 @@
     if (!core.models.some(m => m.label === modelLabel) && core.models[0]) sel.value = core.models[0].label;
     updateArch();
   }
-  function selectedArch() { const o = $("#model-select").selectedOptions[0]; return o ? o.dataset.arch : ""; }
   function updateArch() {
     const o = $("#model-select").selectedOptions[0];
     $("#model-arch").textContent = (o && o.dataset.arch) || "";
-    const note = o && o.dataset.note, el = $("#model-note");   // chatllm AMD 等提醒
+    const note = o && o.dataset.note, el = $("#model-note");
     if (note) { el.hidden = false; el.textContent = note; } else { el.hidden = true; el.textContent = ""; }
   }
 
-  // ── 模型页模式：基础（用途导向）／进阶（核心＋模型全手动）──────────
-  //   两模式共享同一颗加载钮与 set_model／request_load 管道，故不会状态不一致；
-  //   基础模式只是「帮使用者依硬件挑好那一颗」而已。
-  let _modelMode = "basic";
-  function applyModelMode(mode, persist) {
-    _modelMode = (mode === "advanced") ? "advanced" : "basic";
-    const adv = _modelMode === "advanced";
-    const bp = $("#basic-pane"), ap = $("#advanced-pane"), ax = $("#advanced-extra");
-    if (bp) bp.hidden = adv;
-    if (ap) ap.hidden = !adv;
-    if (ax) ax.hidden = !adv;          // 设备／加速版本／诊断属进阶
-    $$("#model-mode button").forEach(b => b.classList.toggle("on", b.dataset.v === _modelMode));
-    if (persist) { try { API.setSettings({ modelMode: _modelMode }); } catch (e) {} }
-  }
-  $("#model-mode") && $("#model-mode").addEventListener("click", e => {
-    const b = e.target.closest("button"); if (!b) return;
-    applyModelMode(b.dataset.v, true);
-  });
+  // ── 模型页：引擎卡 + 模型下拉（先选引擎，再选模型）───────────────
 
-  async function renderBasic() {
-    let d;
-    try { d = await API.getBasicProfiles(); } catch { return; }
-    const host = $("#basic-profiles");
-    if (!d || !host) return;
-    const hw = $("#basic-hw");
-    if (hw) {
-      const t = hw.querySelector("div");
-      if (t) t.textContent = `${d.hardware}　加速方式：${d.accel}`;
-    }
-    host.innerHTML = "";
-    (d.profiles || []).forEach(p => {
-      const card = document.createElement("label");
-      card.className = "radio-card" + (p.selected ? " sel" : "");
-      card.dataset.key = p.key;
-      card.dataset.core = p.core; card.dataset.model = p.model;
-      card.dataset.note = p.note || "";
-      const state = p.present
-        ? `<span class="chip chip-muted" style="font-weight:400">已下载</span>`
-        : `<span class="chip chip-muted" style="font-weight:400">需下载</span>`;
-      card.innerHTML = `<span class="rd"></span><div class="info">
-        <div class="t">${escapeHtml(p.title)}　${state}</div>
-        <div class="d">${escapeHtml(p.desc || "")}</div>
-        <div class="d" style="margin-top:4px;font-family:var(--font-mono);font-size:11.5px">
-          建议模型：${escapeHtml(p.model)}</div></div>`;
-      host.appendChild(card);
-    });
-    basicNote((d.profiles || []).find(p => p.selected));
-  }
-  function basicNote(p) {
-    const el = $("#basic-note"); if (!el) return;
-    const txt = p && p.note;
-    if (!txt) { el.hidden = true; el.textContent = ""; return; }
-    el.hidden = false; el.textContent = txt;
-  }
-  $("#basic-profiles") && $("#basic-profiles").addEventListener("click", async e => {
-    const card = e.target.closest(".radio-card"); if (!card) return;
-    $$(".radio-card", $("#basic-profiles")).forEach(c => c.classList.toggle("sel", c === card));
-    basicNote({ note: card.dataset.note });
-    // 走与进阶模式完全相同的套用路径（会处理「需重启」等状态）
-    _curCore = card.dataset.core;
-    if (_modelOpt) populateModels(_curCore, card.dataset.model);
-    await applyModel(card.dataset.core, card.dataset.model);
-    await renderBasic();
-  });
+  // ── （基础模式已移除；保留空实现以免调用端报错）─────────────────
 
   // ── 推理加速版本（CrispASR 的 Vulkan / CUDA / CPU build）───────────
   //   后端依 WMI + nvidia-smi 检测硬件后给推荐；这里只负责呈现与回写选择。
-  //   实际下载发生在下次加载模型时（换版本＝换核心，需重启）。
+  //   加速版本只对 CrispASR 引擎有意义：选 OpenVINO 时整个区块隐藏。
+  //   实际下载发生在「下载并加载模型」时（换版本＝换引擎组件，热切换）。
   async function renderAccel() {
     let a;
-    try { a = await API.getAccel(); } catch { return; }
+    const section = $("#accel-section");
+    try { a = await API.getAccel(); } catch { if (section) section.hidden = true; return; }
+    if (!a || !section) { if (section) section.hidden = true; return; }
+    if (a.applicable === false) { section.hidden = true; return; }   // OpenVINO：无需加速器
     const host = $("#accel-cards");
-    if (!a || !a.ok || !host) { if (host) host.innerHTML = ""; return; }
+    if (!a.ok || !host) { section.hidden = true; if (host) host.innerHTML = ""; return; }
+    section.hidden = false;
     host.innerHTML = "";
     (a.options || []).forEach(op => {
       const card = document.createElement("label");
@@ -716,7 +653,7 @@
       } else rb.hidden = true;
     }
     accelMsg(a.needsDownload
-      ? `目前选定的核心尚未下载或版本不符（最新 ${a.latest}），会在下次加载模型时自动取得。`
+      ? `加速器尚未下载或版本不符（最新 ${a.latest}），点「下载并加载模型」时会一并取得。`
       : "", "info");
   }
   function accelMsg(text, level) {
@@ -732,12 +669,12 @@
     $$(".radio-card", _accelHost).forEach(c => c.classList.toggle("sel", c === card));
     try {
       const res = await API.setAccel(card.dataset.variant);
-      if (res && res.message) accelMsg(res.message, res.restartRequired ? "warn" : "info");
+      if (res && res.message) accelMsg(res.message, "info");
       await renderAccel();
     } catch (err) { accelMsg(String(err), "warn"); }
   });
 
-  // 点核心卡 → 切核心、模型回该核心首项并套用
+  // 点核心卡 → 切核心、模型回该核心首项并套用；加速版本区块随引擎刷新
   $("#core-cards").addEventListener("click", async e => {
     const card = e.target.closest(".radio-card"); if (!card) return;
     _curCore = card.dataset.core;
@@ -746,6 +683,7 @@
     const first = core && core.models[0] ? core.models[0].label : "";
     populateModels(_curCore, first);
     await applyModel(_curCore, first);
+    await renderAccel();          // 引擎切换 → 加速版本区块显隐/选项随之更新
   });
   // 换模型 → 套用
   $("#model-select").addEventListener("change", async e => {
@@ -753,15 +691,19 @@
     await applyModel(_curCore, e.target.value);
   });
   let _modelLoading = false;       // 模型「就地下载并加载」进行中（进度导到模型页）
+  let _switchBusy = false;         // 转录进行中 → 模型切换整体禁用
+  // 转录/加载忙碌 → 引擎卡与模型下拉禁操作（热切换的并发保护）
+  function _switchBlocked() { return _switchBusy; }
   async function applyModel(core, model) {
+    if (_switchBlocked()) return;   // 转录中忽略选择变更（下拉会回弹到当前值）
     try {
       const res = await API.setModel(core, model);
-      if (res && res.message) modelMsg(res.message, res.restartRequired ? "warn" : "info");
+      if (res && res.message) modelMsg(res.message, "info");
       else modelMsg("", null);
       updateLoadBtn(res);
     } catch (err) { modelMsg("套用失败：" + (err.message || err), "warn"); }
   }
-  // 依 setModel 结果 + 目前加载状态，决定「下载并加载」按钮的文字/可用性
+  // 依 setModel 结果 + 目前加载状态，决定「下载并加载」按钮的文字/可用性（热切换版）
   async function updateLoadBtn(res) {
     const btn = $("#btn-model-load"); if (!btn) return;
     let st = {};
@@ -770,15 +712,14 @@
     if (_modelLoading || st.loading) {
       btn.disabled = true; btn.textContent = T("model.loading", "下载／加载中…"); return;
     }
-    if (st.modelReady && !(res && res.restartRequired)) {
-      // 已就绪且未要求重启 → 引导前往转录
+    if (st.transcribing) {
+      btn.disabled = true; btn.textContent = T("model.busy", "转录进行中，无法切换"); btn.dataset.act = ""; return;
+    }
+    if (st.modelReady && !(res && res.identityChanged)) {
+      // 已就绪且选择未变 → 引导前往转录
       btn.disabled = false; btn.textContent = T("model.goto", "前往语音转文字"); btn.dataset.act = "goto"; return;
     }
-    if (res && res.restartRequired) {
-      // 已加载其他核心、切换需重启 → 按钮反色（不可就地加载）
-      btn.disabled = true; btn.textContent = T("model.needRestart", "切换核心需重新启动"); btn.dataset.act = ""; return;
-    }
-    // 尚未加载 → 可就地下载并加载
+    // 选择有变化（或尚未加载）→ 热切换：就地下载并加载
     btn.disabled = false; btn.textContent = T("model.load", "下载并加载模型"); btn.dataset.act = "load";
   }
   $("#btn-model-load") && $("#btn-model-load").addEventListener("click", async () => {
@@ -845,7 +786,6 @@
     const uiLang = s.uiLang || "简体中文";
     if ([...$("#set-lang").options].some(o => o.value === uiLang)) $("#set-lang").value = uiLang;
     if (window.I18N) { I18N.setLang(uiLang); refreshViewTitle(); }
-    applyModelMode(s.modelMode || "basic", false);   // 模型页默认「基础」
   }
   function segSet(sel, v) { $$(sel + " button").forEach(b => b.classList.toggle("on", b.dataset.v === v)); }
   // 界面缩放：用 CSS zoom（Chromium/WebView2 支持）整体缩放，px 版面也能等比生效。

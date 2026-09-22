@@ -145,6 +145,11 @@ def _get_paths(model_dir: Path) -> tuple[Path, Path]:
 # ── Git LFS 指针文件检测 ────────────────────────────────────────────────
 _LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
 
+# GGUF 完整性大小下限：模型主干最小也在 1GB 级，下载中断留下的残档
+# 通常远小于此。低于下限视为残缺（存在性检查对中断残档无能为力）。
+_GGUF_MIN_BYTES = 100 * 1024 * 1024   # 100 MB
+
+
 def _file_is_real(path: Path) -> bool:
     """返回 True 表示文件存在且不是 Git LFS pointer。
 
@@ -168,7 +173,18 @@ def _file_is_real(path: Path) -> bool:
         return False
 
 
-# ── ForcedAligner（chatllm .bin，单文件，无需 torch）────────────────────
+def _gguf_is_real(path: Path) -> bool:
+    """GGUF 模型完整性检查：_file_is_real ＋ 大小下限（拦截下载中断残档）。"""
+    if not _file_is_real(path):
+        return False
+    try:
+        return path.stat().st_size >= _GGUF_MIN_BYTES
+    except OSError:
+        return False
+
+
+# ── ForcedAligner（chatllm main.exe 用的 .bin，单文件，无需 torch）───────
+#   OpenVINO 核心的卡拉OK逐字模式：ChatLLMAligner 调 chatllm main.exe 做字级对齐。
 _FA_BIN_NAME = "qwen3-focedaligner-0.6b.bin"
 _FA_BIN_URL  = (
     "https://huggingface.co/dseditor/Collection/resolve/main/"
@@ -177,12 +193,12 @@ _FA_BIN_URL  = (
 
 
 def quick_check_aligner(model_dir: Path) -> bool:
-    """快速检查 chatllm ForcedAligner .bin 是否存在（非 LFS pointer）。"""
+    """快速检查 ForcedAligner .bin 是否存在（非 LFS pointer）。"""
     return _file_is_real(Path(model_dir) / _FA_BIN_NAME)
 
 
 def download_aligner(model_dir: Path, progress_cb=None):
-    """下载 chatllm ForcedAligner .bin 至 model_dir（约 939 MB）。
+    """下载 ForcedAligner .bin 至 model_dir（约 939 MB）。
 
     progress_cb(pct: float, msg: str)   pct ∈ [0, 1]
     下载失败时抛出例外。
@@ -823,136 +839,6 @@ def download_ffmpeg(dest_dir: Path, progress_cb=None):
 
 
 
-# ── Faster-Whisper-XXL 引擎（Purfview，独立下载的第三条 Whisper 路径）────
-# faster-whisper-xxl.exe：CTranslate2 (faster-whisper) 的 standalone 打包，
-# 自带全部依赖与 ffmpeg，比 whisper.cpp 系更快且自带 VAD/对齐。不进安装包
-# —— 1.3GB 7z 按需下载，解压后放 <model_dir>/Faster-Whisper-XXL/。
-# 压缩格式是 BCJ2 滤镜的 .7z：py7zr 不支持，须用官方独立解压器 7zr.exe
-# （约 0.6MB，仅处理 .7z），缺则自动下载到 tools/。
-_FWXXL_URL = ("https://github.com/Purfview/whisper-standalone-win/releases/"
-              "download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z")
-_FWXXL_VERSION = "r245.4"
-_FWXXL_DIRNAME = "Faster-Whisper-XXL"          # 解压后的目录名（含 exe）
-_FWXXL_7ZR_URL = "https://www.7-zip.org/a/7zr.exe"
-_FWXXL_SIZE_MB = 1358
-
-
-def fwxxl_dir(model_dir: Path) -> Path:
-    """Faster-Whisper-XXL 引擎目录：<model_dir>/Faster-Whisper-XXL/。"""
-    return Path(model_dir) / _FWXXL_DIRNAME
-
-
-def quick_check_fwxxl(model_dir: Path) -> bool:
-    """faster-whisper-xxl.exe 是否已就绪（目录根或子层，排除空壳）。"""
-    d = fwxxl_dir(model_dir)
-    return (d / "faster-whisper-xxl.exe").is_file() \
-        or any(d.glob("**/faster-whisper-xxl.exe"))
-
-
-# UI 尺寸代码 → XXL 模型缓存目录名（_models/ 下）。XXL 从 HuggingFace 取
-# Systran/faster-whisper-<size>；turbo 用 Purview 官方仓库 large-v3-turbo。
-# 与 webview_backend._FWWHISPER_MODEL_ARG 的 --model 参数保持同源语义。
-_FWWHISPER_CACHE_NAMES = {
-    "base":   "faster-whisper-base",
-    "small":  "faster-whisper-small",
-    "medium": "faster-whisper-medium",
-    "large":  "faster-whisper-large-v2",
-    "turbo":  "faster-whisper-large-v3-turbo",
-}
-
-
-def fwxxl_model_present(model_dir: Path, size: str) -> bool:
-    """指定尺寸的 Whisper 模型是否已缓存（_models/<名字>/model.bin 存在）。"""
-    name = _FWWHISPER_CACHE_NAMES.get(size)
-    if not name:
-        return False
-    d = fwxxl_dir(model_dir) / "_models" / name
-    return (d / "model.bin").is_file()
-
-
-def fwxxl_models_status(model_dir: Path) -> dict[str, bool]:
-    """五个尺寸的模型缓存状态（自检面板逐项显示用）。"""
-    return {size: fwxxl_model_present(model_dir, size)
-            for size in _FWWHISPER_CACHE_NAMES}
-
-
-def fwxxl_model_present_dir(engine_dir: Path, size: str) -> bool:
-    """同 fwxxl_model_present，但直接给定引擎目录（嵌套布局下与 load() 的
-    exe 解析结果保持一致，供自检面板对齐实际引擎位置）。"""
-    name = _FWWHISPER_CACHE_NAMES.get(size)
-    if not name:
-        return False
-    return ((Path(engine_dir) / "_models" / name / "model.bin").is_file())
-
-
-def _ensure_7zr(tools_dir: Path, progress_cb=None) -> Path:
-    """确保 7zr.exe 存在（缺则自 7-zip.org 下载）；返回其路径。"""
-    exe = Path(tools_dir) / "7zr.exe"
-    if exe.is_file() and exe.stat().st_size > 100_000:
-        return exe
-    exe.parent.mkdir(parents=True, exist_ok=True)
-    if progress_cb:
-        progress_cb(0.0, "下载 7z 解压工具…")
-    _download_file(_FWXXL_7ZR_URL, exe, progress_cb=None)
-    return exe
-
-
-def download_fwxxl(model_dir: Path, progress_cb=None):
-    """下载 Faster-Whisper-XXL r245.4（1.3GB 7z）并解压至 <model_dir>/。
-
-    progress_cb(pct: float, msg: str)。GitHub 来源不套用 HF 镜像。
-    解压用 7zr.exe（BCJ2 滤镜 py7zr 不支持）；解压目标为 <model_dir> 根、
-    归档内自带 Faster-Whisper-XXL/ 顶层目录。下载的 .7z 落在 model_dir
-    （约 1.3GB，解压完删除以省空间；断点续传友好——中断后重跑继续）。
-    """
-    import subprocess as _sp
-    model_dir = Path(model_dir)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    zpath = model_dir / f"Faster-Whisper-XXL_{_FWXXL_VERSION}_windows.7z"
-
-    def _cb(done: int, total_b: int):
-        if progress_cb and total_b > 0:
-            progress_cb(
-                0.9 * done / total_b,
-                f"下载 Faster-Whisper-XXL…  {done/1_048_576:.0f} / {total_b/1_048_576:.0f} MB",
-            )
-
-    if not (zpath.is_file() and zpath.stat().st_size >= _FWXXL_SIZE_MB * 1024 * 1024 * 0.98):
-        if progress_cb:
-            progress_cb(0.0, f"下载 Faster-Whisper-XXL {_FWXXL_VERSION}（约 {_FWXXL_SIZE_MB} MB）…")
-        _download_file(_FWXXL_URL, zpath, progress_cb=_cb)
-
-    if progress_cb:
-        progress_cb(0.92, "解压 Faster-Whisper-XXL（约 3.5 GB，需数分钟）…")
-    sevenzr = _ensure_7zr(BASE_DIR_TOOLS(), progress_cb=progress_cb)
-    dest = model_dir
-    dest.mkdir(parents=True, exist_ok=True)
-    proc = _sp.run([str(sevenzr), "x", "-y", f"-o{dest}", str(zpath)],
-                   capture_output=True, creationflags=_CREATE_NO_WINDOW)
-    if proc.returncode != 0 or not quick_check_fwxxl(dest):
-        # 坏包/坏解压器不保留：尺寸门槛拦不住「截断到 98.5%」的残档，留着只会
-        # 让每次重试都跳过下载、在同一处失败。删除后下次自动重新下载。
-        for bad in (zpath, sevenzr):
-            try:
-                bad.unlink(missing_ok=True)
-            except OSError:
-                pass
-        err = (proc.stderr or b"").decode(errors="replace").strip().splitlines()
-        raise RuntimeError("Faster-Whisper-XXL 解压失败（已清理损坏文件，重试将重新下载）："
-                           + (err[-1] if err else f"7zr 返回码 {proc.returncode}"))
-    try:
-        zpath.unlink(missing_ok=True)       # 解压成功即删 7z 省空间
-    except Exception:
-        pass
-    if progress_cb:
-        progress_cb(1.0, f"Faster-Whisper-XXL {_FWXXL_VERSION} 就绪")
-
-
-def BASE_DIR_TOOLS() -> Path:
-    """7zr.exe 的存放目录：frozen 时 EXE 旁 tools/，开发时项目 tools/。"""
-    if getattr(_sys, "frozen", False):
-        return Path(_sys.executable).parent / "tools"
-    return Path(__file__).parent / "tools"
 
 
 # ── qwen3 ForcedAligner GGUF（CrispASR -am 对齐器，Whisper 核心专用 FA）──
@@ -1026,8 +912,13 @@ def qwen3_asr_gguf_filename(quant: str = _QWEN3_ASR_GGUF_DEFAULT) -> str:
 
 def quick_check_qwen3_asr_gguf(model_dir: Path,
                                quant: str = _QWEN3_ASR_GGUF_DEFAULT) -> bool:
-    """指定量化的 Qwen3-ASR-1.7B GGUF 是否存在（排除 LFS pointer）。"""
-    return _file_is_real(Path(model_dir) / qwen3_asr_gguf_filename(quant))
+    """指定量化的 Qwen3-ASR-1.7B GGUF 是否存在且非残缺。
+
+    除 LFS pointer 外再设大小下限（100MB）：下载中断会留下同名残档，
+    存在性检查会误判「已下载」→ 加载时 crispasr 报 failed to initialise
+    backend（无任何提示是文件残缺）。
+    """
+    return _gguf_is_real(Path(model_dir) / qwen3_asr_gguf_filename(quant))
 
 
 def download_qwen3_asr_gguf(model_dir: Path,
@@ -1077,8 +968,8 @@ def qwen3_asr_ja_gguf_filename(quant: str = _QWEN3_ASR_JA_GGUF_DEFAULT) -> str:
 
 def quick_check_qwen3_asr_ja_gguf(model_dir: Path,
                                   quant: str = _QWEN3_ASR_JA_GGUF_DEFAULT) -> bool:
-    """指定量化的 ja-anime GGUF 是否存在（排除 LFS pointer）。"""
-    return _file_is_real(Path(model_dir) / qwen3_asr_ja_gguf_filename(quant))
+    """指定量化的 ja-anime GGUF 是否存在且非残缺（同 q4_k 的大小下限防线）。"""
+    return _gguf_is_real(Path(model_dir) / qwen3_asr_ja_gguf_filename(quant))
 
 
 def download_qwen3_asr_ja_gguf(model_dir: Path,
@@ -1175,7 +1066,12 @@ def _download_file(url: str, dest: Path, progress_cb=None):
     """
     下载单一文件至 dest，支持断点续传（Resume）。
     progress_cb(done_bytes: int, total_bytes: int)
+
+    完整性校验：下载结束时对账 Content-Length——不匹配（连接中断导致静默
+    截断）则抛 RuntimeError 删除残档，绝不把残缺文件留给加载端当完整模型。
     """
+    from applog import log_download, log_error
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     existing = dest.stat().st_size if dest.exists() else 0
 
@@ -1213,6 +1109,21 @@ def _download_file(url: str, dest: Path, progress_cb=None):
                     progress_cb(done, total)
     finally:
         resp.close()
+
+    # ── 完整性对账 ────────────────────────────────────────────────
+    #   服务器有声明长度且收到的字节数不符 → 连接中断的静默截断。
+    #   删除残档（下次重下）并抛错；断点续传场景 done 应等于 total。
+    if total and done != total:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        log_error(f"下载完整性校验失败（已删除残档）", exc=None)
+        log_download(f"{dest.name}: received {done}/{total} bytes — file removed")
+        raise RuntimeError(
+            f"下载中断：{dest.name} 只收到 {done/1_048_576:.0f}/{total/1_048_576:.0f} MB"
+            "（残档已删除，重试将重新下载）。")
+    log_download(f"{dest.name}: download OK ({done/1_048_576:.1f} MB)")
 
 
 def _download_file_with_fallback(

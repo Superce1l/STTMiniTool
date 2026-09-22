@@ -35,6 +35,17 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
+
+def _require_scipy():
+    """说话者分离的聚类依赖 scipy；缺失时给中文指引而非裸 ImportError。"""
+    try:
+        import scipy  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "说话者分离需要 scipy 组件但当前环境未包含。请重新安装完整版程序，"
+            "或执行 pip install scipy 后重试。") from e
+
+
 # ── 常数（从 pyannote-rs 源码 segment.rs 取得）─────────────────
 SAMPLE_RATE    = 16_000
 WINDOW_SAMPLES = SAMPLE_RATE * 10          # 160,000 samples = 10 秒
@@ -352,6 +363,7 @@ class DiarizationEngine:
         指定人数模式：Average-linkage 层次聚类，强制分成 n 组。
         返回 1-indexed 标签列表。
         """
+        _require_scipy()
         from scipy.cluster.hierarchy import linkage, fcluster
         from scipy.spatial.distance import squareform
 
@@ -384,6 +396,7 @@ class DiarizationEngine:
 
         返回 1-indexed 标签列表。
         """
+        _require_scipy()
         from scipy.cluster.hierarchy import linkage, fcluster
         from scipy.spatial.distance import squareform
 

@@ -22,73 +22,37 @@ import app as core          # 重用 ASREngine / 常数 / 诊断函数（__main_
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# ── 模型目录：核心 → 模型 → (backend, settings patch)。──────────────────
-#   webview 自有目录（不直接用 app._resolve_backend），因为它多了一个
-#   app.py 尚无的「Qwen on CRISPASR」项（同颗 crispasr.exe 跑 Qwen3-ASR GGUF，
-#   见 crispasr-nemotron-eval）。settings 键与 app.py 兼容：
+# ── 模型目录：引擎 → 模型 → (backend, settings patch)。──────────────────
+#   引擎即推理核心（两组）：OpenVINO（纯 CPU 的 Qwen）与 CrispASR（GPU 加速，
+#   跑 Whisper GGML 与 Qwen3-ASR GGUF）。settings 键与 app.py 兼容：
 #     openvino → cpu_model_size("0.6B"/"1.7B")
-#     chatllm  → 无额外键（单一 .bin）
 #     crispasr → crisp_model("whisper"/"qwen3") + whisper_size/qwen 量化键
-#   每个 entry：(核心标签, 模型标签, backend, settings_patch)
-# chatllm（Vulkan）核心：因 AMD 核显已知问题 + 打包时二进位常被防毒隔离，
-# 核心二进位「不放进安装包」（build_webview.bat 不再复制 chatllm/）。但引擎代码
-# (_load_chatllm/chatllm_engine)保留，且为「向下兼容」——曾使用 chatllm 的旧用户
-# （或自 CTk 桌面版升级、机器上已备有 chatllm/ 的人）仍能选用并确认其加载状况：
-#   • 模型清单：chatllm 项目只在「机器上实际有 chatllm/libchatllm.dll」或「目前
-#     已记住 backend=chatllm」时才显示（_chatllm_available）→ 新安装的干净机器看不到，
-#     不污染主推 CASR-Qwen 的 UI；旧用户仍可见、可切。
-#   • 系统自检：同条件下 health_check 会列出 chatllm 核心（DLL／模型／FA）就绪状况。
-_CHATLLM_LABEL = "Qwen3-ASR-1.7B Q8（Vulkan · 兼容，chatllm v24）"
-_CHATLLM_AMD_NOTE = ("⚠️ chatllm 核心在部分 AMD 核显／APU 有已知兼容问题，且核心二进位"
-                     "未随安装包提供（保留供既有使用者向下兼容）；若遇死机或无输出，"
-                     "建议改用「Qwen · CRISPASR/Vulkan」核心。")
-# OpenAI Whisper 核心标签与尺寸映射（供目录 / _current_selection / 下拉等使用）
-_WHISPER_CORE = "Whisper"
+#   每个 entry：(引擎标签, 模型标签, backend, settings patch)
+_ENGINE_OV  = "OpenVINO"
+_ENGINE_CASR = "CrispASR"
+# OpenAI Whisper 模型标签映射（供目录 / _current_selection / 下拉等使用）
 _WHISPER_SIZES = ("base", "small", "medium", "large", "turbo")
 _WHISPER_LABEL_BY_SIZE = {
     "base": "Whisper Base", "small": "Whisper Small", "medium": "Whisper Medium",
     "large": "Whisper Large", "turbo": "Whisper Large Turbo",
 }
-# Faster-Whisper-XXL 引擎（Purfview standalone，CTranslate2）：挂在 Whisper
-# 核心下的独立引擎选项。模型为 HuggingFace Systran 系（引擎自行管理/下载），
-# 5 档尺寸与 CrispASR whisper 路径对齐，另附 turbo 说明。
-_FWWHISPER_CORE = "Faster-Whisper-XXL"
-_FWWHISPER_SIZES = ("base", "small", "medium", "large", "turbo")
-_FWWHISPER_LABEL_BY_SIZE = {
-    "base": "Whisper Base (FWXXL)", "small": "Whisper Small (FWXXL)",
-    "medium": "Whisper Medium (FWXXL)", "large": "Whisper Large (FWXXL)",
-    "turbo": "Whisper Large Turbo (FWXXL)",
-}
-# UI 尺寸代码 → XXL --model 参数（turbo=large-v3-turbo）
-_FWWHISPER_MODEL_ARG = {
-    "base": "base", "small": "small", "medium": "medium",
-    "large": "large-v2", "turbo": "large-v3-turbo",
-}
 _MODEL_CATALOG = [
-    ("Qwen", "Qwen3-ASR-0.6B",              "openvino", {"cpu_model_size": "0.6B"}),
-    ("Qwen", "Qwen3-ASR-1.7B INT8",         "openvino", {"cpu_model_size": "1.7B"}),
-    ("Qwen", "Qwen3-ASR-1.7B Q4 (CRISPASR)", "crispasr", {"crisp_model": "qwen3", "crisp_qwen_quant": "q4"}),
-    ("Qwen", "Qwen3-ASR-1.7B Q8 (CRISPASR)", "crispasr", {"crisp_model": "qwen3", "crisp_qwen_quant": "q8"}),
+    (_ENGINE_OV, "Qwen3-ASR-0.6B",      "openvino", {"cpu_model_size": "0.6B"}),
+    (_ENGINE_OV, "Qwen3-ASR-1.7B INT8", "openvino", {"cpu_model_size": "1.7B"}),
+    (_ENGINE_CASR, "Qwen3-ASR-1.7B Q4 (CRISPASR)", "crispasr", {"crisp_model": "qwen3", "crisp_qwen_quant": "q4"}),
+    (_ENGINE_CASR, "Qwen3-ASR-1.7B Q8 (CRISPASR)", "crispasr", {"crisp_model": "qwen3", "crisp_qwen_quant": "q8"}),
     # 日语动漫特化（cstr/qwen3-asr-1.7b-ja-anime）：同架构、针对日语微调，日文歌词/台词识别较佳。
-    ("Qwen", "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)", "crispasr", {"crisp_model": "qwen3-ja", "crisp_qwen_quant": "q4"}),
-    ("Qwen", "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)", "crispasr", {"crisp_model": "qwen3-ja", "crisp_qwen_quant": "q8"}),
-    # chatllm（兼容项）：永远在目录中（供 set_model 查得），但 get_model_options
-    # 会依 _chatllm_available 决定是否实际呈现给前端。
-    ("Qwen", _CHATLLM_LABEL,                "chatllm",  {}),
-] + [
+    (_ENGINE_CASR, "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)", "crispasr", {"crisp_model": "qwen3-ja", "crisp_qwen_quant": "q4"}),
+    (_ENGINE_CASR, "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)", "crispasr", {"crisp_model": "qwen3-ja", "crisp_qwen_quant": "q8"}),
     # OpenAI Whisper 官方模型（ggerganov/whisper.cpp GGML）：CrispASR 的 whisper
     # 后端直接兼容。5 档尺寸覆盖速度／精度需求。
-    (_WHISPER_CORE, _WHISPER_LABEL_BY_SIZE[size], "crispasr",
+] + [
+    (_ENGINE_CASR, _WHISPER_LABEL_BY_SIZE[size], "crispasr",
      {"crisp_model": "whisper", "whisper_size": size})
     for size in _WHISPER_SIZES
-] + [
-    # Faster-Whisper-XXL（Purfview standalone，CTranslate2）：第三条 Whisper
-    # 路径。引擎 1.3GB 按需下载（downloader.download_fwxxl），模型由引擎自行
-    # 取自 HuggingFace Systran 系。CPU／NVIDIA 皆可（--device auto 自适配）。
-    (_FWWHISPER_CORE, _FWWHISPER_LABEL_BY_SIZE[size], "fastwhisper",
-     {"fw_model": size})
-    for size in _FWWHISPER_SIZES
 ]
+# 旧「核心标签」（_current_selection 回退 / set_model 防呆用）
+_CORE_FALLBACK = {(_ENGINE_OV,): "Qwen3-ASR-0.6B"}
 _QWEN_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B Q4 (CRISPASR)",
                           "q8": "Qwen3-ASR-1.7B Q8 (CRISPASR)"}
 _QWEN_JA_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)",
@@ -99,58 +63,20 @@ _WHISPER_MODEL_NOTES = {
                             "显存占用约为 Large 的一半，推荐优先。"),
     "Whisper Large":       "Large-v2：精度最高但速度最慢，适合追求极限准确度的离线场景。",
 }
-# 模型标签 → 提醒文字（Whisper 尺寸提示；chatllm 的提醒仍依 backend 给）
+# 模型标签 → 提醒文字（Whisper 尺寸提示）
 _MODEL_NOTES = _WHISPER_MODEL_NOTES
 
-# ══════════════════════════════════════════════════════════════════════
-# 基础模式：用「用途」而非「模型名」让使用者选
-# ══════════════════════════════════════════════════════════════════════
-#   模型页分两种模式（默认基础）：
-#     基础(basic)   → 选用途 → 依检测到的硬件给出建议模型 → 按同一颗加载钮
-#     进阶(advanced)→ 维持原本的「核心 + 模型下拉」全手动界面
-#   两者共享同一个 set_model / request_load 管道，故不会有状态不一致。
-#
-# 硬件分级（tier）决定同一用途要给哪个量化：
-#   gpu  = 有独立显卡（NVIDIA／AMD 独显）→ 给最准的 Q8
-#   igpu = 只有核显（Intel／AMD APU）    → 给较轻的 Q4／Q5
-#   cpu  = 完全没检测到显卡            → 中文用途改推 OpenVINO 0.6B（纯 CPU 主场）
-_BASIC_PROFILES = [
-    {
-        "key":   "zh",
-        "title": "中文（标准）",
-        "desc":  "一般用途首选：中文为主、断句与标点最完整，长视频／会议／访谈都适用。",
-        "picks": {
-            "gpu":  ("Qwen", _QWEN_CASR_QUANT_LABEL["q8"]),
-            "igpu": ("Qwen", _QWEN_CASR_QUANT_LABEL["q4"]),
-            "cpu":  ("Qwen", "Qwen3-ASR-0.6B"),
-        },
-    },
-    {
-        "key":   "ja",
-        "title": "日本语",
-        "desc":  "日语／动漫特化：日文歌词与台词识别明显较佳，且输出保留日文原生汉字"
-                 "（不会被误转成简体字形）。",
-        "picks": {
-            "gpu":  ("Qwen", _QWEN_JA_CASR_QUANT_LABEL["q8"]),
-            "igpu": ("Qwen", _QWEN_JA_CASR_QUANT_LABEL["q4"]),
-            "cpu":  ("Qwen", _QWEN_JA_CASR_QUANT_LABEL["q4"]),
-        },
-    },
-    {
-        "key":   "whisper",
-        "title": "OpenAI Whisper（通用）",
-        "desc":  "官方 Whisper 模型：99 种语言通用，多语言混合场景稳健。"
-                 "依硬件自动在 Base／Small／Medium／Large／Turbo 间挑选。",
-        "picks": {
-            "gpu":  (_WHISPER_CORE, "Whisper Large Turbo"),
-            "igpu": (_WHISPER_CORE, "Whisper Small"),
-            "cpu":  (_WHISPER_CORE, "Whisper Base"),
-        },
-    },
-]
-# 没有显卡时，非中文用途只剩 GGUF 模型可用 → 据实提醒会比较慢
-_BASIC_CPU_SLOW_NOTE = ("此用途没有纯 CPU 的专用模型，将以 CrispASR 在处理器上执行，"
-                        "速度会明显较慢；若可接受请直接下载，或改选「中文（标准）」。")
+
+def _sanitize_tag(tag: str) -> str:
+    """引擎/模型标签 → 文件名安全片段（供输出字幕文件名拼接）。
+
+    去除 Windows 文件名非法字符与路径分隔符、压掉多余空白；空串回 "model"。
+    """
+    for ch in '<>:"/\\|?*':
+        tag = tag.replace(ch, " ")
+    tag = " ".join(tag.split())
+    return tag or "model"
+
 # crispasr-Qwen 系列的 crisp_model 值（皆走 --backend qwen3-1.7b、同置 ov_models/、
 # 共享 crisp_qwen_quant，差别只在权重与下载来源）。"whisper" 不在此列。
 _QWEN_CASR_MODELS = ("qwen3", "qwen3-ja")
@@ -175,7 +101,7 @@ def _qwen_casr_dl(crisp_model: str):
             download_qwen3_asr_gguf)
 
 # ── 长音频 FFmpeg 切片转录 ────────────────────────────────────────────
-#   超长音频一次性塞给引擎会造成：内存峰值高、OpenVINO/chatllm 的 KV-Cache 线性
+#   超长音频一次性塞给引擎会造成：内存峰值高、OpenVINO 的 KV-Cache 线性
 #   膨胀、转录中途失败要整段重来。这里先用 ffmpeg 把音频按等长窗口切片（相邻
 #   片段重叠 SLICE_OVERLAP 秒，避免切点把一个字/一句话劈成两半造成漏识），
 #   逐片转录，再把各片 SRT 解析后按片起点平移、重叠区去重合并成整份结果。
@@ -308,9 +234,9 @@ def _srt_ts_fmt(sec: float) -> str:
 # 说话者分离是「与后端无关的外部 ONNX」(diarize.py / DiarizationEngine)：
 # OpenVINO 与 CRISPASR(whisper/qwen) 皆支持——前者 process_file 内置 use_diar 分支，
 # 后者由 crisp_engine._apply_diarization 依时间指派。diar_engine 由 _ensure_diarization 挂上。
-_DIARIZE_BACKENDS = {"openvino", "chatllm", "crispasr"}
+_DIARIZE_BACKENDS = {"openvino", "crispasr"}
 
-# 识别语言：crispasr/chatllm 共享的常用语言清单（OpenVINO 改用 processor 的）
+# 识别语言：crispasr 使用的常用语言清单（OpenVINO 改用 processor 的）
 _COMMON_LANGS = [
     "Chinese", "English", "Japanese", "Korean", "Cantonese", "French", "German",
     "Spanish", "Portuguese", "Russian", "Arabic", "Thai", "Vietnamese",
@@ -428,7 +354,6 @@ class WebBackend:
         cur.setdefault("backend", "crispasr")
         cur.setdefault("crisp_model", "qwen3")
         cur.setdefault("crisp_qwen_quant", "q4")
-        cur.setdefault("output_simplified", True)   # 本分支默认输出简体
         try:
             f.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -442,49 +367,78 @@ class WebBackend:
             except Exception:
                 pass
 
-    # ── 模型加载（背景线程调用）──────────────────────────
+    # ── 模型加载（背景线程调用；支持热切换，可重复调用）──────────────
     def start_load(self):
-        if self._loading or self._loaded:
+        # 热切换：不再限制「整个进程只加载一次」。转录进行中或正在加载时
+        # 忽略新的加载请求（前端同时会禁用按钮）。
+        if self._loading or self._transcribing:
             return
         self._loading = True
         threading.Thread(target=self._load_worker, name="model-loader", daemon=True).start()
 
-    def _load_worker(self):
-        # 依 settings.backend 全新加载对应引擎。因「切换=重启」，每次启动只加载
-        # 一个核心、且为全新进程，天然避开 chatllm Vulkan 双 context 切换死机。
-        backend = self._persisted_backend()           # openvino / chatllm / crispasr / fastwhisper
+    def _release_engine(self, old):
+        """显式释放旧引擎（OpenVINO 编译模型体量可观，不等 GC）。"""
+        if old is None:
+            return
+        import gc
         try:
-            if backend == "chatllm":
-                self._load_chatllm()
-            elif backend == "crispasr":
-                self._load_crispasr()
-            elif backend == "fastwhisper":
-                self._load_fastwhisper()
-            else:
-                backend = "openvino"
-                self._load_openvino()
-            self._loaded = True
-            self._active_backend = backend
-            self._remember_active(backend)
-            self._emit("status", {"modelReady": True})
-        except Exception as e:
-            traceback.print_exc()
-            head = str(e).splitlines()[0][:110] if str(e) else type(e).__name__
-            # GPU 核心加载失败 → 退回 CPU(OpenVINO)，但明确告知(非静默回退)
-            if backend != "openvino":
-                self._emit("progress", {"pct": 0, "status": f"{backend} 加载失败，改用 CPU 核心…"})
+            old.ready = False
+        except Exception:
+            pass
+        del old
+        gc.collect()
+
+    def _load_worker(self):
+        # 依 settings.backend 全新加载对应引擎。支持热切换：
+        # 持 self._lock 与转录互斥（转录也持此锁），加载前释放旧引擎
+        # （OpenVINO 编译模型体量可观，显式释放避免新旧并存双占内存）。
+        from applog import log_model, log_error
+        backend = self._persisted_backend()           # openvino / crispasr
+        eng_label, model_label = self._current_selection()
+        log_model(f"开始加载：{eng_label} · {model_label}（backend={backend}）")
+        old_engine = getattr(self, "engine", None)
+        try:
+            with self._lock:
                 try:
-                    self._load_openvino()
+                    self.engine = None                    # 先摘下旧引擎，加载期间状态为「未就绪」
+                    self._release_engine(old_engine)
+                    old_engine = None
+                    if backend == "crispasr":
+                        self._load_crispasr()
+                    else:
+                        backend = "openvino"
+                        self._load_openvino()
                     self._loaded = True
-                    self._active_backend = "openvino"
-                    self._remember_active("openvino")
-                    self._load_err = f"{backend} 核心加载失败，已退回 CPU(OpenVINO)：{head}"
-                    self._emit("status", {"modelReady": True, "error": self._load_err})
-                    return
-                except Exception:
+                    self._active_backend = backend
+                    self._remember_active(backend)
+                    log_model(f"加载完成：{eng_label} · {model_label}")
+                    self._emit("status", {"modelReady": True})
+                except Exception as e:
                     traceback.print_exc()
-            self._load_err = str(e)
-            self._emit("status", {"modelReady": False, "error": str(e)})
+                    log_error(f"模型加载失败（{eng_label} · {model_label}）", exc=e)
+                    head = str(e).splitlines()[0][:110] if str(e) else type(e).__name__
+                    # 加载失败回退优先级：① 之前加载过的旧引擎（还能用）→ ② OpenVINO（若失败的不是它）
+                    if old_engine is not None:
+                        self.engine = old_engine
+                        old_engine = None
+                        self._loaded = True
+                        self._load_err = f"{eng_label} · {model_label} 加载失败，已回退原引擎：{head}"
+                        log_model(f"回退原引擎：{self._active_backend}")
+                        self._emit("status", {"modelReady": True, "error": self._load_err})
+                    elif backend != "openvino":
+                        self._emit("progress", {"pct": 0, "status": f"{backend} 加载失败，改用 CPU 核心…"})
+                        try:
+                            self._load_openvino()
+                            self._loaded = True
+                            self._active_backend = "openvino"
+                            self._remember_active("openvino")
+                            self._load_err = f"{backend} 核心加载失败，已退回 CPU(OpenVINO)：{head}"
+                            self._emit("status", {"modelReady": True, "error": self._load_err})
+                        except Exception:
+                            traceback.print_exc()
+                    if self.engine is None:
+                        self._load_err = str(e)
+                        self._emit("status", {"modelReady": False, "error": str(e)})
         finally:
             self._loading = False
 
@@ -502,7 +456,7 @@ class WebBackend:
         return int(m.group(1)) if m else 0
 
     # 每段最长秒数：使用者设置 → 套到当前引擎，但永远压到「模型天花板」。
-    # 天花板＝引擎类别的 max_chunk_secs（0.6B/chatllm 30、1.7B 10），由音频
+    # 天花板＝引擎类别的 max_chunk_secs（0.6B 30、1.7B 10），由音频
     # 编码器导出长度写死，超过会被静默截断掉字，故只允许往短调，绝不超过。
     # crispasr（无 max_chunk_secs 类别属性）走自身窗口，不受此设置影响。
     _CHUNK_FLOOR = 5
@@ -554,47 +508,6 @@ class WebBackend:
         eng.load(device="CPU", model_dir=model_dir, cb=self._st, cpu_threads=cpu_threads)
         self.engine = eng
 
-    def _load_chatllm(self):
-        from chatllm_engine import ChatLLMASREngine
-        s = self._settings_raw()
-        chatllm_dir = Path(s.get("chatllm_dir", str(getattr(core, "_CHATLLM_DIR", BASE_DIR / "chatllm"))))
-        default_bin = getattr(core, "_BIN_PATH", BASE_DIR / "ov_models" / "qwen3-asr-1.7b.bin")
-        model_path = Path(s.get("model_path") or s.get("gguf_path") or str(default_bin))
-        if not model_path.exists():
-            for c in (Path(s.get("model_dir", "")) / "qwen3-asr-1.7b.bin" if s.get("model_dir") else None,
-                      default_bin):
-                if c and Path(c).exists():
-                    model_path = Path(c)
-                    break
-        if not model_path.exists():
-            self._download_chatllm_bin(model_path)
-        eng = ChatLLMASREngine()
-        eng.load(model_path=model_path, chatllm_dir=chatllm_dir, n_gpu_layers=99,
-                 device_id=self._vk_device_id(s), cb=self._st)
-        self.engine = eng
-
-    def _download_chatllm_bin(self, model_path: Path):
-        import urllib.request
-        from downloader import _ssl_ctx
-        self._st("下载 chatllm 模型（~2.3 GB）…")
-        url = "https://huggingface.co/dseditor/Collection/resolve/main/qwen3-asr-1.7b.bin"
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; STTMiniTool)"})
-        with urllib.request.urlopen(req, context=_ssl_ctx()) as resp, \
-                open(str(model_path) + ".tmp", "wb") as out:
-            total = int(resp.headers.get("Content-Length", 0))
-            done = 0
-            while True:
-                block = resp.read(65536)
-                if not block:
-                    break
-                out.write(block)
-                done += len(block)
-                if total > 0:
-                    self._dl_progress(done / total, f"模型 {done/1048576:.0f}/{total/1048576:.0f} MB")
-        import os as _os
-        _os.replace(str(model_path) + ".tmp", str(model_path))
-
     def _load_crispasr(self):
         from crisp_engine import CrispWhisperEngine
         from downloader import (quick_check_crispasr, download_crispasr_core,
@@ -610,10 +523,11 @@ class WebBackend:
         fa_quant = s.get("crisp_fa_quant", "q5")
         variant = self._crisp_variant()                  # 加速版本（vulkan/cuda…）
 
-        # crispasr.exe 核心一律需要。带 variant 检查 → 版本升级或使用者改选
-        # 加速版本时都会判定为「不就绪」而重新下载对应的 zip。
+        # crispasr.exe 核心（即推理加速器，依 variant 对应 Vulkan/CUDA/CPU build）
+        # 一律需要。带 variant 检查 → 版本升级或使用者改选加速版本时都会判定为
+        # 「不就绪」而重新下载对应的 zip——即「下载并加载模型」时一并取得加速器。
         if not quick_check_crispasr(crispasr_dir, variant):
-            self._st("下载 CrispASR 核心…")
+            self._st(f"下载 CrispASR 加速器（{variant}）…")
             download_crispasr_core(crispasr_dir, progress_cb=self._dl_progress,
                                    variant=variant)
 
@@ -655,39 +569,18 @@ class WebBackend:
                  gpu_backend=crispasr_gpu_backend(variant))
         self.engine = eng
 
-    def _load_fastwhisper(self):
-        """Faster-Whisper-XXL 引擎加载分支（catalog backend='fastwhisper'）。
-
-        引擎目录钉在模型目录下 Faster-Whisper-XXL/；1.3GB 7z 缺则自动下载
-        （downloader.download_fwxxl，7zr 解压）。模型为 HuggingFace Systran
-        系，由 exe 按 --model_dir 自取（首次转录该尺寸时下载）。
-        """
-        from downloader import quick_check_fwxxl, download_fwxxl, fwxxl_dir, _FWXXL_SIZE_MB
-        from fastwhisper_engine import FastWhisperEngine
-        s = self._settings_raw()
-        model_dir = Path(s.get("model_dir", str(getattr(core, "_DEFAULT_MODEL_DIR",
-                                                        BASE_DIR / "ov_models"))))
-        if not quick_check_fwxxl(model_dir):
-            self._st(f"下载 Faster-Whisper-XXL 引擎（约 {_FWXXL_SIZE_MB} MB，首次需数分钟）…")
-            download_fwxxl(model_dir, progress_cb=self._dl_progress)
-        size = s.get("fw_model", "small")
-        eng = FastWhisperEngine()
-        eng.load(engine_dir=fwxxl_dir(model_dir),
-                 model_size=_FWWHISPER_MODEL_ARG.get(size, size),
-                 cb=self._st)
-        self.engine = eng
-
     # ── 状态 ────────────────────────────────────────────────
     def get_status(self) -> dict:
         active = getattr(self, "_active_backend", "openvino")
         return {
             "modelReady": bool(getattr(self.engine, "ready", False)),
             "loading": self._loading,
+            "transcribing": self._transcribing,          # 转录中 → 前端禁切换
             "error": self._load_err,
             "backend": self._backend_label(active, "CPU · OpenVINO INT8"),
             "backendKey": self._persisted_backend(),       # 已记住的核心选择
             "activeBackend": active,                        # 实际加载中的核心
-            "device": "GPU" if active in ("chatllm", "crispasr") else "CPU",
+            "device": "GPU" if active == "crispasr" else "CPU",
             "version": self._app_version(),
             "appName": "语音识别小工具",
             # 是否已有「任一组」模型下载完成（信息用）
@@ -721,14 +614,33 @@ class WebBackend:
                     _, check_fn, _ = _qwen_casr_dl(cm)
                     return check_fn(model_dir, s.get("crisp_qwen_quant", "q8"))
                 return quick_check_whisper_ggml(cd, s.get("whisper_size", "base"))
-            if be == "chatllm":
-                return ((self._chatllm_dir() / "qwen3-asr-1.7b.bin").exists()
-                        or (model_dir / "qwen3-asr-1.7b.bin").exists())
-            if be == "fastwhisper":
-                # 引擎 exe 就绪即视为「已就绪」：模型由 XXL 按需自动下载，
-                # 首次转录对应尺寸时会拉取（不阻塞启动页决策）。
-                from downloader import quick_check_fwxxl
-                return quick_check_fwxxl(model_dir)
+        except Exception:
+            traceback.print_exc()
+        return False
+
+    def selected_model_present_for(self, backend: str, patch: dict) -> bool:
+        """给定目录项（backend + settings patch）的模型文件是否已下载。
+
+        CLI `profiles` 用：与 selected_model_present() 同样的判断，但吃
+        「任意一项」而非目前 settings 里选定的。
+        """
+        try:
+            from downloader import (quick_check, quick_check_1p7b, quick_check_whisper_ggml,
+                                    quick_check_crispasr)
+            s = patch
+            model_dir = self._model_dir()
+            if backend == "openvino":
+                return (quick_check_1p7b(model_dir)
+                        if "1.7B" in s.get("cpu_model_size", "0.6B") else quick_check(model_dir))
+            if backend == "crispasr":
+                cd = self._crispasr_dir()
+                if not quick_check_crispasr(cd):
+                    return False
+                cm = s.get("crisp_model", "whisper")
+                if cm in _QWEN_CASR_MODELS:
+                    _, check_fn, _ = _qwen_casr_dl(cm)
+                    return check_fn(model_dir, s.get("crisp_qwen_quant", "q8"))
+                return quick_check_whisper_ggml(cd, s.get("whisper_size", "base"))
         except Exception:
             traceback.print_exc()
         return False
@@ -748,9 +660,7 @@ class WebBackend:
             for q in ("q4", "q8"):
                 if quick_check_qwen3_asr_gguf(model_dir, q) or quick_check_qwen3_asr_ja_gguf(model_dir, q):
                     return True
-            # chatllm .bin（向下兼容）
-            if (self._chatllm_dir() / "qwen3-asr-1.7b.bin").exists():
-                return True
+            # 旧版遗留的 chatllm ASR .bin（无对应核心，仅作「已有模型」判定）
             if (model_dir / "qwen3-asr-1.7b.bin").exists():
                 return True
         except Exception:
@@ -778,6 +688,8 @@ class WebBackend:
     # opts: {path, language, diarize, nSpeakers, align, hint}
     # progress_cb(pct:int, status:str)
     def transcribe(self, opts: dict, progress_cb=None) -> dict:
+        import time as _time
+        from applog import log_transcribe
         if not getattr(self.engine, "ready", False):
             raise RuntimeError("模型尚未加载完成，请稍候再试。")
         path = opts.get("path")
@@ -785,6 +697,12 @@ class WebBackend:
             raise RuntimeError("找不到音频文件。")
         self._cancel = False
         self._transcribing = True
+        _t0 = _time.monotonic()
+        eng_label, model_label = self._current_selection()
+        log_transcribe(f"开始转录：{Path(path).name}"
+                       f"（{eng_label} · {model_label}，"
+                       f"语言={opts.get('language') or '自动'}"
+                       f"{'，分离' if opts.get('diarize') else ''}）")
 
         def _cb(i, total, msg):
             if progress_cb:
@@ -841,6 +759,12 @@ class WebBackend:
             out_name = Path(str(raw_name).replace("\\", "/")).name   # 去除任何目录成分
             if not out_name or out_name.startswith("."):
                 out_name = "transcript"
+            # 文件名拼接本次使用的引擎与模型：唯一.flac → 唯一 [CrispASR · Whisper Base].flac
+            # （引擎/模型短标签做文件名安全化：去路径非法字符、压空白）
+            eng_label, model_label = self._current_selection()
+            tag = _sanitize_tag(f"{eng_label} · {model_label}")
+            p = Path(out_name)
+            out_name = f"{p.stem} [{tag}]{p.suffix}" if p.suffix else f"{p.stem} [{tag}]"
             out_ref = srt_dir / out_name
             # 防呆：确认解析后仍在 subtitles/ 内
             try:
@@ -884,6 +808,7 @@ class WebBackend:
 
         if not srt:
             diag = getattr(self.engine, "_last_vad_diag", None)
+            log_transcribe(f"转录未产生字幕：{Path(path).name}（{diag or '未检测到人声'}）")
             raise RuntimeError(diag or "未产生字幕（未检测到人声）。")
 
         # UI 永远以内存中的 segments 渲染波形/字幕卡（需时间轴），故引擎固定产 SRT。
@@ -908,6 +833,10 @@ class WebBackend:
             except Exception:
                 traceback.print_exc()          # 退回 SRT，不让转录整体失败
 
+        log_transcribe(
+            f"转录完成：{Path(path).name} → {Path(saved).name}"
+            f"（{len(segments)} 段，耗时 {_time.monotonic() - _t0:.1f}s，"
+            f"{eng_label} · {model_label}）")
         if progress_cb:
             progress_cb(100, "完成")
         return {"segments": segments, "srtPath": saved}
@@ -1067,7 +996,7 @@ class WebBackend:
         """确保「时间轴对齐」模型存在（移植自 app.py _check_aligner_model）。
 
         CRISPASR：FA aligner gguf 已于 _load_crispasr 处理，这里略过。
-        OpenVINO/chatllm：需 chatllm ForcedAligner .bin（约 939 MB），缺则下载并
+        OpenVINO：需 chatllm ForcedAligner .bin（约 939 MB），缺则下载并
         重新加载引擎内的对齐器（eng._load_aligner）。返回是否就绪。
         """
         backend = getattr(self, "_active_backend", "openvino")
@@ -1091,9 +1020,6 @@ class WebBackend:
         self._cancel = True
         return True
 
-    # ── 关闭流程：任务状态查询／录音状态同步 ─────────────────
-    #   关窗时 app_webview 的 closing 处理先查 has_running_tasks()：
-    #   有任务 → 弹原生确认框；确认放弃 → 前端先调 /api/cancel 再走 shutdown。
     def has_running_tasks(self) -> bool:
         """是否有不可中断丢失的工作进行中（转录／模型下载加载／录音）。"""
         return bool(self._transcribing or self._loading or self._recording)
@@ -1186,149 +1112,57 @@ class WebBackend:
         except Exception as e:
             return {"ok": False, "url": url, "error": str(e)}
 
-    # ── 设备 ────────────────────────────────────────────────
-    #   检测以 **CrispASR 为主**（crispasr.exe --diagnostics 自带 GPU 列举，不需
-    #   chatllm）。chatllm 的 main.exe --show_devices 未随安装包提供 → 改为后备：
-    #   仅在 crispasr 不在、但机器上有 chatllm main.exe 时才用（向下兼容）。
-    def _crispasr_dir(self) -> Path:
-        # 用 core.BASE_DIR（frozen 时 = sys.executable 旁；非 webview_backend 的
-        # __file__，后者在 onefile 冻结后指向 _MEIPASS 临时目录）→ 才找得到随包
-        # 附带／执行时下载到 exe 旁的 crispasr/ 核心。
+    # ── 模型下拉（核心 + 模型）＋ 识别语言 ─────────────────────────────
+    #   持久化后走「切换=重启」(同 set_backend 的理由：避免就地切核心死机)。
+    def _remember_active(self, backend: str):
+        """记住「实际加载」的选择识别码，供 set_model 判断是否需重启。"""
+        self._active_backend = backend
+        self._active_identity = self._identity_for(backend, self._settings_raw())
+
+    def _identity_for(self, backend: str, s: dict):
+        """把 (backend + 相关 settings) 化为可比较的识别码（决定要不要重启）。"""
+        if backend == "openvino":
+            return ("openvino", s.get("cpu_model_size", "0.6B"))
+        if backend == "crispasr":
+            cm = s.get("crisp_model", "whisper")
+            if cm == "whisper":
+                extra = s.get("whisper_size", "base")
+            else:
+                extra = s.get("crisp_qwen_quant", "q8")   # qwen3 量化也纳入识别
+            # 加速版本也纳入识别：换 Vulkan↔CUDA 等同换核心，需重启才生效
+            return ("crispasr", cm, extra, self._crisp_variant())
+        return ("openvino",)
+
+    def _current_selection(self):
+        """settings → (引擎标签, 模型标签)，供下拉预选。"""
         s = self._settings_raw()
-        app_dir = getattr(core, "BASE_DIR", BASE_DIR)
-        return Path(s.get("crispasr_dir", str(app_dir / "crispasr")))
+        be = s.get("backend", "openvino")
+        if be == "crispasr":
+            cm = s.get("crisp_model", "whisper")
+            if cm == "qwen3-ja":
+                qq = s.get("crisp_qwen_quant", "q8")
+                return (_ENGINE_CASR, _QWEN_JA_CASR_QUANT_LABEL.get(qq, _QWEN_JA_CASR_QUANT_LABEL["q8"]))
+            if cm == "qwen3":
+                qq = s.get("crisp_qwen_quant", "q8")
+                return (_ENGINE_CASR, _QWEN_CASR_QUANT_LABEL.get(qq, _QWEN_CASR_QUANT_LABEL["q8"]))
+            size = s.get("whisper_size", "base")
+            if size not in _WHISPER_SIZES:
+                size = "base"
+            return (_ENGINE_CASR, _WHISPER_LABEL_BY_SIZE[size])
+        sz = s.get("cpu_model_size", "0.6B")
+        return (_ENGINE_OV, "Qwen3-ASR-1.7B INT8" if "1.7B" in sz else "Qwen3-ASR-0.6B")
 
-    # ── 推理加速版本（CrispASR 的 Vulkan / CUDA / CPU 三种 build）────────
-    #   检测→推荐→下载对应 zip。注意这里的硬件检测**不能**用既有的
-    #   probe_crispasr_devices()（那要先有 crispasr.exe），而走 downloader 的
-    #   detect_hardware()（WMI + nvidia-smi），才能在下载核心前就决定抓哪一包。
-    def _crisp_variant(self) -> str:
-        """目前选定的加速版本；settings 没有就依硬件推荐一个并记住。"""
-        from downloader import (crispasr_variants, recommend_crispasr_variant)
-        s = self._settings_raw()
-        v = s.get("crisp_variant")
-        if v in crispasr_variants():
-            return v
-        try:
-            v = recommend_crispasr_variant()["recommended"]
-        except Exception:
-            v = "vulkan"
-        self._persist_setting("crisp_variant", v)
-        return v
-
-    def get_accel(self) -> dict:
-        """返回硬件检测结果 + 加速版本菜单（供前端「推理加速版本」区块渲染）。"""
-        from downloader import (recommend_crispasr_variant, installed_crispasr_info,
-                                _CRISPASR_VERSION)
-        try:
-            info = recommend_crispasr_variant()
-        except Exception as e:
-            traceback.print_exc()
-            return {"ok": False, "error": f"硬件检测失败：{e}", "options": []}
-        installed = installed_crispasr_info(self._crispasr_dir())
-        selected  = self._crisp_variant()
-        return {
-            "ok": True,
-            "selected": selected,
-            "recommended": info["recommended"],
-            "reason": info["reason"],
-            "options": info["options"],
-            "hardware": info["hardware"],
-            "installed": installed,          # {"version","variant"}；None＝尚未安装
-            "latest": _CRISPASR_VERSION,
-            # 已装但版本／版本别不符 → 前端提示「加载时会自动重新下载」
-            "needsDownload": (installed.get("version") != _CRISPASR_VERSION
-                              or installed.get("variant") != selected),
-        }
-
-    def set_accel(self, variant: str) -> dict:
-        """记住使用者选的加速版本。实际下载发生在下次加载模型时。"""
-        from downloader import crispasr_variants, installed_crispasr_info, _CRISPASR_VERSION
-        variants = crispasr_variants()
-        if variant not in variants:
-            return {"ok": False, "message": f"未知的加速版本：{variant}"}
-        self._persist_setting("crisp_variant", variant)
-        meta = variants[variant]
-        installed = installed_crispasr_info(self._crispasr_dir())
-        fresh = (installed.get("version") == _CRISPASR_VERSION
-                 and installed.get("variant") == variant)
-        if fresh:
-            return {"ok": True, "variant": variant, "restartRequired": False,
-                    "message": f"已选用「{meta['label']}」（核心已就绪）。"}
-        return {"ok": True, "variant": variant, "restartRequired": True,
-                "message": (f"已记住「{meta['label']}」。下次加载模型时会下载该版本"
-                            f"核心（约 {meta['size_mb']} MB），请重新启动程序以套用。")}
-
-    def list_devices(self) -> dict:
-        import platform
-        devices = [{"kind": "cpu", "name": platform.processor() or "CPU", "note": "使用中"}]
-        diag = {"level": None, "text": ""}
-
-        vk, source = self._probe_gpu_devices()
-        try:
-            for d in (vk.get("devices") if vk else []) or []:
-                gb = d.get("vram_free", 0) / (1024 ** 3)
-                devices.append({"kind": "gpu", "name": d.get("name", "GPU"),
-                                "note": f"{gb:.1f} GB 可用" if gb else ""})
-            if source is None:
-                # 没有任何可用的检测器（crispasr 与 chatllm 皆未就位）
-                diag = {"level": "info",
-                        "text": "GPU 检测需要 CrispASR 核心；启用 GPU 核心时会自动下载，"
-                                "之后即可在此列出可用的独立显卡。目前仅 CPU 推理可用。"}
-            elif vk and vk.get("error"):
-                diag = {"level": "warn",
-                        "text": f"GPU 检测未完成（{source}）：{vk['error']}　已自动改用 CPU 推理。"}
-            elif not (vk and vk.get("devices")):
-                diag = {"level": "info", "text": "未检测到可用的独立 GPU，仅 CPU 推理可用。"}
-        except Exception as e:
-            diag = {"level": "warn", "text": f"GPU 检测例外：{e}"}
-        return {"devices": devices, "diag": diag}
-
-    def _probe_gpu_devices(self):
-        """返回 (探测结果 dict, 来源标签)；找不到任何检测器时回 (None, None)。
-
-        优先 CrispASR（crispasr.exe --diagnostics）；其次后备 chatllm（main.exe
-        --show_devices，仅供仍备有 chatllm 的既有使用者）。
-        """
-        # ① CrispASR 为主
-        try:
-            from crisp_engine import probe_crispasr_devices, _find_exe
-            cd = self._crispasr_dir()
-            if _find_exe(cd):                       # 直接或子文件夹找到 crispasr.exe
-                return probe_crispasr_devices(cd), "CrispASR"
-        except Exception:
-            traceback.print_exc()
-        # ② chatllm 后备（向下兼容）
-        try:
-            chatllm_dir = self._chatllm_dir()
-            if (chatllm_dir / "main.exe").exists():
-                return core.probe_vulkan_devices(str(chatllm_dir)), "chatllm"
-        except Exception:
-            traceback.print_exc()
-        return None, None
-
-    # ── 核心切换：持久化选择 + 请使用者重启（不就地热重载）─────
-    #   理由：① chatllm DLL 在核心切换时 Vulkan context 未释放会整机死机
-    #   (见记忆 vulkan-dual-context-crash)；② 统一所有核心的切换行为，最安全。
-    #   chatllm 保留原桌面实现以向下兼容；未来全面改 casr，但切换一律需重启。
-    _BACKENDS = {0: "openvino", 1: "chatllm", 2: "crispasr"}
+    _BACKENDS = {0: "openvino", 2: "crispasr"}
     _BACKEND_LABELS = {
         "openvino": "CPU · OpenVINO INT8",
-        "chatllm":  "GPU · chatllm Vulkan",
         # CRISPASR 的加速版本可切（Vulkan/CUDA/CPU）→ 实际标签由 _backend_label()
         # 依 crisp_variant 补上；这里只留字典的默认值供旧调用端使用。
         "crispasr": "GPU · CRISPASR",
-        "fastwhisper": "Faster-Whisper-XXL（CTranslate2）",
     }
 
     @staticmethod
     def _note_for(backend: str, model_label: str = "") -> str:
-        """该（核心, 模型）要显示的提醒文字；没有则空字符串。
-
-        chatllm 依 backend 给（AMD 核显问题），Whisper 等依模型标签给（模型提示）。
-        """
-        if backend == "chatllm":
-            return _CHATLLM_AMD_NOTE
+        """该（核心, 模型）要显示的提醒文字；没有则空字符串（依模型标签给）。"""
         return _MODEL_NOTES.get(model_label, "")
 
     def _backend_label(self, backend: str, fallback: str = "") -> str:
@@ -1349,6 +1183,7 @@ class WebBackend:
         return label
 
     def set_backend(self, idx) -> dict:
+        # 热切换：记住选择即可，实际加载由前端「下载并加载模型」触发。
         backend = self._BACKENDS.get(int(idx) if str(idx).isdigit() else 0, "openvino")
         label = self._backend_label(backend)
         self._persist_backend(backend)
@@ -1356,13 +1191,9 @@ class WebBackend:
         if backend == active:
             return {"ok": True, "backend": backend, "restartRequired": False,
                     "message": f"「{label}」已是目前使用的核心。"}
-        if backend == "openvino":
-            return {"ok": True, "backend": backend, "restartRequired": True,
-                    "message": f"已记住「{label}」。请重新启动程序以套用新核心。"}
-        # GPU 核心：重启后会全新加载（首次启用会自动下载对应模型）
-        return {"ok": True, "backend": backend, "restartRequired": True,
-                "message": (f"已记住「{label}」。请重新启动程序以套用 —— "
-                            f"首次启用该核心会在启动时自动下载对应模型。")}
+        return {"ok": True, "backend": backend, "restartRequired": False,
+                "message": (f"已选定「{label}」。点「下载并加载模型」即可热切换"
+                            f"（首次启用会自动下载对应模型）。")}
 
     def _persist_backend(self, backend: str):
         f = Path(getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
@@ -1376,173 +1207,11 @@ class WebBackend:
         except Exception:
             pass
 
-    # ── 模型下拉（核心 + 模型）＋ 识别语言 ─────────────────────────────
-    #   持久化后走「切换=重启」(同 set_backend 的理由：避免就地切核心死机)。
-    def _remember_active(self, backend: str):
-        """记住「实际加载」的选择识别码，供 set_model 判断是否需重启。"""
-        self._active_backend = backend
-        self._active_identity = self._identity_for(backend, self._settings_raw())
-
-    def _identity_for(self, backend: str, s: dict):
-        """把 (backend + 相关 settings) 化为可比较的识别码（决定要不要重启）。"""
-        if backend == "openvino":
-            return ("openvino", s.get("cpu_model_size", "0.6B"))
-        if backend == "crispasr":
-            cm = s.get("crisp_model", "whisper")
-            if cm == "whisper":
-                extra = s.get("whisper_size", "base")
-            else:
-                extra = s.get("crisp_qwen_quant", "q8")   # qwen3 量化也纳入识别
-            # 加速版本也纳入识别：换 Vulkan↔CUDA 等同换核心，需重启才生效
-            return ("crispasr", cm, extra, self._crisp_variant())
-        if backend == "fastwhisper":
-            return ("fastwhisper", s.get("fw_model", "small"))
-        return ("chatllm",)
-
-    def _current_selection(self):
-        """settings → (核心标签, 模型标签)，供下拉预选。"""
-        s = self._settings_raw()
-        be = s.get("backend", "openvino")
-        if be == "crispasr":
-            cm = s.get("crisp_model", "whisper")
-            if cm == "qwen3-ja":
-                qq = s.get("crisp_qwen_quant", "q8")
-                return ("Qwen", _QWEN_JA_CASR_QUANT_LABEL.get(qq, _QWEN_JA_CASR_QUANT_LABEL["q8"]))
-            if cm == "qwen3":
-                qq = s.get("crisp_qwen_quant", "q8")
-                return ("Qwen", _QWEN_CASR_QUANT_LABEL.get(qq, _QWEN_CASR_QUANT_LABEL["q8"]))
-            size = s.get("whisper_size", "base")
-            if size not in _WHISPER_SIZES:
-                size = "base"
-            return (_WHISPER_CORE, _WHISPER_LABEL_BY_SIZE[size])
-        if be == "fastwhisper":
-            size = s.get("fw_model", "small")
-            if size not in _FWWHISPER_SIZES:
-                size = "small"
-            return (_FWWHISPER_CORE, _FWWHISPER_LABEL_BY_SIZE[size])
-        if be == "chatllm":
-            return ("Qwen", _CHATLLM_LABEL)
-        sz = s.get("cpu_model_size", "0.6B")
-        return ("Qwen", "Qwen3-ASR-1.7B INT8" if "1.7B" in sz else "Qwen3-ASR-0.6B")
-
-    def _chatllm_dir(self) -> Path:
-        s = self._settings_raw()
-        return Path(s.get("chatllm_dir",
-                          str(getattr(core, "_CHATLLM_DIR", BASE_DIR / "chatllm"))))
-
-    def _chatllm_available(self) -> bool:
-        """chatllm 是否该对使用者「现身」（向下兼容判准）。
-
-        条件（任一成立）：① 机器上实际备有 chatllm 核心二进位（libchatllm.dll）；
-        ② 目前已记住的 backend 就是 chatllm（曾选用过）。新安装的干净机器两者皆否
-        → chatllm 不出现在模型清单／自检，UI 维持以 CASR-Qwen 为主。
-        """
-        try:
-            if self._persisted_backend() == "chatllm":
-                return True
-            if (self._chatllm_dir() / "libchatllm.dll").exists():
-                return True
-        except Exception:
-            pass
-        return False
-
-    # ── 基础模式：用途 → 依硬件建议模型 ────────────────────────────────
-    def _hw_tier(self) -> tuple[str, str]:
-        """返回 (tier, 硬件摘要文字)。tier ∈ gpu / igpu / cpu。
-
-        tier 决定基础模式要推荐哪个量化：有独显给最准的 Q8，只有核显给较轻的
-        Q4／Q5，完全没显卡则中文用途改推纯 CPU 的 OpenVINO 0.6B。
-        """
-        from downloader import detect_hardware
-        try:
-            hw = detect_hardware()
-        except Exception:
-            return "igpu", "无法检测显卡，以一般配备为准给建议。"
-        gpus = hw.get("gpus") or []
-        if not gpus:
-            return "cpu", "未检测到显卡 —— 以纯处理器（CPU）推理为准给建议。"
-        names = "、".join(g["name"] for g in gpus)
-        if hw.get("has_discrete"):
-            return "gpu", f"检测到独立显卡：{names} —— 可用最准的模型。"
-        return "igpu", f"检测到内置显示芯片：{names} —— 建议用较轻量的模型。"
-
-    def _present_for(self, backend: str, patch: dict) -> bool:
-        """某个目录项（backend + settings patch）的模型文件是否已下载。
-
-        与 selected_model_present() 同样的判断，但改吃「任意一项」而非目前选定的，
-        供基础模式在卡片上标示「已下载／需下载」。
-        """
-        try:
-            from downloader import (quick_check, quick_check_1p7b, quick_check_whisper_ggml)
-            model_dir = self._model_dir()
-            if backend == "openvino":
-                return (quick_check_1p7b(model_dir)
-                        if "1.7B" in patch.get("cpu_model_size", "0.6B")
-                        else quick_check(model_dir))
-            if backend == "crispasr":
-                cm = patch.get("crisp_model", "whisper")
-                if cm in _QWEN_CASR_MODELS:
-                    _, check_fn, _ = _qwen_casr_dl(cm)
-                    return check_fn(model_dir, patch.get("crisp_qwen_quant", "q8"))
-                return quick_check_whisper_ggml(self._crispasr_dir(),
-                                                patch.get("whisper_size", "base"))
-            if backend == "chatllm":
-                return ((self._chatllm_dir() / "qwen3-asr-1.7b.bin").exists()
-                        or (model_dir / "qwen3-asr-1.7b.bin").exists())
-        except Exception:
-            traceback.print_exc()
-        return False
-
-    def get_basic_profiles(self) -> dict:
-        """基础模式的用途清单（已套用硬件建议）。
-
-        返回 {"tier","hardware","accel","profiles":[…],"current"}；每个 profile 带
-        它在本机硬件下建议的 (core, model) 与该模型是否已下载。前端点击后仍走
-        既有的 set_model()／request_load()，不另开加载路径。
-        """
-        from downloader import crispasr_variants
-        tier, hw_text = self._hw_tier()
-        cur_core, cur_model = self._current_selection()
-        variant = self._crisp_variant()
-        vmeta = crispasr_variants().get(variant, {})
-
-        profiles = []
-        for p in _BASIC_PROFILES:
-            core_label, model_label = p["picks"].get(tier, p["picks"]["igpu"])
-            entry = next((e for e in _MODEL_CATALOG
-                          if e[0] == core_label and e[1] == model_label), None)
-            if entry is None:            # 目录改名时不要整页坏掉，跳过该用途
-                continue
-            _, _, be, patch = entry
-            note = p.get("note", "")
-            if tier == "cpu" and be != "openvino":
-                note = (note + "　" if note else "") + _BASIC_CPU_SLOW_NOTE
-            profiles.append({
-                "key": p["key"], "title": p["title"], "desc": p["desc"],
-                "note": note,
-                "core": core_label, "model": model_label,
-                "arch": self._backend_label(be, be),
-                "present": self._present_for(be, patch),
-                "selected": (core_label == cur_core and model_label == cur_model),
-            })
-        return {
-            "tier": tier, "hardware": hw_text,
-            "accel": vmeta.get("short") or vmeta.get("label") or variant,
-            "profiles": profiles,
-            "current": {"core": cur_core, "model": cur_model},
-        }
-
     def get_model_options(self) -> dict:
-        """核心/模型阶层 + 目前选择 + 每模型对应架构标签（前端渲染下拉用）。
-
-        chatllm 为「向下兼容」项：仅在 _chatllm_available 时纳入清单（见其注释）。
-        """
+        """核心/模型阶层 + 目前选择 + 每模型对应架构标签（前端渲染下拉用）。"""
         cur_core, cur_model = self._current_selection()
-        show_chatllm = self._chatllm_available()
         order, by_core = [], {}
         for core_label, model_label, be, _patch in _MODEL_CATALOG:
-            if be == "chatllm" and not show_chatllm:
-                continue
             if core_label not in by_core:
                 by_core[core_label] = []
                 order.append(core_label)
@@ -1580,28 +1249,29 @@ class WebBackend:
             pass
 
         arch = self._backend_label(backend, backend)
-        # 尚未加载任何核心（首次启动）→ 可「就地下载并加载」，免重启（此时没有
-        # 既有 Vulkan context 会冲突，安全）。已加载核心后再换 → 仍需重启（safety）。
-        loaded_or_loading = self._loaded or self._loading
+        # 热切换：任何时刻都支持就地切换。转录/加载进行中 → 前端禁用切换
+        # （canLoadNow=False），此处置灰只影响「立即加载」，选择本身仍被记住。
         identity_changed = (self._identity_for(backend, cur)
                             != getattr(self, "_active_identity", None))
-        can_load_now = not loaded_or_loading
-        restart = loaded_or_loading and identity_changed
-        if can_load_now:
-            msg = (f"已选定「{core_label} · {model_label}」（{arch}）。"
-                   f"点「下载并加载模型」即可开始（不需重启）。")
-        elif restart:
-            msg = (f"已记住「{core_label} · {model_label}」（{arch}）。"
-                   f"切换核心需重新启动程序以套用。")
+        busy = self._loading or self._transcribing
+        can_load_now = not busy
+        if identity_changed:
+            if busy:
+                msg = (f"已记住「{core_label} · {model_label}」（{arch}）。"
+                       f"当前有任务进行中，完成后可点「下载并加载模型」热切换。")
+            else:
+                msg = (f"已选定「{core_label} · {model_label}」（{arch}）。"
+                       f"点「下载并加载模型」即可热切换（不需重启）。")
         else:
             msg = f"「{core_label} · {model_label}」已是目前使用的模型。"
         note = self._note_for(backend, model_label)
-        if note:                          # chatllm AMD 问题／模型提示 → 一并提醒
+        if note:                          # 模型提示 → 一并提醒
             msg += "\n" + note
         return {
             "ok": True, "core": core_label, "model": model_label,
-            "backend": backend, "arch": arch, "restartRequired": restart,
+            "backend": backend, "arch": arch, "restartRequired": False,
             "canLoadNow": can_load_now,
+            "identityChanged": identity_changed,
             "note": note,
             "message": msg,
         }
@@ -1634,6 +1304,123 @@ class WebBackend:
             langs = _COMMON_LANGS
         return {"languages": [{"label": "自动检测", "value": ""}]
                 + [{"label": l, "value": l} for l in langs]}
+
+    def _crispasr_dir(self) -> Path:
+        # 用 core.BASE_DIR（frozen 时 = sys.executable 旁；非 webview_backend 的
+        # __file__，后者在 onefile 冻结后指向 _MEIPASS 临时目录）→ 才找得到随包
+        # 附带／执行时下载到 exe 旁的 crispasr/ 核心。
+        s = self._settings_raw()
+        app_dir = getattr(core, "BASE_DIR", BASE_DIR)
+        return Path(s.get("crispasr_dir", str(app_dir / "crispasr")))
+
+    def _crisp_variant(self) -> str:
+        """目前选定的加速版本；settings 没有就依硬件推荐一个并记住。"""
+        from downloader import (crispasr_variants, recommend_crispasr_variant)
+        s = self._settings_raw()
+        v = s.get("crisp_variant")
+        if v in crispasr_variants():
+            return v
+        try:
+            v = recommend_crispasr_variant()["recommended"]
+        except Exception:
+            v = "vulkan"
+        self._persist_setting("crisp_variant", v)
+        return v
+
+    def get_accel(self) -> dict:
+        """返回硬件检测结果 + 加速版本菜单（供前端「推理加速版本」区块渲染）。
+
+        加速版本只对 CrispASR 引擎有意义：选 OpenVINO 时 applicable=False
+        （前端据此隐藏该区块），CrispASR 时列出全部 Vulkan/CUDA/CPU build。
+        """
+        from downloader import (recommend_crispasr_variant, installed_crispasr_info,
+                                _CRISPASR_VERSION)
+        backend = self._persisted_backend()
+        if backend != "crispasr":
+            return {"ok": True, "applicable": False, "engine": backend,
+                    "options": [], "selected": None, "recommended": None,
+                    "reason": "", "hardware": None, "installed": None,
+                    "latest": _CRISPASR_VERSION, "needsDownload": False}
+        try:
+            info = recommend_crispasr_variant()
+        except Exception as e:
+            traceback.print_exc()
+            return {"ok": False, "applicable": True, "engine": backend,
+                    "error": f"硬件检测失败：{e}", "options": []}
+        installed = installed_crispasr_info(self._crispasr_dir())
+        selected  = self._crisp_variant()
+        return {
+            "ok": True,
+            "applicable": True,
+            "engine": backend,
+            "selected": selected,
+            "recommended": info["recommended"],
+            "reason": info["reason"],
+            "options": info["options"],
+            "hardware": info["hardware"],
+            "installed": installed,          # {"version","variant"}；None＝尚未安装
+            "latest": _CRISPASR_VERSION,
+            # 已装但版本／版本别不符 → 前端提示「加载时会自动重新下载」
+            "needsDownload": (installed.get("version") != _CRISPASR_VERSION
+                              or installed.get("variant") != selected),
+        }
+
+    def set_accel(self, variant: str) -> dict:
+        """记住使用者选的加速版本。实际下载发生在下次加载模型时。"""
+        from downloader import crispasr_variants, installed_crispasr_info, _CRISPASR_VERSION
+        variants = crispasr_variants()
+        if variant not in variants:
+            return {"ok": False, "message": f"未知的加速版本：{variant}"}
+        self._persist_setting("crisp_variant", variant)
+        meta = variants[variant]
+        installed = installed_crispasr_info(self._crispasr_dir())
+        fresh = (installed.get("version") == _CRISPASR_VERSION
+                 and installed.get("variant") == variant)
+        if fresh:
+            return {"ok": True, "variant": variant, "restartRequired": False,
+                    "message": f"已选用「{meta['label']}」（核心已就绪）。"}
+        return {"ok": True, "variant": variant, "restartRequired": False,
+                "message": (f"已记住「{meta['label']}」。点「下载并加载模型」时会一并下载该加速器"
+                            f"（约 {meta['size_mb']} MB）并热切换。")}
+
+    def list_devices(self) -> dict:
+        import platform
+        devices = [{"kind": "cpu", "name": platform.processor() or "CPU", "note": "使用中"}]
+        diag = {"level": None, "text": ""}
+
+        vk, source = self._probe_gpu_devices()
+        try:
+            for d in (vk.get("devices") if vk else []) or []:
+                gb = d.get("vram_free", 0) / (1024 ** 3)
+                devices.append({"kind": "gpu", "name": d.get("name", "GPU"),
+                                "note": f"{gb:.1f} GB 可用" if gb else ""})
+            if source is None:
+                # 没有可用的检测器（crispasr 未就位）
+                diag = {"level": "info",
+                        "text": "GPU 检测需要 CrispASR 核心；启用 GPU 核心时会自动下载，"
+                                "之后即可在此列出可用的独立显卡。目前仅 CPU 推理可用。"}
+            elif vk and vk.get("error"):
+                diag = {"level": "warn",
+                        "text": f"GPU 检测未完成（{source}）：{vk['error']}　已自动改用 CPU 推理。"}
+            elif not (vk and vk.get("devices")):
+                diag = {"level": "info", "text": "未检测到可用的独立 GPU，仅 CPU 推理可用。"}
+        except Exception as e:
+            diag = {"level": "warn", "text": f"GPU 检测例外：{e}"}
+        return {"devices": devices, "diag": diag}
+
+    def _probe_gpu_devices(self):
+        """返回 (探测结果 dict, 来源标签)；找不到检测器时回 (None, None)。
+
+        走 CrispASR（crispasr.exe --diagnostics）。
+        """
+        try:
+            from crisp_engine import probe_crispasr_devices, _find_exe
+            cd = self._crispasr_dir()
+            if _find_exe(cd):                       # 直接或子文件夹找到 crispasr.exe
+                return probe_crispasr_devices(cd), "CrispASR"
+        except Exception:
+            traceback.print_exc()
+        return None, None
 
     # ── 启动自检：每核心 × 每能力，实际探测文件/键路是否就绪 ─────────────
     #   status：green=已就绪 / yellow=缺但会自动下载 / red=缺且需处理 / na=不适用
@@ -1673,15 +1460,13 @@ class WebBackend:
         ov_size = s.get("cpu_model_size", "0.6B")
         ov_model_ok = quick_check_1p7b(model_dir) if "1.7B" in ov_size else quick_check(model_dir)
         ov = {
-            "label": "Qwen · OpenVINO（CPU）", "backend": "openvino",
+            "label": "OpenVINO（CPU：Qwen）", "backend": "openvino",
             "items": [
                 item("model", f"ASR 模型（{ov_size}）", ov_model_ok,
                      "已下载", "未下载（启用时自动下载）"),
                 item("vad", "语音分段 VAD（silero）", _vad_ok(), "已内置", "缺 VAD onnx", downloadable=False),
                 item("fa", "时间轴对齐 FA（ForcedAligner .bin）", quick_check_aligner(model_dir),
                      "已下载", "未下载（约 939MB，启用对齐时下载）"),
-                item("diar", "说话者分离（外部 ONNX）", diar_ok,
-                     "已下载", "未下载（约 32MB，启用分离时下载）"),
             ],
         }
 
@@ -1716,8 +1501,6 @@ class WebBackend:
                 item("fa", f"时间轴对齐 FA（aligner gguf {fa_quant.upper()}）",
                      quick_check_aligner_gguf(crispasr_dir, fa_quant),
                      "已下载", "未下载（约 643MB，启用时下载）"),
-                item("diar", "说话者分离（外部 ONNX，与 OpenVINO 共享）", diar_ok,
-                     "已下载", "未下载（约 32MB，启用分离时下载）"),
             ],
         }
 
@@ -1729,85 +1512,6 @@ class WebBackend:
         ]
 
         cores = [ov, crisp]
-
-        # chatllm（向下兼容）：仅在 _chatllm_available 时列出，让既有使用者能确认
-        # 其加载状况。核心 DLL「不随安装包提供」→ 缺则红灯（非可自动下载）；
-        # .bin 模型缺则黄灯（启用时自动下载）。FA／diar 与 OpenVINO 共享。
-        if self._chatllm_available():
-            chatllm_dir = self._chatllm_dir()
-            dll_ok = (chatllm_dir / "libchatllm.dll").exists()
-            bin_candidates = [
-                Path(s.get("model_path") or "") if s.get("model_path") else None,
-                Path(s.get("gguf_path") or "") if s.get("gguf_path") else None,
-                getattr(core, "_BIN_PATH", None),
-                model_dir / "qwen3-asr-1.7b.bin",
-            ]
-            bin_ok = any(p and Path(p).exists() for p in bin_candidates)
-            chatllm = {
-                "label": "Qwen · chatllm（Vulkan · 兼容）", "backend": "chatllm",
-                "items": [
-                    item("core", "chatllm 核心（libchatllm.dll）", dll_ok,
-                         "已就绪", "未提供（核心未随安装包附带，仅供既有使用者）",
-                         downloadable=False),
-                    item("model", "Qwen3-ASR 模型（.bin）", bin_ok,
-                         "已下载", "未下载（约 2.3GB，启用时自动下载）"),
-                    item("fa", "时间轴对齐 FA（ForcedAligner .bin）",
-                         quick_check_aligner(model_dir),
-                         "已下载", "未下载（约 939MB，启用对齐时下载）"),
-                    item("diar", "说话者分离（外部 ONNX，与 OpenVINO 共享）", diar_ok,
-                         "已下载", "未下载（约 32MB，启用分离时下载）"),
-                ],
-            }
-            cores.append(chatllm)
-
-        # Faster-Whisper-XXL：独立组件状态栏——引擎、7z 解压器、各尺寸模型
-        # 缓存逐项显示。引擎未下载时也常驻列出（模型页选了才会触发 1.3GB
-        # 下载），让使用者在下载前就能看到这套组件的全貌与大小。
-        try:
-            from downloader import (quick_check_fwxxl, fwxxl_dir,
-                                    _FWWHISPER_CACHE_NAMES, _FWXXL_SIZE_MB,
-                                    fwxxl_model_present_dir)
-            fw_dir = fwxxl_dir(model_dir)
-            fw_ready = quick_check_fwxxl(model_dir)
-            # 状态检查与 load() 用同一套 exe 解析：load() 会在嵌套子目录里找 exe
-            # （用户手工解压带包装目录时），模型缓存跟 exe 同层——状态栏若只看
-            # 顶层会对该布局永远显示「未缓存」。找到实际引擎目录后按它检查。
-            fw_engine_dir = fw_dir
-            if fw_ready and not (fw_dir / "faster-whisper-xxl.exe").is_file():
-                found = list(fw_dir.glob("**/faster-whisper-xxl.exe"))
-                if found:
-                    fw_engine_dir = found[0].parent
-            models_ok = {size: fwxxl_model_present_dir(fw_engine_dir, size)
-                         for size in _FWWHISPER_CACHE_NAMES} if fw_ready \
-                else {k: False for k in _FWWHISPER_CACHE_NAMES}
-            size_label = {"base": "Base", "small": "Small", "medium": "Medium",
-                          "large": "Large（large-v2）", "turbo": "Large Turbo（large-v3-turbo）"}
-            fw_items = [
-                item("fwxxl_core", f"引擎（faster-whisper-xxl.exe，约 {_FWXXL_SIZE_MB}MB）",
-                     fw_ready, "已下载",
-                     f"未下载（模型页选用时自动下载）"),
-                item("fwxxl_models", "Whisper 模型（引擎自管，随用随取）",
-                     any(models_ok.values()), "已有缓存", "未缓存（首次转录所选尺寸时下载）"),
-            ]
-            if fw_ready:
-                # 引擎就绪才逐尺寸展开——未下载时逐项全是「未缓存」没有信息量
-                fw_items += [
-                    item(f"fwxxl_m_{size}", f"　├ {size_label[size]} 模型缓存",
-                         ok, "已缓存",
-                         "未缓存（转录该尺寸时自动下载）")
-                    for size, ok in models_ok.items()
-                ]
-                fw_items.append(item(
-                    "fwxxl_ffmpeg", "FFmpeg（XXL 自带，含 ffmpeg.exe）",
-                    (fw_dir / "ffmpeg.exe").is_file(), "已内置", "缺失（重新下载引擎可修复）",
-                    downloadable=False))
-            cores.append({
-                "label": "Faster-Whisper-XXL（CTranslate2）",
-                "backend": "fastwhisper",
-                "items": fw_items,
-            })
-        except Exception:
-            traceback.print_exc()
 
         # 红灯：缺且不可自动补（目前仅 VAD/ffmpeg 属此类）
         reds = sum(1 for c in cores for it in c["items"] if it["status"] == "red")
@@ -1920,23 +1624,6 @@ class WebBackend:
         except Exception:
             pass
 
-    # ── 简繁/词汇输出 ─────────────────────────────────────────────────
-    #   简繁词汇转换已从设置页移除：所有引擎固定输出模型原文（简体）。
-    #   启动时统一把各引擎的输出标志钉为「原始输出」，忽略 settings 中的旧值。
-    def _apply_output_flags(self):
-        """把「固定输出模型原文（简体）」套到全部引擎模块。"""
-        import importlib
-        try:
-            core._g_output_simplified = True
-        except Exception:
-            pass
-        for name in ("chatllm_engine", "crisp_engine"):
-            try:
-                m = importlib.import_module(name)
-                m._output_simplified = True
-            except Exception:
-                pass
-
     def _apply_mirror(self, base):
         try:
             import downloader as _dl
@@ -1968,7 +1655,6 @@ class WebBackend:
             self._apply_vad(s.get("vad_threshold", 0.5))
         except Exception:
             pass
-        self._apply_output_flags()
         self._apply_mirror(s.get("hf_mirror", ""))
         self._apply_output_format(s.get("output_format", "srt"))
 

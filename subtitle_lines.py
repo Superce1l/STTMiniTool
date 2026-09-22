@@ -1,7 +1,7 @@
 """subtitle_lines.py — 字级时间轴 → 字幕行（后端无关，全引擎共享）
 
 把「字级 (word, start_sec, end_sec) + ASR 原文」转成字幕行的逻辑集中于此，
-让 OpenVINO / chatllm / CrispASR(Whisper) 三种引擎产出**一致**的字幕断句与
+让 OpenVINO / CrispASR(Whisper) 等引擎产出**一致**的字幕断句与
 时间轴（标点切行 + MAX_CHARS/MAX_WORDS 保护 + 孤儿行合并）。
 
 公开符号：
@@ -83,7 +83,7 @@ def write_transcript(
 ):
     """把字幕行依格式写成 .srt 或 .txt，返回实际输出路径（Path）。
 
-    所有引擎（OpenVINO / chatllm / CrispASR）与录制转换共享此单一写出点，
+    所有引擎（OpenVINO / CrispASR）与录制转换共享此单一写出点，
     确保全域输出格式一致。
 
     参数：
@@ -212,8 +212,6 @@ def _ts_chatllm_to_subtitle_lines(
     raw_text: str,
     chunk_offset: float,
     spk: str | None,
-    cc,
-    simplified: bool,
     break_on_space: bool = False,
     with_words: bool = False,
 ):
@@ -252,13 +250,8 @@ def _ts_chatllm_to_subtitle_lines(
     # 映射的类别 ID」直接当成字符渲染的结果（实例：crispasr 的 qwen3 CTC 对齐器
     # 遇到其类别表外的繁体字，会输出 U+E000+class_id）。它们对使用者是乱码，
     # 也会污染下游（SRT／JSON／Agent）。在唯一的文字出口统一滤掉，任何引擎都受惠。
-
-    # 繁化：text（整行）沿用既有「整行转换」确保 SRT 输出零变化；
-    # words[].text 走「逐字转换」（卡拉OK高亮单位）——两者在极少数 s2twp
-    # 词组转换情境可能有细微差异，但卡拉OK检视只读 words，不影响字幕卡/SRT。
     def _conv(s: str) -> str:
-        s = _strip_pua(s)
-        return cc.convert(s) if (not simplified and cc is not None) else s
+        return _strip_pua(s)
 
     seg_idx:   list[int] = []   # 当前行的 ts_items 索引
     seg_words: list[str] = []   # 当前行的原始 word

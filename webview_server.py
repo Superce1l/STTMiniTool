@@ -207,8 +207,6 @@ class WebViewServer:
                     return self._json(server.backend.get_accel())
                 if path == "/api/model-options":
                     return self._json(server.backend.get_model_options())
-                if path == "/api/basic-profiles":   # 基础模式：用途 → 建议模型
-                    return self._json(server.backend.get_basic_profiles())
                 if path == "/api/languages":
                     return self._json(server.backend.get_languages())
                 if path == "/api/health-check":
@@ -366,6 +364,10 @@ class WebViewServer:
                         opts, progress_cb=lambda pct, status:
                         server.hub.publish("progress", {"pct": pct, "status": status}))
                     return self._json(result)
+                except Exception as e:
+                    from applog import log_error
+                    log_error(f"转录失败：{filename}", exc=e)
+                    raise
                 finally:
                     try:
                         import shutil

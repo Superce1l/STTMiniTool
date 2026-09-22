@@ -436,7 +436,7 @@ def main():
         sys.exit(cli_main(cli))
 
     # 先把自己绑进 Job Object：此后 start_load()/转录派生的 crispasr.exe、
-    # chatllm main.exe(FA) 等子程序都会自动纳入同一 Job，关窗时连带被杀。
+    # chatllm main.exe（FA 对齐）等子程序都会自动纳入同一 Job，关窗时连带被杀。
     # handle 由 proc_guard 模块级变量持有（生命周期 == 进程），无须在此保管。
     setup_kill_on_close_job()
 
@@ -487,7 +487,7 @@ def main():
         pass
     finally:
         # 窗口已关 → 立即收网。先停 HTTP server（释放端口），再硬退出进程。
-        # 为什么用 os._exit 而非正常 return：chatllm 走常驻 libchatllm.dll，
+        # 为什么用 os._exit 而非正常 return：引擎可能持有常驻 DLL 等资源，
         # Vulkan context 刻意永不释放（见 vulkan-dual-context-crash）；正常
         # 直译器关闭会去清理这颗 DLL → 可能卡死成僵尸进程、持续占显存。
         # os._exit 跳过 atexit/GC/DLL 卸载，由 OS 直接回收进程与 GPU 资源；

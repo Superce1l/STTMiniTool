@@ -2,13 +2,13 @@
 crisp_engine.py — CrispASR (ggml / Vulkan) Whisper 推理后端
 
 定位：把 CrispASR 的 whisper backend 当作本项目的第三个推理引擎（与
-ASREngine[OpenVINO] / ChatLLMASREngine[chatllm] 并列），用来加载 Whisper
+ASREngine[OpenVINO] 并列），用来加载 Whisper
 类模型（默认 OpenAI Whisper 官方 GGML）。
 
 设计重点：
   • CrispASR 是 whisper.cpp fork，crispasr.exe 自己会输出 SRT（含分段时间轴），
     因此本引擎不需重造 VAD/chunk/FA，本质是「调用 crispasr.exe → 读 SRT →
-    OpenCC 繁化 → 写回」。
+    写回」。
   • GPU 后端由 load(gpu_backend=) 决定，对应「使用者选的 CrispASR 加速版本」
     （downloader.crispasr_gpu_backend）：
       - vulkan（默认）：Windows 通吃 Intel/AMD 核显与 NVIDIA 独显，体积最小。
@@ -16,7 +16,7 @@ ASREngine[OpenVINO] / ChatLLMASREngine[chatllm] 并列），用来加载 Whisper
         早期 0.7.1 的 fattn crash 为 nemotron 后端专属问题）。
       - None：CPU build，改挂 -ng（该 build 没有 ggml-vulkan/cuda DLL）。
   • 界面对齐 app.py 既有引擎契约：load / ready / transcribe / process_file /
-    processor / diar_engine / use_aligner / aligner / _lock / rebuild_cc。
+    processor / diar_engine / use_aligner / aligner / _lock。
 
 对外界面（app.py 的 _load_models[crispasr 分支] 会这样调用）：
     eng = CrispWhisperEngine()
@@ -25,7 +25,9 @@ ASREngine[OpenVINO] / ChatLLMASREngine[chatllm] 并列），用来加载 Whisper
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -40,15 +42,6 @@ from subtitle_lines import (_ts_chatllm_to_subtitle_lines, _srt_ts, write_transc
 
 # 中文/英文标点集合（与断句器一致）：Qwen 模式下标点只当切点、不进 items
 _PUNCT = _ZH_CLAUSE_END | _EN_SENT_END
-
-# ── 输出语言标志（由 app.py 切换时同步设置，与 chatllm_engine 行为一致）──
-_output_simplified: bool = True    # True=输出模型原始（简体）；False=OpenCC 转换
-_vocab_convert:     bool = True    # True=s2twp(含台湾词)；False=s2t(仅字形)
-
-
-def _opencc_config() -> str:
-    return "s2twp" if _vocab_convert else "s2t"
-
 
 # ── 共享常数 ──────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
@@ -72,7 +65,7 @@ if sys.platform == "win32":
     _STARTUP_INFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     _STARTUP_INFO.wShowWindow = 0  # SW_HIDE
 
-# 默认 crispasr 目录（仿 chatllm/ 惯例）与模型文件名
+# 默认 crispasr 目录与模型文件名
 _DEFAULT_CRISPASR_DIR = BASE_DIR / "crispasr"
 _DEFAULT_MODEL_NAME   = "ggml-base.bin"   # OpenAI Whisper Base（ggerganov/whisper.cpp）
 # qwen3 ForcedAligner GGUF（FA 对齐器）文件名样式，置于 crispasr_dir 同层
@@ -132,9 +125,8 @@ def _find_exe(crispasr_dir: Path) -> Path | None:
 def probe_crispasr_devices(crispasr_dir: str | Path) -> dict:
     """执行 `crispasr.exe --diagnostics` 并解析计算设备清单（含 GPU 内存）。
 
-    这是 chatllm `probe_vulkan_devices()` 的对应物，但走 CrispASR 自带的
-    `--diagnostics`（会列举 ggml 后端与设备后立即退出，不需模型/音频）。
-    让设备检测**不再依赖 chatllm**（main.exe 未随安装包提供时也能检测 GPU）。
+    走 CrispASR 自带的 `--diagnostics`（会列举 ggml 后端与设备后立即退出，
+    不需模型/音频）。
 
     解析目标是 diagnostics 输出中的「registered devices」区块，例如：
         registered devices : 2
@@ -142,7 +134,7 @@ def probe_crispasr_devices(crispasr_dir: str | Path) -> dict:
           [1] cpu    name=CPU desc=13th Gen Intel(R) Core(TM) i5-13500 mem=79978/98045 MiB id=?
     每行 → {'id','name','vram_free'(bytes),'backend','is_cpu'}；mem 为 free/total MiB。
 
-    返回 dict 与 probe_vulkan_devices() 同结构：
+    返回设备列表 dict：
       {devices(非CPU), all_devices(全部), raw, error, exit_code, exe_found}
     """
     crispasr_dir = Path(crispasr_dir)
@@ -211,7 +203,7 @@ def probe_crispasr_devices(crispasr_dir: str | Path) -> dict:
 # ── 与 CTC 对齐器不兼容的模型 ──────────────────────────────────────────
 #   `qwen3-forced-aligner-0.6b` 是「把 vocabulary head 换成 5000 类 timestamp
 #   head」的对齐器，其类别表是配著 Qwen3-ASR 的**简体**输出建立的。我们的管线
-#   一直没事，是因为既有模型都吐简体、OpenCC 繁化发生在对齐**之后** —— 对齐器
+#   一直没事，是因为既有模型都吐简体、繁化发生在对齐**之后** —— 对齐器
 #   永远只看到简体。
 #
 #   TEA-ASR 打破了这个隐含假设：它**原生输出繁体**，`询`／`会`／`湾` 这类字落在
@@ -263,7 +255,6 @@ class CrispWhisperEngine:
         self._backend    = "whisper"  # crispasr 后端：whisper / qwen3 / qwen3-1.7b …
         self._device_id  = 0       # GPU device id
         self._gpu_backend = "vulkan"  # --gpu-backend；None＝纯 CPU（挂 -ng）
-        self.cc          = None    # OpenCC 转换器
 
     # ══ 加载 ══════════════════════════════════════════════════════════
 
@@ -331,19 +322,9 @@ class CrispWhisperEngine:
             self.aligner   = False
             self._fa       = False
 
-        import opencc
-        self.cc = opencc.OpenCC(_opencc_config())
         self.ready = True
         _fa_tag = "  + FA" if self._aligner_path else ""
         _s(f"就绪（CrispASR / Vulkan / {self._backend}  {model_path.name}{_fa_tag}）")
-
-    def rebuild_cc(self):
-        """依目前词汇转换标志重建 OpenCC（免重新加载）。"""
-        try:
-            import opencc
-            self.cc = opencc.OpenCC(_opencc_config())
-        except Exception:
-            pass
 
     # ══ 子程序命令建构（★ 由你定夺：speed/quality 取舍）═════════════════
 
@@ -440,8 +421,14 @@ class CrispWhisperEngine:
             bufsize=1, creationflags=_CREATE_NO_WINDOW, startupinfo=_STARTUP_INFO,
         )
         pat = re.compile(r"progress\s*=\s*(\d+)\s*%")
+        tail: list[str] = []      # 末尾输出（崩溃原因诊断用）
         try:
             for line in proc.stdout:
+                t = line.rstrip()
+                if t:
+                    tail.append(t)
+                    if len(tail) > 15:
+                        tail.pop(0)
                 m = pat.search(line)
                 if m and progress_cb:
                     p = int(m.group(1))
@@ -454,8 +441,9 @@ class CrispWhisperEngine:
                 proc.kill()
                 proc.wait()
         if proc.returncode != 0:
+            detail = "　|　".join(tail[-5:]) if tail else "（无输出）"
             raise RuntimeError(
-                f"crispasr.exe 异常退出（返回码 {proc.returncode}）。\n"
+                f"crispasr.exe 异常退出（返回码 {proc.returncode}）：{detail}\n"
                 "请检查显存是否充足、加速版本是否与显卡匹配，"
                 "或改用 CPU 推理版本重试。")
         return proc.returncode
@@ -469,8 +457,8 @@ class CrispWhisperEngine:
                      out_format: str | None = None) -> Path | None:
         """音频 → SRT，返回 SRT 路径（None=无输出）。
 
-        流程：crispasr `-ml 1` 取字符级时间轴 → 解析 → 与 OpenVINO/chatllm
-        共享的 `_ts_chatllm_to_subtitle_lines` 分行（含 OpenCC 繁化、孤儿合并）。
+        流程：crispasr `-ml 1` 取字符级时间轴 → 解析 → 共享的
+        `_ts_chatllm_to_subtitle_lines` 分行（含孤儿合并）。
 
         说话者分离（diarize）：用与后端无关的外部 ONNX（diar_engine，CPU）取得
         说话者段落，再依时间把每行字幕指派给对应说话者。whisper/qwen 后端皆适用
@@ -482,6 +470,20 @@ class CrispWhisperEngine:
         if progress_cb:
             progress_cb(0, 1, "CrispASR 转录中…")
 
+        # 非 ASCII 路径防线：crispasr.exe（0.8.35 实测）对含非 ASCII 字符的
+        # 音频路径报「input file not found」——其内部文件打开不走 Windows
+        # UTF-16 API。路径含中文等字符时先复制成 ASCII 名临时文件再传。
+        ascii_copy = None
+        try:
+            audio_path.resolve(True).name.encode("ascii")
+        except (UnicodeEncodeError, OSError):
+            try:
+                ascii_copy = Path(tempfile.gettempdir()) / f"stt_ascii_{os.getpid()}_{audio_path.stem.encode('ascii', 'ignore').decode().rstrip('.') or 'audio'}.flac"
+                shutil.copyfile(audio_path, ascii_copy)
+                audio_path = ascii_copy
+            except Exception:
+                ascii_copy = None   # 复制失败 → 仍按原路径尝试
+
         with tempfile.TemporaryDirectory() as td:
             out_base = Path(td) / "crisp_out"
             cmd = self._build_cmd(audio_path, out_base, language, word_level=True)
@@ -492,9 +494,15 @@ class CrispWhisperEngine:
                 return None
             raw = srt_tmp.read_text(encoding="utf-8", errors="replace")
 
+        if ascii_copy is not None:
+            try:
+                ascii_copy.unlink(missing_ok=True)
+            except OSError:
+                pass
+
         # ── 依后端选对「断句契约」（使用者要求：Qwen 要走 Qwen 逻辑，非 Whisper）──
         #   Qwen3-ASR：模型自带中文标点 → 标点剔出 items、只留 raw_text 当切点，
-        #              break_on_space=False → 与 chatllm/OpenVINO **完全相同**的标点切行。
+        #              break_on_space=False → 与 OpenVINO **完全相同**的标点切行。
         #   Whisper(Breeze)：无标点 → 保留空白语句边界、break_on_space=True 逼近 Qwen。
         is_qwen = (self._backend or "").startswith("qwen3")
         ts_items, raw_text = _parse_srt_words(raw, drop_punct=is_qwen)
@@ -508,15 +516,9 @@ class CrispWhisperEngine:
             # 之间，后者对字幕明显有用；且段落起止仍是后端给的真实时间。
             ts_items = _interpolate_chars(ts_items)
 
-        # 日语：跳过 OpenCC 繁化。s2twp/s2t 是「简体中文→繁体中文」转换，套在日文上
-        # 会把日文汉字（会/静/図/学）误转成繁体字形（会/静/图/学），对日语读者是错的
-        # （ja-anime 模型本就针对日语，尤其该保留原生字形）。中文/台语维持繁化不变；
-        # 自动检测无法预知语言，保守仍走繁化。
-        cc_use = None if _LANG_MAP.get(language) == "ja" else self.cc
-
         self._last_segments_rich = None   # 本次字级结果（卡拉OK侧通道）
         lines5 = _ts_chatllm_to_subtitle_lines(
-            ts_items, raw_text, 0.0, None, cc_use, _output_simplified,
+            ts_items, raw_text, 0.0, None,
             break_on_space=(not is_qwen), with_words=True,
         )
         if not lines5:
@@ -592,10 +594,7 @@ class CrispWhisperEngine:
                         "已终止子进程。请检查显卡驱动或改用 CPU 版本。")
             txt = out_base.with_suffix(".txt")
             text = txt.read_text(encoding="utf-8", errors="replace").strip() if txt.exists() else ""
-        # 日语跳过繁化（同 process_file 理由）；中文/台语维持 s2twp/s2t。
-        if _output_simplified or _LANG_MAP.get(language) == "ja" or self.cc is None:
-            return text
-        return self.cc.convert(text)
+        return text
 
 
 # ── SRT 解析 / 写入（模块层工具）──────────────────────────────────────
@@ -657,7 +656,7 @@ def _parse_srt_words(srt_text: str, drop_punct: bool = False
                    供分行器 break_on_space 在语句边界切行。
 
     drop_punct=True（Qwen 模式）：标点字符只保留在 raw_text 当「切点」，**不**进
-    ts_items —— 这正是 chatllm/OpenVINO Qwen 路径的契约（items=内容词、标点仅在
+    ts_items —— 这正是 OpenVINO Qwen 路径的契约（items=内容词、标点仅在
     raw_text）。crispasr `-ml 1` 会把标点也输出成独立字符段，若放进 items 会让
     断句器的 raw_text 指标双重前进、标点沦为下一行开头，故需在此剔除。
     """

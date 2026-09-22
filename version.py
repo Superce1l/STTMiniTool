@@ -17,19 +17,27 @@ __version__ = "2.2.0"
 WEBVIEW_VERSION = __version__
 
 # ── 2.2.0 更新汇总（本地改进版，基于上游 2.0.0）────────────────────────────
-#   新引擎：引入 Faster-Whisper-XXL（Purfview，CTranslate2）第四推理核心——
-#         Whisper 全系模型（Base/Small/Medium/Large-v2/Large-v3-Turbo），
-#         CPU／NVIDIA 自动适配；引擎 1.3GB 按需自动下载，自检面板独立
-#         组件状态栏（引擎／各尺寸模型缓存／自带 FFmpeg）。
-#   修复：长视频（>2 小时，如 .mov）转录报
-#         「TypeError: missing 1 required positional argument: 'msg'」
-#         —— 长音频切片进度回调签名不匹配；并恢复跨片进度聚合
-#         （进度条不再逐片回跳）。
+#   热切换：引擎／模型／加速版本切换不再需要重启——选好后点「下载并加载
+#         模型」即就地热切换（转录进行中禁切换）；加载失败自动回退原引擎。
+#   字幕：输出文件名拼接所用引擎与模型（如「唯一 [CrispASR · Whisper
+#         Base].srt」），多模型对比不再混淆。
+#   日志：新增运行日志（logs/app-年月.log）——转录开始/完成（含耗时、
+#         段数）、模型加载、下载完成与完整性失败全程留痕。
+#   可靠：下载完成做 Content-Length 对账，中断残档即删即重下；GGUF 模型
+#         加 100MB 大小下限，杜绝残档被当完整模型（此前会静默加载失败）。
+#   修复：CrispASR 引擎打开含中文／非 ASCII 字符的音频路径报
+#         「input file not found」——自动复制 ASCII 文件名临时副本转录；
+#         OpenVINO 路径 VAD 崩溃「Unable to handle object of type int」
+#         —— silero v4 的 sr 输入改用 0-d int64 张量；
+#         crispasr.exe 异常退出时错误消息带上子进程末尾输出（真实原因
+#         不再被吞）；打包补齐缺失的 scipy 依赖（说话者分离必需）。
 #   智能：长音频切片时长依可用物理内存自适应（5–30 分钟），小内存
 #         机器不再有转录中 OOM 风险；内存充裕行为不变。
 #   下载：CrispASR 核心不再固定 v0.8.33，自动获取 GitHub 最新 release
-#         （离线回退 0.8.33）；旧版安装下次加载时自动升级；FWXXL 下载
-#         失败自动清理损坏压缩包，重试无需手动删文件。
+#         （离线回退 0.8.33）；旧版安装下次加载时自动升级。
+#   精简：模型页移除「基础/高级」双模式，改为 引擎（OpenVINO/CrispASR
+#         两列并排）→ 选择模型 直选；说话者分离归入自检「共享组件」；
+#         删除闲置的 OpenCC 简繁转换链路。
 
 # ── 2.1.1 更新汇总（本地改进版，基于上游 2.0.0）────────────────────────────
 #   界面自适应：主内容区随窗口宽度伸缩（窄窗撑满、宽窗居中封顶）；设置页
@@ -49,8 +57,7 @@ WEBVIEW_VERSION = __version__
 #   模型：移除 TEA-ASR-1.1 与 Whisper Breeze-ASR-26，
 #         新增 OpenAI Whisper 官方模型（Base / Small / Medium / Large / Large-Turbo，
 #         ggerganov/whisper.cpp GGML，CrispASR whisper 后端原生支持）。
-#   核心：CrispASR 升级 v0.8.33；OpenVINO 依赖升级至 2026.4；chatllm
-#         向下兼容层对齐 v24。
+#   核心：CrispASR 升级 v0.8.33；OpenVINO 依赖升级至 2026.4。
 #   加速：NVIDIA 显卡用户默认推荐 CUDA（依驱动版本自动选 CUDA 13 / 12，
 #         自带 runtime 免装 Toolkit）；AMD/Intel 仍为 Vulkan。
 #   长音频：新增 FFmpeg 切片转录——超过 2 小时的音频自动按 30 分钟切片（15 秒

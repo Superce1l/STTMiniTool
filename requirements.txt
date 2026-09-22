@@ -13,9 +13,7 @@ onnxruntime>=1.17.0
 # 音频处理
 numpy>=1.24.0
 soundfile>=0.12.0
-
-# 中文转换（OpenCC 简繁/词汇转换，按设置使用）
-opencc-python-reimplemented>=0.1.7
+scipy>=1.10.0          # 说话者分离聚类（linkage/fcluster）＋音频重采样后备
 
 # 模型下载
 requests>=2.30.0

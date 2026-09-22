@@ -2,9 +2,9 @@
 
 问题背景
 --------
-本项目的 GPU 推理核心会以 subprocess 衍生子程序：
+本项目的组件会以 subprocess 衍生子程序：
   • crispasr.exe（CrispASR / Whisper Vulkan）
-  • chatllm main.exe（ForcedAligner 时间轴对齐）
+  • chatllm main.exe（ForcedAligner 字级时间轴对齐，OpenVINO 卡拉OK逐字用）
 Windows 不像 POSIX 会在父进程死亡时连带回收子程序——若使用者在「识别
 到一半」关窗、或主进程崩溃／被任务管理器强制结束，这些子程序就成为孤儿
 残留（仍占 GPU / 内存）。
@@ -16,9 +16,9 @@ Windows 不像 POSIX 会在父进程死亡时连带回收子程序——若使�
 结束，含被强制结束／崩溃）时，OS 会自动终止 Job 内所有成员 → 子程序无一
 幸免。`app.py`（CTk）与 `app_webview.py`（WebView）两个进入点共享本模块。
 
-注意：chatllm 在 webview 走的是 **in-process libchatllm.dll**（非子程序），
-Job Object 管不到它——那一条由各进入点以 `os._exit(0)` 硬退出、交给 OS
-回收（见各进入点关闭流程）。本模块只负责「真正的子程序」。
+注意：主进程常驻资源（如 DLL）不是子程序，Job Object 管不到——那一条由
+各进入点以 `os._exit(0)` 硬退出、交给 OS 回收（见各进入点关闭流程）。
+本模块只负责「真正的子程序」。
 """
 from __future__ import annotations
 

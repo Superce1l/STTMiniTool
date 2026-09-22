@@ -144,13 +144,22 @@
     // CrispASR 推理加速版本（Vulkan / CUDA / CPU）：检测硬件 → 给推荐 + 菜单
     async getAccel() {
       if (MODE === "web") return apiGet("/api/accel");
+      // mock：加速版本只对 CrispASR 引擎有意义——依当前模型所属 backend 返回
+      const cur = MOCK.modelOptions.current;
+      const coreObj = MOCK.modelOptions.cores.find(c => c.label === cur.core);
+      const be = coreObj && coreObj.models[0] && coreObj.models[0].backend;
+      if (be !== "crispasr") {
+        return { ok: true, applicable: false, engine: be || "openvino", options: [],
+                 selected: null, recommended: null, reason: "", hardware: null,
+                 installed: null, latest: "0.8.32", needsDownload: false };
+      }
       return MOCK.accel;
     },
     async setAccel(variant) {
       if (MODE === "web") return apiPost("/api/accel", { variant });
       MOCK.accel.selected = variant;
-      return { ok: true, variant, restartRequired: true,
-               message: "（展示模式）已记住加速版本，重新启动后套用" };
+      return { ok: true, variant, restartRequired: false,
+               message: "（展示模式）已记住加速版本，点「下载并加载模型」时会一并取得" };
     },
     async setBackend(id) {
       if (MODE === "web") return apiPost("/api/backend", { index: id });
@@ -160,13 +169,9 @@
       if (MODE === "web") return apiGet("/api/model-options");
       return MOCK.modelOptions;
     },
-    // 基础模式：用途清单（后端已套用硬件建议）
-    async getBasicProfiles() {
-      if (MODE === "web") return apiGet("/api/basic-profiles");
-      return MOCK.basicProfiles;
-    },
     async setModel(core, model) {
       if (MODE === "web") return apiPost("/api/model", { core, model });
+      MOCK.modelOptions.current = { core, model };   // mock：让 getAccel 依最新引擎联动
       return { ok: true, core, model, arch: "（mock）", restartRequired: false, canLoadNow: true,
                message: `（展示模式）已选「${core} · ${model}」，点「下载并加载模型」开始` };
     },
@@ -223,24 +228,9 @@
     cancelled: false,
     status: { modelReady: true, backend: "GPU · CRISPASR（Vulkan）", device: "NVIDIA GeForce RTX", version: "webview 0.1", appName: "语音识别小工具", hasAnyModel: false, selectedReady: false },
     settings: { scale: 100, format: "srt", vocab: "off", mirror: "", ffmpeg: "", theme: "light", uiLang: "简体中文", vad: 0.5, chunkSecs: 0 },
-    basicProfiles: {
-      tier: "gpu", accel: "Vulkan",
-      hardware: "（展示模式）检测到独立显卡：NVIDIA GeForce RTX 4070 —— 可用最准的模型。",
-      current: { core: "Qwen", model: "Qwen3-ASR-1.7B Q8 (CRISPASR)" },
-      profiles: [
-        { key: "zh", title: "中文（标准）", desc: "一般用途首选：中文为主、断句与标点最完整。",
-          note: "", core: "Qwen", model: "Qwen3-ASR-1.7B Q8 (CRISPASR)",
-          arch: "GPU · CRISPASR（Vulkan）", present: true, selected: true },
-        { key: "ja", title: "日本语", desc: "日语／动漫特化，保留日文原生汉字。", note: "",
-          core: "Qwen", model: "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)",
-          arch: "GPU · CRISPASR（Vulkan）", present: false, selected: false },
-        { key: "whisper", title: "OpenAI Whisper（通用）", desc: "多语言通用模型，99 种语言，速度快。",
-          note: "", core: "Whisper", model: "Whisper Base",
-          arch: "GPU · CRISPASR（Vulkan）", present: false, selected: false },
-      ],
-    },
     accel: {
-      ok: true, selected: "vulkan", recommended: "vulkan",
+      ok: true, applicable: true, engine: "crispasr",
+      selected: "vulkan", recommended: "vulkan",
       reason: "（展示模式）检测到 NVIDIA 显卡。默认仍用 Vulkan（仅 34 MB、实测速度接近）。",
       latest: "0.8.32", installed: { version: "0.8.32", variant: "vulkan" }, needsDownload: false,
       hardware: { gpus: [{ vendor: "nvidia", name: "NVIDIA GeForce RTX 4070", vram_mb: 8192 }] },
@@ -266,14 +256,15 @@
     },
     modelOptions: {
       cores: [
-        { label: "Qwen", models: [
+        { label: "OpenVINO", models: [
           { label: "Qwen3-ASR-0.6B", backend: "openvino", arch: "CPU · OpenVINO INT8", note: "" },
           { label: "Qwen3-ASR-1.7B INT8", backend: "openvino", arch: "CPU · OpenVINO INT8", note: "" },
+        ]},
+        { label: "CrispASR", models: [
           { label: "Qwen3-ASR-1.7B Q4 (CRISPASR/Vulkan)", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）", note: "" },
           { label: "Qwen3-ASR-1.7B Q8 (CRISPASR/Vulkan)", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）", note: "" },
-          { label: "Qwen3-ASR-1.7B Q8（Vulkan · 兼容）", backend: "chatllm", arch: "GPU · chatllm Vulkan", note: "⚠️ chatllm 核心在部分 AMD 核显／APU 有已知兼容问题，且核心二进位未随安装包提供（保留供既有使用者向下兼容）；若遇死机或无输出，建议改用「Qwen · CRISPASR/Vulkan」核心。" },
-        ]},
-        { label: "Whisper", models: [
+          { label: "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）", note: "" },
+          { label: "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）", note: "" },
           { label: "Whisper Base", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）" },
           { label: "Whisper Small", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）" },
           { label: "Whisper Medium", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）" },
@@ -281,7 +272,7 @@
           { label: "Whisper Large Turbo", backend: "crispasr", arch: "GPU · CRISPASR（Vulkan）" },
         ]},
       ],
-      current: { core: "Qwen", model: "Qwen3-ASR-0.6B" },
+      current: { core: "OpenVINO", model: "Qwen3-ASR-0.6B" },
       activeArch: "CPU · OpenVINO INT8",
     },
     languages: {
@@ -294,18 +285,16 @@
     health: {
       summary: { red: 0, yellow: 3, ok: true }, activeBackend: "openvino",
       cores: [
-        { label: "Qwen · OpenVINO（CPU）", backend: "openvino", items: [
+        { label: "OpenVINO（CPU：Qwen）", backend: "openvino", items: [
           { key: "model", label: "ASR 模型（0.6B）", status: "green", detail: "已下载" },
           { key: "vad", label: "语音分段 VAD（silero）", status: "green", detail: "已内建" },
           { key: "fa", label: "时间轴对齐 FA", status: "yellow", detail: "未下载（约 939MB，启用对齐时下载）" },
-          { key: "diar", label: "说话者分离（外部 ONNX）", status: "yellow", detail: "未下载（约 32MB，启用分离时下载）" },
         ]},
         { label: "CRISPASR（Vulkan：Whisper + Qwen）", backend: "crispasr", items: [
           { key: "core", label: "CrispASR 核心（crispasr.exe）", status: "green", detail: "已下载" },
           { key: "whisper", label: "OpenAI Whisper 模型（Base）", status: "green", detail: "已下载" },
           { key: "qwen", label: "Qwen3-ASR-1.7B 模型（Q8）", status: "yellow", detail: "未下载（启用时下载）" },
           { key: "fa", label: "时间轴对齐 FA（aligner gguf Q5）", status: "green", detail: "已下载" },
-          { key: "diar", label: "说话者分离（外部 ONNX，与 OpenVINO 共享）", status: "yellow", detail: "未下载" },
         ]},
       ],
       shared: [

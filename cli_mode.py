@@ -93,13 +93,46 @@ def _make_backend(args):
 
     be = WebBackend()                      # on_event=None → 不推事件、全静音
     if getattr(args, "profile", None):
-        prof = next((p for p in be.get_basic_profiles()["profiles"]
-                     if p["key"] == args.profile), None)
+        prof = _profile_pick(be, args.profile)
         if prof is None:
             raise SystemExit(f"未知的 profile：{args.profile}（用 `profiles` 子命令查看）")
         be.set_model(prof["core"], prof["model"])
         _log(f"[profile] {args.profile} → {prof['core']} · {prof['model']}")
     return be, core
+
+
+# ── 用途 profile → (引擎, 模型) 映射 ───────────────────────────────────
+#   基础模式已从 GUI 移除，CLI 保留 --profile 语义：zh=中文（OpenVINO）、
+#   ja=日语动漫（CrispASR）、whisper=官方 Whisper（按硬件挑尺寸）。
+def _profile_pick(be, key: str) -> dict | None:
+    """返回 {"core","model","present"}；未知 key 回 None。
+
+    present 用目录项的 backend+patch 做真实文件检测（与 GUI 基础模式同源）。
+    """
+    from downloader import detect_hardware
+    from webview_backend import _MODEL_CATALOG
+    try:
+        hw = detect_hardware()
+        has_gpu = bool(hw.get("has_discrete"))
+    except Exception:
+        has_gpu = False
+    table = {
+        "zh":  ("OpenVINO", "Qwen3-ASR-1.7B INT8" if has_gpu else "Qwen3-ASR-0.6B"),
+        "ja":  ("CrispASR", "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)" if has_gpu
+                else "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)"),
+        "whisper": ("CrispASR", "Whisper Large Turbo" if has_gpu else "Whisper Base"),
+    }
+    pick = table.get(key)
+    if pick is None:
+        return None
+    core_label, model_label = pick
+    entry = next((e for e in _MODEL_CATALOG
+                  if e[0] == core_label and e[1] == model_label), None)
+    if entry is None:
+        return None
+    _, _, backend, patch = entry
+    return {"core": core_label, "model": model_label,
+            "present": be.selected_model_present_for(backend, patch)}
 
 
 def _load(be):
@@ -317,21 +350,39 @@ def cmd_status(args) -> int:
 def cmd_profiles(args) -> int:
     be, _core = _make_backend(args)
     with _stdout_to_stderr() as out:
-        d = be.get_basic_profiles()
-        payload = {"tier": d["tier"], "hardware": d["hardware"],
-                   "profiles": [{"key": p["key"], "title": p["title"],
-                                 "desc": p["desc"], "note": p["note"],
-                                 "core": p["core"], "model": p["model"],
-                                 "present": p["present"]}
-                                for p in d["profiles"]]}
+        hw = _hardware_text()
+        profiles = []
+        for key in ("zh", "ja", "whisper"):
+            p = _profile_pick(be, key)
+            if p is None:
+                continue
+            profiles.append({"key": key, "core": p["core"], "model": p["model"],
+                             "present": p["present"]})
+        payload = {"hardware": hw, "profiles": profiles}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
     else:
         print(payload["hardware"])
         for p in payload["profiles"]:
             mark = "✓" if p["present"] else " "
-            print(f"  [{mark}] {p['key']:6s} {p['title']}  →  {p['model']}")
+            print(f"  [{mark}] {p['key']:6s}  →  {p['core']} · {p['model']}")
     return 0
+
+
+def _hardware_text() -> str:
+    """一行硬件摘要（与旧 get_basic_profiles 的 hardware 字段语义一致）。"""
+    from downloader import detect_hardware
+    try:
+        hw = detect_hardware()
+    except Exception:
+        return "无法检测显卡，以一般配备为准。"
+    gpus = hw.get("gpus") or []
+    if not gpus:
+        return "未检测到显卡 —— 以纯处理器（CPU）推理为准。"
+    names = "、".join(g["name"] for g in gpus)
+    if hw.get("has_discrete"):
+        return f"检测到独立显卡：{names} —— 可用最准的模型。"
+    return f"检测到内置显示芯片：{names} —— 建议用较轻量的模型。"
 
 
 # ══════════════════════════════════════════════════════════════════════
