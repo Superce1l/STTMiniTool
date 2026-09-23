@@ -51,8 +51,6 @@ _MODEL_CATALOG = [
      {"crisp_model": "whisper", "whisper_size": size})
     for size in _WHISPER_SIZES
 ]
-# 旧「核心标签」（_current_selection 回退 / set_model 防呆用）
-_CORE_FALLBACK = {(_ENGINE_OV,): "Qwen3-ASR-0.6B"}
 _QWEN_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B Q4 (CRISPASR)",
                           "q8": "Qwen3-ASR-1.7B Q8 (CRISPASR)"}
 _QWEN_JA_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)",
@@ -234,7 +232,6 @@ def _srt_ts_fmt(sec: float) -> str:
 # 说话者分离是「与后端无关的外部 ONNX」(diarize.py / DiarizationEngine)：
 # OpenVINO 与 CRISPASR(whisper/qwen) 皆支持——前者 process_file 内置 use_diar 分支，
 # 后者由 crisp_engine._apply_diarization 依时间指派。diar_engine 由 _ensure_diarization 挂上。
-_DIARIZE_BACKENDS = {"openvino", "crispasr"}
 
 # 识别语言：crispasr 使用的常用语言清单（OpenVINO 改用 processor 的）
 _COMMON_LANGS = [
@@ -332,7 +329,10 @@ class WebBackend:
         self._recording = False          # 前端录音进行中（由 /api/record-state 同步）
         self._on_event = on_event
         self._theme_cb = None            # 主题变更回调（app_webview 用来同步窗口标题栏深浅）
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # 转录/加载互斥（整个引擎调用期间被持有）
+        self._load_gate = threading.Lock()     # start_load 的 check-and-set（非重入，短持有）
+        self._transcribe_gate = threading.Lock()  # transcribe 忙碌 check-and-set（非重入）
+        self._active_label = None        # 实际加载的 (引擎标签, 模型标签)——字幕文件名/日志用
         self._seed_defaults()            # 首次启动（无 backend）→ 种子默认模型
         self._apply_runtime_prefs()      # 启动即套用持久化偏好（VAD/简繁/镜像/格式）
 
@@ -370,13 +370,16 @@ class WebBackend:
     # ── 模型加载（背景线程调用；支持热切换，可重复调用）──────────────
     def start_load(self):
         # 热切换：不再限制「整个进程只加载一次」。转录进行中或正在加载时
-        # 忽略新的加载请求（前端同时会禁用按钮）。
-        if self._loading or self._transcribing:
-            return
-        self._loading = True
+        # 忽略新的加载请求（前端同时会禁用按钮）。check-and-set 在锁内完成，
+        # 防止并发请求双通过 guard、起两个加载线程。
+        with self._load_gate:
+            if self._loading or self._transcribing:
+                return
+            self._loading = True
         threading.Thread(target=self._load_worker, name="model-loader", daemon=True).start()
 
-    def _release_engine(self, old):
+    @staticmethod
+    def _release_engine(old):
         """显式释放旧引擎（OpenVINO 编译模型体量可观，不等 GC）。"""
         if old is None:
             return
@@ -390,19 +393,18 @@ class WebBackend:
 
     def _load_worker(self):
         # 依 settings.backend 全新加载对应引擎。支持热切换：
-        # 持 self._lock 与转录互斥（转录也持此锁），加载前释放旧引擎
-        # （OpenVINO 编译模型体量可观，显式释放避免新旧并存双占内存）。
+        # 持 self._lock 与转录互斥（转录也持此锁）。失败回退优先级：
+        # ① 之前加载过的旧引擎（保留引用、ready 不动，加载成功后才释放）
+        # → ② OpenVINO（若失败的不是它）。加载成功后清空 _load_err。
         from applog import log_model, log_error
         backend = self._persisted_backend()           # openvino / crispasr
         eng_label, model_label = self._current_selection()
         log_model(f"开始加载：{eng_label} · {model_label}（backend={backend}）")
-        old_engine = getattr(self, "engine", None)
+        old_engine = getattr(self, "engine", None) if self._loaded else None
         try:
             with self._lock:
                 try:
-                    self.engine = None                    # 先摘下旧引擎，加载期间状态为「未就绪」
-                    self._release_engine(old_engine)
-                    old_engine = None
+                    self.engine = None                    # 先摘下旧引擎（引用仍留在 old_engine）
                     if backend == "crispasr":
                         self._load_crispasr()
                     else:
@@ -411,6 +413,9 @@ class WebBackend:
                     self._loaded = True
                     self._active_backend = backend
                     self._remember_active(backend)
+                    self._load_err = None                 # 成功加载后清掉上次失败的错误残留
+                    self._release_engine(old_engine)      # 新引擎就绪，此时才释放旧的
+                    old_engine = None
                     log_model(f"加载完成：{eng_label} · {model_label}")
                     self._emit("status", {"modelReady": True})
                 except Exception as e:
@@ -419,7 +424,7 @@ class WebBackend:
                     head = str(e).splitlines()[0][:110] if str(e) else type(e).__name__
                     # 加载失败回退优先级：① 之前加载过的旧引擎（还能用）→ ② OpenVINO（若失败的不是它）
                     if old_engine is not None:
-                        self.engine = old_engine
+                        self.engine = old_engine          # ready 未动，立即可继续转录
                         old_engine = None
                         self._loaded = True
                         self._load_err = f"{eng_label} · {model_label} 加载失败，已回退原引擎：{head}"
@@ -692,13 +697,18 @@ class WebBackend:
         from applog import log_transcribe
         if not getattr(self.engine, "ready", False):
             raise RuntimeError("模型尚未加载完成，请稍候再试。")
+        # 忙碌 check-and-set（独立小锁；self._lock 会在整个引擎调用期间被持有，
+        # 不能用来做这道 gate——否则两道门互相等死锁）。并发第二请求直接拒绝，
+        # 且只有置位者能在 finally 里清 flag，避免先结束者清掉后到者的忙碌状态。
+        if not self._transcribe_gate.acquire(blocking=False):
+            raise RuntimeError("已有识别任务进行中，请稍候再试。")
         path = opts.get("path")
-        if not Path(path).exists():
+        if not path or not Path(path).exists():
             raise RuntimeError("找不到音频文件。")
         self._cancel = False
         self._transcribing = True
         _t0 = _time.monotonic()
-        eng_label, model_label = self._current_selection()
+        eng_label, model_label = getattr(self, "_active_label", None) or self._current_selection()
         log_transcribe(f"开始转录：{Path(path).name}"
                        f"（{eng_label} · {model_label}，"
                        f"语言={opts.get('language') or '自动'}"
@@ -759,10 +769,13 @@ class WebBackend:
             out_name = Path(str(raw_name).replace("\\", "/")).name   # 去除任何目录成分
             if not out_name or out_name.startswith("."):
                 out_name = "transcript"
-            # 文件名拼接本次使用的引擎与模型：唯一.flac → 唯一 [CrispASR · Whisper Base].flac
-            # （引擎/模型短标签做文件名安全化：去路径非法字符、压空白）
-            eng_label, model_label = self._current_selection()
-            tag = _sanitize_tag(f"{eng_label} · {model_label}")
+            # 文件名拼接「实际加载」的引擎与模型（非 settings 里记住的选择——
+            # 忙碌期间选择可被改而引擎未换，标签必须反映真正跑的引擎）：
+            # 唯一.flac → 唯一 [CrispASR · Whisper Base].flac
+            # （标签安全化：去路径非法字符、压空白；「.」换「·」——无扩展名文件的
+            # out_ref 以「…0.6B]」结尾时，write_transcript 的 ref.stem 与切片路径的
+            # with_suffix 会把它当扩展名剥掉，产生残缺文件名）
+            tag = _sanitize_tag(f"{eng_label} · {model_label}").replace(".", "·")
             p = Path(out_name)
             out_name = f"{p.stem} [{tag}]{p.suffix}" if p.suffix else f"{p.stem} [{tag}]"
             out_ref = srt_dir / out_name
@@ -800,6 +813,10 @@ class WebBackend:
                     )
         finally:
             self._transcribing = False
+            try:
+                self._transcribe_gate.release()   # 只有置位者会走到这里（acquire 失败早已抛出）
+            except RuntimeError:
+                pass
             if tmp_extra:
                 try:
                     Path(tmp_extra).unlink(missing_ok=True)
@@ -1115,9 +1132,10 @@ class WebBackend:
     # ── 模型下拉（核心 + 模型）＋ 识别语言 ─────────────────────────────
     #   持久化后走「切换=重启」(同 set_backend 的理由：避免就地切核心死机)。
     def _remember_active(self, backend: str):
-        """记住「实际加载」的选择识别码，供 set_model 判断是否需重启。"""
+        """记住「实际加载」的选择识别码与标签（字幕文件名/日志标注用）。"""
         self._active_backend = backend
         self._active_identity = self._identity_for(backend, self._settings_raw())
+        self._active_label = self._current_selection()
 
     def _identity_for(self, backend: str, s: dict):
         """把 (backend + 相关 settings) 化为可比较的识别码（决定要不要重启）。"""
@@ -1161,8 +1179,8 @@ class WebBackend:
     }
 
     @staticmethod
-    def _note_for(backend: str, model_label: str = "") -> str:
-        """该（核心, 模型）要显示的提醒文字；没有则空字符串（依模型标签给）。"""
+    def _note_for(model_label: str = "") -> str:
+        """该模型要显示的提醒文字；没有则空字符串。"""
         return _MODEL_NOTES.get(model_label, "")
 
     def _backend_label(self, backend: str, fallback: str = "") -> str:
@@ -1218,7 +1236,7 @@ class WebBackend:
             by_core[core_label].append({
                 "label": model_label, "backend": be,
                 "arch": self._backend_label(be, be),
-                "note": self._note_for(be, model_label),
+                "note": self._note_for(model_label),
             })
         active = getattr(self, "_active_backend", None)
         return {
@@ -1264,7 +1282,7 @@ class WebBackend:
                        f"点「下载并加载模型」即可热切换（不需重启）。")
         else:
             msg = f"「{core_label} · {model_label}」已是目前使用的模型。"
-        note = self._note_for(backend, model_label)
+        note = self._note_for(model_label)
         if note:                          # 模型提示 → 一并提醒
             msg += "\n" + note
         return {

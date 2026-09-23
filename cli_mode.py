@@ -104,18 +104,16 @@ def _make_backend(args):
 # ── 用途 profile → (引擎, 模型) 映射 ───────────────────────────────────
 #   基础模式已从 GUI 移除，CLI 保留 --profile 语义：zh=中文（OpenVINO）、
 #   ja=日语动漫（CrispASR）、whisper=官方 Whisper（按硬件挑尺寸）。
-def _profile_pick(be, key: str) -> dict | None:
+def _profile_pick(be, key: str, hw: dict | None = None) -> dict | None:
     """返回 {"core","model","present"}；未知 key 回 None。
 
     present 用目录项的 backend+patch 做真实文件检测（与 GUI 基础模式同源）。
     """
     from downloader import detect_hardware
     from webview_backend import _MODEL_CATALOG
-    try:
+    if hw is None:
         hw = detect_hardware()
-        has_gpu = bool(hw.get("has_discrete"))
-    except Exception:
-        has_gpu = False
+    has_gpu = bool(hw.get("has_discrete")) and not hw.get("error")
     table = {
         "zh":  ("OpenVINO", "Qwen3-ASR-1.7B INT8" if has_gpu else "Qwen3-ASR-0.6B"),
         "ja":  ("CrispASR", "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)" if has_gpu
@@ -349,16 +347,18 @@ def cmd_status(args) -> int:
 
 def cmd_profiles(args) -> int:
     be, _core = _make_backend(args)
+    from downloader import detect_hardware
+    hw = detect_hardware()          # 只探测一次（每次 WMI 调用要起一个 PowerShell）
     with _stdout_to_stderr() as out:
-        hw = _hardware_text()
+        hw_text = _hardware_text(hw)
         profiles = []
         for key in ("zh", "ja", "whisper"):
-            p = _profile_pick(be, key)
+            p = _profile_pick(be, key, hw)
             if p is None:
                 continue
             profiles.append({"key": key, "core": p["core"], "model": p["model"],
                              "present": p["present"]})
-        payload = {"hardware": hw, "profiles": profiles}
+        payload = {"hardware": hw_text, "profiles": profiles}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
     else:
@@ -369,13 +369,15 @@ def cmd_profiles(args) -> int:
     return 0
 
 
-def _hardware_text() -> str:
+def _hardware_text(hw: dict | None = None) -> str:
     """一行硬件摘要（与旧 get_basic_profiles 的 hardware 字段语义一致）。"""
     from downloader import detect_hardware
-    try:
+    if hw is None:
         hw = detect_hardware()
-    except Exception:
-        return "无法检测显卡，以一般配备为准。"
+    # detect_hardware 内部吞错、经 "error" 字段报告（PowerShell/WMI 失败等）；
+    # 不区分会把探测失败误报成「没有显卡」。
+    if hw.get("error"):
+        return f"无法检测显卡（{hw['error']}）—— 以一般配备为准。"
     gpus = hw.get("gpus") or []
     if not gpus:
         return "未检测到显卡 —— 以纯处理器（CPU）推理为准。"

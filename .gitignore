@@ -120,6 +120,6 @@ UI.txt
 release_pkg/
 *.zip
 
-# 7zr.exe 独立解压器（运行时按需下载，不入库）
-tools/
-logs/
+# 运行时按需下载的 7zr.exe（预留）；运行日志（applog.py 写入 app-年月.log）
+/tools/
+/logs/

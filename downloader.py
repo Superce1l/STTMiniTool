@@ -193,8 +193,8 @@ _FA_BIN_URL  = (
 
 
 def quick_check_aligner(model_dir: Path) -> bool:
-    """快速检查 ForcedAligner .bin 是否存在（非 LFS pointer）。"""
-    return _file_is_real(Path(model_dir) / _FA_BIN_NAME)
+    """快速检查 ForcedAligner .bin 是否存在且非残缺（大小下限同 GGUF）。"""
+    return _gguf_is_real(Path(model_dir) / _FA_BIN_NAME)
 
 
 def download_aligner(model_dir: Path, progress_cb=None):
@@ -363,8 +363,11 @@ def crispasr_version() -> str:
             tag = (_json.loads(resp.read().decode("utf-8")).get("tag_name") or "").strip()
         if tag.lower().startswith("v") and tag[1:].replace(".", "").isdigit():
             ver = tag[1:]
-    except Exception:
-        pass                                # 离线／限流 → 保底版本
+    except Exception as err:
+        # 离线／限流 → 保底版本。结果会缓存整个进程周期，留痕以便诊断
+        # （若首查失败固定了旧版本，quick_check 会把新版核心误判为过期）。
+        from applog import log_error
+        log_error(f"CrispASR 版本查询失败，回退保底版本 {ver}", exc=err)
     _crispasr_ver_cache = ver
     return ver
 
@@ -931,7 +934,7 @@ def download_qwen3_asr_gguf(model_dir: Path,
     model_dir.mkdir(parents=True, exist_ok=True)
     fname = qwen3_asr_gguf_filename(quant)
     dest  = model_dir / fname
-    if _file_is_real(dest):
+    if _gguf_is_real(dest):      # 大小下限：残档不放行，落到 _download_file 断点续传补全
         if progress_cb:
             progress_cb(1.0, f"{fname} 已存在")
         return
@@ -982,7 +985,7 @@ def download_qwen3_asr_ja_gguf(model_dir: Path,
     model_dir.mkdir(parents=True, exist_ok=True)
     fname = qwen3_asr_ja_gguf_filename(quant)
     dest  = model_dir / fname
-    if _file_is_real(dest):
+    if _gguf_is_real(dest):      # 同上：残档不放行
         if progress_cb:
             progress_cb(1.0, f"{fname} 已存在")
         return
@@ -1089,12 +1092,14 @@ def _download_file(url: str, dest: Path, progress_cb=None):
         raise
 
     content_length = int(resp.headers.get("Content-Length", 0))
-    total = existing + content_length if content_length else 0
 
     # 追加写入（resume）或全新写入
     mode = "ab" if existing > 0 and resp.status == 206 else "wb"
     if mode == "wb":
         existing = 0
+    # total 必须在 existing 归零之后计算：服务器忽略 Range 返回 200 完整内容时，
+    # Content-Length 即全文件大小，残档大小不能重复计入（否则对账必失败、误删完整文件）。
+    total = existing + content_length if content_length else 0
 
     done = existing
     try:

@@ -41,20 +41,26 @@ MIN_W, MIN_H = 900, 640           # 允许缩得更小；界面已做窄宽度�
 _SPI_GETWORKAREA = 0x0030
 _BOTTOM_MARGIN = 8               # 底边安全边距（逻辑 px）：DPI 缩放取整可能
                                  # 让物理底边比工作区低 1~2px，压进任务栏
-def _workarea_logical() -> tuple[int, int]:
-    """主屏工作区（任务栏以外的矩形），逻辑像素；非 Windows／失败回 (0,0)。"""
+def _workarea_logical() -> tuple[int, int, int, int]:
+    """主屏工作区（任务栏以外的矩形），逻辑像素，回 (x, y, w, h)。
+
+    x/y 是工作区左上角的**绝对屏幕坐标**：多显示器下主屏原点不保证 (0,0)
+    （外接屏设主屏、任务栏停靠左/上都会偏移），pywebview 的 x/y 又是绝对
+    坐标，居中计算必须相对这个原点。非 Windows／失败回 (0, 0, 0, 0)。
+    """
     if sys.platform != "win32":
-        return (0, 0)
+        return (0, 0, 0, 0)
     try:
         from ctypes import wintypes
         u = ctypes.windll.user32
         rect = wintypes.RECT()
         if not u.SystemParametersInfoW(_SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
-            return (0, 0)
-        return (rect.right - rect.left,
+            return (0, 0, 0, 0)
+        return (rect.left, rect.top,
+                rect.right - rect.left,
                 max(0, (rect.bottom - rect.top) - _BOTTOM_MARGIN))
     except Exception:
-        return (0, 0)
+        return (0, 0, 0, 0)
 
 
 def fit_window_to_screen(w: int, h: int, min_w: int, min_h: int):
@@ -65,12 +71,12 @@ def fit_window_to_screen(w: int, h: int, min_w: int, min_h: int):
     出边缘）。位置必须显式给出：pywebview 默认 CenterScreen 以整屏（含任务
     栏空间）居中，高度贴满工作区时底边会压到任务栏之下。
     """
-    wa_w, wa_h = _workarea_logical()
+    wa_x, wa_y, wa_w, wa_h = _workarea_logical()
     if wa_w > 0 and wa_h > 0:
         w, h = min(w, wa_w), min(h, wa_h)
         min_w, min_h = min(min_w, w), min(min_h, h)
-        x = max(0, (wa_w - w) // 2)
-        y = max(0, (wa_h - h) // 2)
+        x = wa_x + max(0, (wa_w - w) // 2)
+        y = wa_y + max(0, (wa_h - h) // 2)
     else:
         x = y = None                  # 查询失败 → 交给 pywebview 默认居中
     return x, y, w, h, min_w, min_h

@@ -471,34 +471,38 @@ class CrispWhisperEngine:
             progress_cb(0, 1, "CrispASR 转录中…")
 
         # 非 ASCII 路径防线：crispasr.exe（0.8.35 实测）对含非 ASCII 字符的
-        # 音频路径报「input file not found」——其内部文件打开不走 Windows
-        # UTF-16 API。路径含中文等字符时先复制成 ASCII 名临时文件再传。
-        ascii_copy = None
+        # 音频路径（含目录）报「input file not found」——其内部文件打开不走
+        # Windows UTF-16 API。完整路径无法纯 ASCII 编码时，复制进一个保证
+        # ASCII 的临时目录（子进程输出用的同一个 TemporaryDirectory）再传。
+        # diar_audio：说话者分离仍用原路径（soundfile 支持 Unicode；临时副本
+        # 在转录结束即删，diarization 若再用它会静默失败）。
+        import uuid as _uuid
+        ascii_dir = None
+        diar_audio = audio_path
         try:
-            audio_path.resolve(True).name.encode("ascii")
+            str(audio_path.resolve(True)).encode("ascii")
         except (UnicodeEncodeError, OSError):
             try:
-                ascii_copy = Path(tempfile.gettempdir()) / f"stt_ascii_{os.getpid()}_{audio_path.stem.encode('ascii', 'ignore').decode().rstrip('.') or 'audio'}.flac"
+                ascii_dir = tempfile.mkdtemp(prefix="stt_ascii_")
+                ascii_copy = Path(ascii_dir) / f"audio_{_uuid.uuid4().hex[:8]}{audio_path.suffix or '.flac'}"
                 shutil.copyfile(audio_path, ascii_copy)
                 audio_path = ascii_copy
             except Exception:
-                ascii_copy = None   # 复制失败 → 仍按原路径尝试
+                ascii_dir = None   # 复制失败 → 仍按原路径尝试
 
-        with tempfile.TemporaryDirectory() as td:
-            out_base = Path(td) / "crisp_out"
-            cmd = self._build_cmd(audio_path, out_base, language, word_level=True)
-            with self._lock:
-                self._run_streaming(cmd, progress_cb)
-            srt_tmp = out_base.with_suffix(".srt")
-            if not srt_tmp.exists():
-                return None
-            raw = srt_tmp.read_text(encoding="utf-8", errors="replace")
-
-        if ascii_copy is not None:
-            try:
-                ascii_copy.unlink(missing_ok=True)
-            except OSError:
-                pass
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                out_base = Path(td) / "crisp_out"
+                cmd = self._build_cmd(audio_path, out_base, language, word_level=True)
+                with self._lock:
+                    self._run_streaming(cmd, progress_cb)
+                srt_tmp = out_base.with_suffix(".srt")
+                if not srt_tmp.exists():
+                    return None
+                raw = srt_tmp.read_text(encoding="utf-8", errors="replace")
+        finally:
+            if ascii_dir is not None:
+                shutil.rmtree(ascii_dir, ignore_errors=True)
 
         # ── 依后端选对「断句契约」（使用者要求：Qwen 要走 Qwen 逻辑，非 Whisper）──
         #   Qwen3-ASR：模型自带中文标点 → 标点剔出 items、只留 raw_text 当切点，
@@ -530,7 +534,7 @@ class CrispWhisperEngine:
         # 说话者分离（外部 ONNX，与 whisper/qwen 后端无关）：依时间中点指派每行说话者。
         # diarize 只重新指派 speaker、不增减行，故与 lines5 一一对应 → 可 zip 并回字级。
         if diarize and self.diar_engine is not None and getattr(self.diar_engine, "ready", False):
-            lines = self._apply_diarization(audio_path, lines, n_speakers, progress_cb)
+            lines = self._apply_diarization(diar_audio, lines, n_speakers, progress_cb)
 
         # 字级结果挂上实例：speaker 取 diarize 后的 lines，words 取 lines5
         self._last_segments_rich = [
@@ -539,7 +543,7 @@ class CrispWhisperEngine:
         ]
 
         # 共享写出层：依全域设置（或 out_format 覆盖）产出 .srt 或 .txt。
-        ref = original_path if original_path is not None else audio_path
+        ref = original_path if original_path is not None else diar_audio
         out = write_transcript(ref, lines, out_format)
         if progress_cb:
             progress_cb(1, 1, "完成")
