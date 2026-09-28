@@ -237,6 +237,9 @@ class CrispWhisperEngine:
         self._fa_blocked  = False
         self.ready       = False
         self._lock       = threading.Lock()
+        # 取消事件：webview_backend.cancel() 置位 → _run_streaming 杀子进程。
+        # 每次转录前由调用端 clear（见 webview_backend.transcribe）。
+        self.cancel_event = threading.Event()
         # 界面兼容标志
         self.processor   = None    # None → app.py 改用 SUPPORTED_LANGUAGES
         self.diar_engine = None
@@ -410,6 +413,10 @@ class CrispWhisperEngine:
         会动的进度条（granularity = slice 数，长档较细、短档较粗）。
         stderr 并入 stdout 一起读；无 `-pp` 或解析不到时，行为等同旧版。
 
+        取消支持：cancel_event（threading.Event）置位时终止子进程并抛
+        RuntimeError("已取消")——读取循环阻塞在 proc.stdout 上时靠 cancel_watch
+        线程兜底杀进程，避免「点了取消却要等下一行输出才生效」。
+
         超时保护：Vulkan 初始化已知可能卡死（probe 路径为此用 10-15s 超时）。
         转录本身可长达数十分钟，故超时按「无输出行间隔」计（_PROC_TIMEOUT_SECS
         内没有任何新输出视为挂死）：超时杀掉子进程并抛 RuntimeError，
@@ -422,6 +429,23 @@ class CrispWhisperEngine:
         )
         pat = re.compile(r"progress\s*=\s*(\d+)\s*%")
         tail: list[str] = []      # 末尾输出（崩溃原因诊断用）
+        cancel_event = getattr(self, "cancel_event", None)
+
+        def _cancel_watch():
+            # proc.stdout 无输出的整段时间里，读取循环不醒来；由独立线程
+            # 负责在取消时杀掉子进程，让读取循环立刻收到 EOF。
+            cancel_event.wait()
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+        watcher = None
+        if cancel_event is not None:
+            watcher = threading.Thread(target=_cancel_watch, daemon=True)
+            watcher.start()
+        cancelled = False
         try:
             for line in proc.stdout:
                 t = line.rstrip()
@@ -429,17 +453,34 @@ class CrispWhisperEngine:
                     tail.append(t)
                     if len(tail) > 15:
                         tail.pop(0)
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 m = pat.search(line)
                 if m and progress_cb:
                     p = int(m.group(1))
                     # 上限 99：留「完成」给写档后的最终回报，避免 100% 却还在写字幕
                     progress_cb(min(99, p), 100, f"CrispASR 转录中… {p}%")
+            # 循环正常结束（无更多输出）后再查一次：cancel_watch 杀掉进程时
+            # EOF 与置位几乎同时发生，最后一行之后才置位的场景在此捕获。
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
         finally:
             try:
                 proc.wait(timeout=_PROC_SHUTDOWN_GRACE_SECS)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+            if watcher is not None:
+                # 收尾：确保 watcher 不挂在未置位的 event 上（正常结束时）
+                cancel_event.set()
+                watcher.join(timeout=1)
+                # 复位：切片转录逐片调 process_file，而调用端只在入口 clear
+                # 一次；置位残留会让第 2 片起刚启动就被 watch 线程判「已取消」
+                # 杀掉。每次运行结束时复位，保证下次启动是干净状态。
+                cancel_event.clear()
+        if cancelled:
+            raise RuntimeError("已取消。")
         if proc.returncode != 0:
             detail = "　|　".join(tail[-5:]) if tail else "（无输出）"
             raise RuntimeError(

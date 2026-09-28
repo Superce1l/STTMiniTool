@@ -706,6 +706,18 @@ class WebBackend:
         if not path or not Path(path).exists():
             raise RuntimeError("找不到音频文件。")
         self._cancel = False
+        # 引擎侧取消事件：crispasr 的 _run_streaming 据此杀子进程，实现
+        # 「单片转录中」也能立即取消（此前只在切片边界生效）。
+        cancel_ev = getattr(self.engine, "cancel_event", None)
+        if cancel_ev is not None:
+            cancel_ev.clear()
+        # 清除上一轮残留的「未产生字幕」诊断：OpenVINO 引擎每次 process_file
+        # 会重置它，但 CrispASR 引擎从不写/清 → 不清的话，下一次非切片转录
+        # 无产出时会误报上一次切片运行的旧诊断。
+        try:
+            self.engine._last_vad_diag = None
+        except Exception:
+            pass
         self._transcribing = True
         _t0 = _time.monotonic()
         eng_label, model_label = getattr(self, "_active_label", None) or self._current_selection()
@@ -823,6 +835,9 @@ class WebBackend:
                 except Exception:
                     pass
 
+        if self._cancel:
+            log_transcribe(f"转录已取消：{Path(path).name}")
+            raise RuntimeError("已取消。")
         if not srt:
             diag = getattr(self.engine, "_last_vad_diag", None)
             log_transcribe(f"转录未产生字幕：{Path(path).name}（{diag or '未检测到人声'}）")
@@ -889,6 +904,7 @@ class WebBackend:
 
         plan = _slice_plan(duration)
         all_segments: list[list[dict]] = []
+        _silent_parts: list[bool] = []   # 逐片记录是否无声（全静音时给诊断用）
 
         with tempfile.TemporaryDirectory(prefix="asr_slice_") as td:
             tmp = Path(td)
@@ -896,7 +912,12 @@ class WebBackend:
                 if self._cancel:
                     raise RuntimeError("已取消。")
                 seg_wav = tmp / f"slice_{i:03d}.wav"
-                cmd = [str(ff), "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+                # -ss 放 -i 前（输入侧快速定位，大偏移时不解码整段前缀）。
+                # 此时输入时间戳被重置为 0，-to <全局终点> 会被误读成
+                # 「重置后时间轴的终点」→ 第 2 片起每片严重超长。故用
+                # -t <片长> 显式指定时长，语义不受 -ss 位置影响。
+                cmd = [str(ff), "-y", "-ss", f"{start:.3f}",
+                       "-t", f"{end - start:.3f}",
                        "-i", str(audio_path), "-vn", "-ar", "16000", "-ac", "1",
                        "-f", "wav", str(seg_wav)]
                 proc = subprocess.run(cmd, stdout=subprocess.PIPE,
@@ -929,7 +950,9 @@ class WebBackend:
                     out_format="srt",
                 )
                 if not part_srt:
+                    _silent_parts.append(True)
                     continue      # 该片无声 → 跳过（如纯音乐片段）
+                _silent_parts.append(False)
                 # 片内时间已是绝对时间（-ss 放在 -i 前 = 输入侧定位，
                 # 输出的 pts 从 0 起算，故把片起点平移回全局时间轴）
                 part_segs = _rich_to_segments(
@@ -946,6 +969,11 @@ class WebBackend:
 
         merged = _merge_sliced_segments(all_segments)
         if not merged:
+            # 所有片都无声（每片 process_file 回 None）→ 给出与整段路径
+            # 对等的诊断，而非笼统的「未检测到人声」。
+            self.engine._last_vad_diag = (
+                f"⚠ 切片转录未产生字幕：{sum(_silent_parts)}/{len(plan)} 片"
+                f"未识别到内容（音频可能为纯音乐/静音，或音轨编码异常）。")
             return None
         lines = [(seg["start"], seg["end"], seg["text"],
                   (f'说话者{seg["speaker"]}' if seg.get("speaker") else None))
@@ -953,7 +981,7 @@ class WebBackend:
         out = out_ref.with_suffix(".srt")
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
-            for idx, (s0, e0, text, spk) in enumerate(merged, 1):
+            for idx, (s0, e0, text, spk) in enumerate(lines, 1):
                 prefix = f"{spk}：" if spk else ""
                 f.write(f"{idx}\n{_srt_ts_fmt(s0)} --> {_srt_ts_fmt(e0)}\n"
                         f"{prefix}{text}\n\n")
@@ -1034,7 +1062,16 @@ class WebBackend:
             return False
 
     def cancel(self):
+        """请求取消当前转录。
+
+        _cancel 标志由切片循环/收尾检查；引擎侧的 cancel_event（CrispASR）
+        让单片转录中的子进程立即被终止，而非等到下一片边界。
+        OpenVINO 引擎逐段（max_chunk_secs）转录，本标志在段间生效。
+        """
         self._cancel = True
+        cancel_ev = getattr(self.engine, "cancel_event", None)
+        if cancel_ev is not None:
+            cancel_ev.set()
         return True
 
     def has_running_tasks(self) -> bool:

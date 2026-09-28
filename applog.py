@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 _LOCK = threading.Lock()
@@ -81,6 +82,12 @@ def log_warn(msg: str):
 def log_error(msg: str, exc: BaseException | None = None):
     if exc is not None:
         msg = f"{msg}：{type(exc).__name__}: {exc}"
+        tb = "".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__)).rstrip()
+        # traceback 多行 → 整体缩进（含首行 "Traceback (most recent call last):"），
+        # 使续行都可视上归属同一条日志：首行才有 ts [ERROR] 前缀，缩进避免
+        # 续行像独立事件混入按行检索。
+        msg += "\n    " + tb.replace("\n", "\n    ")
     _write("ERROR", msg)
 
 

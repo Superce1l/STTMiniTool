@@ -61,7 +61,12 @@ def _parse_multipart(body: bytes, boundary: bytes):
     files: dict[str, tuple] = {}
     delim = b"--" + boundary
     for part in body.split(delim):
-        part = part.strip(b"\r\n")
+        # 不能用 strip(b"\r\n")：文件内容恰好以 \r\n 结尾时会把数据一并剥掉。
+        # 分隔符残留固定是「前导 \r\n + 尾部 \r\n」，逐边只剥一次。
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
         if not part or part == b"--":
             continue
         header_blob, _, content = part.partition(b"\r\n\r\n")
@@ -367,7 +372,10 @@ class WebViewServer:
                 except Exception as e:
                     from applog import log_error
                     log_error(f"转录失败：{filename}", exc=e)
-                    raise
+                    # 回结构化的 500 而非 raise（raise 会让 HTTP 层打印
+                    # traceback 并中断连接，前端只能看到网络错误）。
+                    head = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                    return self._err(500, head)
                 finally:
                     try:
                         import shutil
