@@ -17,6 +17,18 @@ MAX_CHARS      = 20
 _ZH_CLAUSE_END = frozenset('，。？！；：…—、·')
 _EN_SENT_END   = frozenset('.,!?;')
 
+# ── 声学停顿切行（无标点时的补充句界信号）────────────────────────────
+# ASR 偶尔在两个句子之间漏打标点，此后标点切行失效，唯一的换行依据只剩
+# MAX_CHARS 强制保护 —— 切点与语句无关，产出「上一句尾巴＋下一句开头」
+# 混在一行的字幕。字级时间轴上有现成的补充信号：字与字之间的空隙（停顿）。
+# 句间停顿普遍 ≥0.3s、短语内几乎不留空隙，故「当前行已有一定长度＋停顿
+# 够长」时主动切行，效果等同一个看不见的逗号，与「标点即切行」的设计一致。
+PAUSE_BREAK_SEC = 0.35   # 字间空隙 ≥ 此值（秒）视为句界
+PAUSE_MIN_ZH    = 5      # 停顿前行至少已累积的中文字数（防把短语切碎）
+PAUSE_MIN_WORDS = 3      # 含拉丁词的行最少词数
+MIN_SPLIT_GAP   = 0.15   # 超限回退切行时，词间空隙的最小可信值（秒）；
+                         # 须明显大于连续语流的字间隙（≲0.1s）、小于句间停顿（≥0.3s）
+
 
 def _strip_pua(s: str) -> str:
     """滤除 Unicode 私用区字符（BMP U+E000–U+F8FF 与两个补充平面）。
@@ -288,6 +300,33 @@ def _ts_chatllm_to_subtitle_lines(
             return len(seg_words) > MAX_WORDS
         return sum(len(w) for w in seg_words) > MAX_ZH_CHARS
 
+    def _pause_break(gap: float) -> bool:
+        """行已具一定长度 + 字间空隙够长 → 停顿处主动切行。"""
+        if gap < PAUSE_BREAK_SEC or not seg_idx:
+            return False
+        if any(_is_latin_word(w) for w in seg_words):
+            return len(seg_words) >= PAUSE_MIN_WORDS
+        return sum(len(w) for w in seg_words) >= PAUSE_MIN_ZH
+
+    def _emit_overflow():
+        """超限切行：优先回退到行内「最长且像句界」的停顿处切开，让断点尽量
+        贴近语义边界；行内全无停顿时才在溢出点直接切。候选停顿须位于行的前
+        1/3 之后，避免把行切成两字孤儿＋一长串。"""
+        nonlocal seg_idx, seg_words
+        best_k, best_gap = -1, MIN_SPLIT_GAP
+        lo = max(1, len(seg_idx) // 3)
+        for k in range(lo, len(seg_idx)):
+            gap = float(ts_items[seg_idx[k]][1]) - float(ts_items[seg_idx[k - 1]][2])
+            if gap >= best_gap:            # ≥，取最靠后的最大停顿
+                best_k, best_gap = k, gap
+        if best_k > 0:
+            tail_idx, tail_words = seg_idx[best_k:], seg_words[best_k:]
+            seg_idx, seg_words = seg_idx[:best_k], seg_words[:best_k]
+            _emit()
+            seg_idx, seg_words = tail_idx, tail_words
+        else:
+            _emit()
+
     for wi in range(n):
         word = word_list[wi]
 
@@ -305,6 +344,13 @@ def _ts_chatllm_to_subtitle_lines(
 
         if hit_punct:
             _emit()
+        elif wi > 0:
+            # 标点缺席时以声学停顿补位：本 word 距上一 word 的空隙够长、
+            # 且当前行已有一定长度 → 在停顿处切行，避免句间无标点时靠
+            # MAX_CHARS 硬切产出「两句混一行」。
+            gap = float(ts_items[wi][1]) - float(ts_items[wi - 1][2])
+            if _pause_break(gap):
+                _emit()
 
         seg_idx.append(wi)
         seg_words.append(word)
@@ -319,7 +365,7 @@ def _ts_chatllm_to_subtitle_lines(
             ri += 1; consumed += 1
 
         if _over_limit():
-            _emit()
+            _emit_overflow()
 
     _emit()
     merged = _merge_orphan_lines_rich(result)

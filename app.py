@@ -544,31 +544,76 @@ class ASREngine:
             text = raw.strip()
             return text
 
+    @staticmethod
+    def _quiet_split_pos(chunk: np.ndarray, target: int, lo: int, hi: int) -> int:
+        """在 [lo, hi]（样本索引）内找短窗 RMS 最低的位置作为切点。
+
+        人声在停顿处能量显著走低，以此把切分点吸附到词句间隙而非字词中间；
+        范围无效时回退 target。
+        """
+        win, hop = 400, 200   # 25ms 窗 / 12.5ms 步进 @16kHz
+        lo = max(lo, win)
+        hi = min(hi, len(chunk))
+        if lo >= hi:
+            return target
+        best, best_e = target, None
+        for p in range(lo, hi + 1, hop):
+            seg = chunk[p - win:p]
+            e = float(np.mean(seg * seg))
+            if best_e is None or e < best_e:
+                best, best_e = p, e
+        return best
+
     def _enforce_chunk_limit(
         self,
         groups: list[tuple[float, float, np.ndarray, "str | None"]],
     ) -> list[tuple[float, float, np.ndarray, "str | None"]]:
-        """将超过 max_chunk_secs 的音频段落切分为等长子片段。
+        """将超过 max_chunk_secs 的音频段落切分为多个子片段。
 
         不论是说话者分离路径或 VAD 单段路径，都可能产生比模型
         输入长度（max_chunk_secs）更长的 chunk。若不切分，
         _extract_mel() 会静默截断尾段，造成掉字。
+
+        切分策略：n 片（n = ceil(L/max)），每片长度硬性约束在
+        [1 秒, max_samples]；实际切点在「可行窗」内吸附到能量最低的停顿处。
+        可行窗同时受三重约束（左 ≥ max(prev+1s, L-(n-k)*max) 保证剩余可切、
+        右 ≤ min(prev+max, L-(n-k)*1s) 保证本片不超限），数学上可证非空
+        —— 停顿吸附的漂移不会把任何一片挤出上限（旧实现按固定步进硬切，
+        既会劈开字词又可能因末段无约束产生超长片被 mel 静默截断）。
         """
         max_samples = self.max_chunk_secs * SAMPLE_RATE
+        search = int(1.5 * SAMPLE_RATE)      # 切点距理想位置的偏好半径
         result = []
         for t0, t1, chunk, spk in groups:
-            if len(chunk) <= max_samples:
+            L = len(chunk)
+            if L <= max_samples:
                 result.append((t0, t1, chunk, spk))
-            else:
-                pos = 0
-                while pos < len(chunk):
-                    piece = chunk[pos: pos + max_samples]
-                    if len(piece) < SAMPLE_RATE:   # 不足 1 秒的残余片段跳过
-                        break
-                    piece_t0 = t0 + pos / SAMPLE_RATE
-                    piece_t1 = min(t1, piece_t0 + len(piece) / SAMPLE_RATE)
-                    result.append((piece_t0, piece_t1, piece, spk))
-                    pos += max_samples
+                continue
+            n = -(-L // max_samples)                 # ceil(L / max_samples)
+            ideal = L / n
+            bounds = [0]
+            prev = 0
+            for k in range(1, n):
+                # 可行窗（非空可证）：保证本片 ≤ max 且剩余 (n-k) 片仍各 ≥ 1s
+                lo = max(prev + SAMPLE_RATE, L - (n - k) * max_samples)
+                hi = min(prev + max_samples, L - (n - k) * SAMPLE_RATE)
+                # 偏好窗：理想切点 ±1.5s；与可行窗无交集时退到可行窗全域
+                target = int(round(ideal * k))
+                plo, phi = target - search, target + search
+                if max(lo, plo) <= min(hi, phi):
+                    lo, hi = max(lo, plo), min(hi, phi)
+                cut = self._quiet_split_pos(chunk, target, lo, hi)
+                cut = max(lo, min(cut, hi))
+                bounds.append(cut)
+                prev = cut
+            bounds.append(L)
+            for a, b in zip(bounds, bounds[1:]):
+                piece = chunk[a:b]
+                if len(piece) < SAMPLE_RATE:      # 防御：异常短残余不产出
+                    continue
+                piece_t0 = t0 + a / SAMPLE_RATE
+                result.append((piece_t0, min(t1, piece_t0 + len(piece) / SAMPLE_RATE),
+                               piece, spk))
         return result
 
     def process_file(

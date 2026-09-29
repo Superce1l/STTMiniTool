@@ -203,21 +203,65 @@ def _slice_plan(duration: float, window_secs: int | None = None) -> list[tuple[f
 def _merge_sliced_segments(all_parts: list[list[dict]]) -> list[dict]:
     """各片 segments（已含绝对时间）→ 去重合并。
 
-    重叠区去重：以「后一片」为准，丢弃 start 落在前一片已收录行之后的重复行
-    （重叠区两片都会识别出同样的文字，取后片的起点做截断线）。
+    重叠区（相邻片 15 秒）里两片会识别出同一句；跨越片边界的句子必在其中
+    一侧被截断：跨片尾的句子在前一片是前半、后一片完整；跨片首的句子在
+    前一片完整、后一片只剩尾段。同一句只保留**更完整的版本**（文字更长者，
+    其次时长更长者；完全等同取后一片）——无条件取某一片都会丢字：取后一片
+    会丢掉「后一片自其起点截断的尾段」，取前一片则会丢掉「前一片自其终点
+    截断的前半」。
     """
     if not all_parts:
         return []
+
+    def _dur(seg: dict) -> float:
+        return max(0.0, seg["end"] - seg["start"])
+
+    def _norm(t: str) -> str:
+        return "".join(str(t).split())
+
+    def _is_dup(a: dict, b: dict) -> bool:
+        ov = min(a["end"], b["end"]) - max(a["start"], b["start"])
+        if ov <= 0:
+            return False
+        ta, tb = _norm(a.get("text", "")), _norm(b.get("text", ""))
+        if ta and ta == tb:
+            return True
+        shorter = min(_dur(a), _dur(b))
+        return shorter > 0 and ov > 0.4 * shorter   # 重叠过半＝同一句（容时间抖动）
+
+    def _prefer(a: dict, b: dict) -> dict:
+        """同一句的两个版本 → 更完整者；平手取 b（后一片，时间戳距片缘较远）。"""
+        ta, tb = _norm(a.get("text", "")), _norm(b.get("text", ""))
+        if len(ta) != len(tb):
+            return a if len(ta) > len(tb) else b
+        da, db = _dur(a), _dur(b)
+        if abs(da - db) > 0.05:
+            return a if da > db else b
+        return b
+
     merged = list(all_parts[0])
     for part in all_parts[1:]:
         if not part:
             continue
-        # 截断线：前一片最后一行的起点（重叠区识别内容重复，以此为界丢弃）
-        cut = merged[-1]["start"] if merged else None
+        out: list[dict] = []
+        i = 0                       # merged 中尚未确定归属的行指针
         for seg in part:
-            if cut is not None and seg["start"] < cut:
-                continue
-            merged.append(seg)
+            while i < len(merged) and merged[i]["end"] <= seg["start"]:
+                out.append(merged[i])              # 早于 seg 结束 → 不可能再重复
+                i += 1
+            hit = False
+            j = i
+            while j < len(merged) and merged[j]["start"] < seg["end"]:
+                if _is_dup(merged[j], seg):
+                    merged[j] = _prefer(merged[j], seg)
+                    hit = True
+                    break
+                j += 1
+            if not hit:
+                out.append(seg)
+        out.extend(merged[i:])
+        out.sort(key=lambda s: (s["start"], s["end"]))
+        merged = out
     return merged
 
 
