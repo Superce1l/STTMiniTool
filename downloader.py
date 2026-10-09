@@ -347,7 +347,11 @@ def crispasr_version() -> str:
     """当前应下载的 CrispASR 版本号（不带 v 前缀）。
 
     优先取 GitHub 最新 release 的 tag（v0.8.34 → 0.8.34）；网络失败／超时／
-    响应异常时回退 _CRISPASR_FALLBACK_VERSION。结果缓存，进程内只查一次
+    响应异常时回退：① 本机已安装版本（crispasr_build.json 纪录）——版本查询
+    失败常是 API 限流（403），此时假定已装版本即所需版本，避免保底旧版本
+    触发 quick_check 判「过期」→ 把刚装好的核心重复下载一遍（用户反馈实录：
+    403 → 回退 0.8.33 → 已装的 0.8.38 每次加载都重下 35MB zip）；② 都没有
+    时才用 _CRISPASR_FALLBACK_VERSION。结果缓存，进程内只查一次
     （GPU 页／自检页／下载会重复调用，不能每次都打 API）。
     """
     global _crispasr_ver_cache
@@ -364,10 +368,15 @@ def crispasr_version() -> str:
         if tag.lower().startswith("v") and tag[1:].replace(".", "").isdigit():
             ver = tag[1:]
     except Exception as err:
-        # 离线／限流 → 保底版本。结果会缓存整个进程周期，留痕以便诊断
-        # （若首查失败固定了旧版本，quick_check 会把新版核心误判为过期）。
+        # 离线／限流 → 先看本机已装版本（与已装核心一致即不必重下），
+        # 没有任何安装纪录才退回保底版本。留痕以便诊断。
         from applog import log_error
-        log_error(f"CrispASR 版本查询失败，回退保底版本 {ver}", exc=err)
+        installed = installed_crispasr_info(_CRISPASR_DEFAULT_DIR).get("version")
+        if installed:
+            ver = str(installed)
+            log_error(f"CrispASR 版本查询失败，沿用已安装版本 {ver}", exc=err)
+        else:
+            log_error(f"CrispASR 版本查询失败，回退保底版本 {ver}", exc=err)
     _crispasr_ver_cache = ver
     return ver
 
@@ -438,6 +447,7 @@ _CRISPASR_DEFAULT_VARIANT = "vulkan"
 # 安装纪录：记下这份 crispasr/ 目录「实际装了哪个版本／哪个加速版本」，
 # 用来判断是否需要重新下载（升版或使用者换加速版本）。
 _CRISPASR_MARKER = "crispasr_build.json"
+_CRISPASR_DEFAULT_DIR = BASE_DIR / "crispasr"   # 版本查询失败时找已装版本用
 
 
 def crispasr_variants() -> dict[str, dict]:

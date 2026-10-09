@@ -60,6 +60,11 @@ _STARTUP_INFO: "subprocess.STARTUPINFO | None" = None
 _RT_PROC_TIMEOUT_SECS = 600
 # 流式模式收尾宽限：正常退出等待上限（秒）；超时强杀。
 _PROC_SHUTDOWN_GRACE_SECS = 30
+# 流式模式输出停滞上限（秒）：超过此时长没有任何新输出行才判挂死。
+# 注意不能太小：qwen3 后端可能先做 LID 初始化与音频扫描（几十秒无输出），
+# 且上游明确不出 progress 行（-pp 仅 whisper 后端有效），进度只能靠
+# 「行活跃度」近似回报，停滞看门狗是唯一的挂死防线。
+_PROC_STALL_TIMEOUT_SECS = 180
 if sys.platform == "win32":
     _STARTUP_INFO = subprocess.STARTUPINFO()
     _STARTUP_INFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -218,6 +223,23 @@ def _fa_incompatible(model_path) -> bool:
     return any(k in name for k in _FA_INCOMPATIBLE)
 
 
+def _lid_model_path(crispasr_dir: Path | None = None) -> Path | None:
+    """找本地的 whisper ggml 给 qwen3 后端当 LID 模型（--lid-model）。
+
+    qwen3 后端启动要做语言识别，默认找 ggml-tiny.bin；本目录没有时 crispasr
+    会联网下载（失败要等 ~44 秒超时才继续，离线机器更久）。crispasr 目录里
+    通常已有 whisper ggml（base 随包、medium 等按需下载），任选其一即可。
+    找不到回 None（不挂标志，维持 crispasr 默认行为）。
+    """
+    d = Path(crispasr_dir) if crispasr_dir else _DEFAULT_CRISPASR_DIR
+    # 优先 tiny（体积最小、加载最快），否则退回任何 ggml whisper 模型
+    for cand in sorted(d.glob("ggml-*.bin"),
+                       key=lambda p: (("tiny" not in p.name), p.stat().st_size)):
+        if cand.is_file() and cand.stat().st_size > 10 * 1024 * 1024:
+            return cand
+    return None
+
+
 class CrispWhisperEngine:
     """CrispASR(whisper backend) 推理引擎。子程序模式调用 crispasr.exe。"""
 
@@ -364,6 +386,12 @@ class CrispWhisperEngine:
         # 非 whisper 架构（Qwen3-ASR 等）需显式指定后端，crispasr 才用对解码路径
         if self._backend and self._backend != "whisper":
             cmd += ["--backend", self._backend]
+            # qwen3 后端默认要用 ggml-tiny.bin 做 LID（语言识别）；找不到时
+            # crispasr 会自己联网下载，网络不通就干等 ~44 秒才继续（0.8.38/0.8.42
+            # 实测）。这里显式指到本地的 whisper ggml（base 已随包），彻底免下载。
+            lid = _lid_model_path(self._exe.parent) if self._exe else None
+            if lid:
+                cmd += ["--lid-model", str(lid)]
         # 加速版本：Vulkan／CUDA 走 --gpu-backend + 设备 id；CPU 版挂 -ng
         # （CPU 版核心没有 ggml-vulkan/cuda DLL，硬给 --gpu-backend 会启动失败）
         if self._gpu_backend:
@@ -408,20 +436,22 @@ class CrispWhisperEngine:
     def _run_streaming(self, cmd: list[str], progress_cb=None) -> int:
         """以 Popen 流式读 crispasr 输出，解析「progress = NN%」实时回报进度。
 
-        crispasr 一次处理整档（内部切 N 个 slice），`-pp` 会输出
-        「crispasr: progress = NN% (x/N slices)」。据此把单一阻塞子程序变成
-        会动的进度条（granularity = slice 数，长档较细、短档较粗）。
-        stderr 并入 stdout 一起读；无 `-pp` 或解析不到时，行为等同旧版。
+        crispasr（whisper 后端）一次处理整档（内部切 N 个 slice），`-pp` 会输出
+        「crispasr: progress = NN% (x/N slices)」。**qwen3 后端不输出 progress
+        行**（-pp 仅 whisper 后端实现，0.8.38/0.8.42 实测）——此前 qwen3 长档
+        转录进度条恒为 0%，使用者以为卡死、关窗取消（反馈实录）。故这里加
+        「行活跃度」回报：qwen3 路径下每收到一行输出就小幅推进模拟进度
+        （对数逼近 90%，永不触顶），至少让使用者看到「在动」。
 
         取消支持：cancel_event（threading.Event）置位时终止子进程并抛
         RuntimeError("已取消")——读取循环阻塞在 proc.stdout 上时靠 cancel_watch
         线程兜底杀进程，避免「点了取消却要等下一行输出才生效」。
 
-        超时保护：Vulkan 初始化已知可能卡死（probe 路径为此用 10-15s 超时）。
-        转录本身可长达数十分钟，故超时按「无输出行间隔」计（_PROC_TIMEOUT_SECS
-        内没有任何新输出视为挂死）：超时杀掉子进程并抛 RuntimeError，
-        避免永久持有 self._lock 把整个引擎卡死。
+        停滞看门狗：超过 _PROC_STALL_TIMEOUT_SECS 没有任何新输出行 → 视为
+        挂死（Vulkan 初始化卡死等），杀掉子进程并抛错，避免永久持有
+        self._lock 把整个引擎卡死。
         """
+        import time as _time
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
@@ -430,16 +460,31 @@ class CrispWhisperEngine:
         pat = re.compile(r"progress\s*=\s*(\d+)\s*%")
         tail: list[str] = []      # 末尾输出（崩溃原因诊断用）
         cancel_event = getattr(self, "cancel_event", None)
+        is_qwen = (self._backend or "").startswith("qwen3")
+        # qwen3 活跃度进度：输出行数 → 模拟百分比（对数逼近 90）
+        sim_base = 0
 
         def _cancel_watch():
             # proc.stdout 无输出的整段时间里，读取循环不醒来；由独立线程
-            # 负责在取消时杀掉子进程，让读取循环立刻收到 EOF。
-            cancel_event.wait()
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+            # 负责在取消或停滞时杀掉子进程，让读取循环立刻收到 EOF。
+            while True:
+                if cancel_event.wait(timeout=_PROC_STALL_TIMEOUT_SECS):
+                    return                      # 置位 = 用户取消 → 杀进程
+                # 超时未取消：若读取循环长时间无新输出 → 判挂死
+                if _time.monotonic() - last_line_t.v > _PROC_STALL_TIMEOUT_SECS:
+                    stall_flag[0] = True
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                    return
+
+        class _V:
+            __slots__ = ("v",)
+            def __init__(self, v): self.v = v
+
+        last_line_t = _V(_time.monotonic())
+        stall_flag = [False]
 
         watcher = None
         if cancel_event is not None:
@@ -448,6 +493,7 @@ class CrispWhisperEngine:
         cancelled = False
         try:
             for line in proc.stdout:
+                last_line_t.v = _time.monotonic()
                 t = line.rstrip()
                 if t:
                     tail.append(t)
@@ -461,6 +507,12 @@ class CrispWhisperEngine:
                     p = int(m.group(1))
                     # 上限 99：留「完成」给写档后的最终回报，避免 100% 却还在写字幕
                     progress_cb(min(99, p), 100, f"CrispASR 转录中… {p}%")
+                elif progress_cb and is_qwen:
+                    # qwen3 无真实进度 → 行活跃度近似（每行 +ε，对数逼近 90%）
+                    sim_base += 1
+                    p = int(90 * (1 - 2.718281828 ** (-sim_base / 40)))
+                    if p > 0:
+                        progress_cb(min(90, p), 100, "CrispASR 转录中…（模型运行中，暂无精确进度）")
             # 循环正常结束（无更多输出）后再查一次：cancel_watch 杀掉进程时
             # EOF 与置位几乎同时发生，最后一行之后才置位的场景在此捕获。
             if cancel_event is not None and cancel_event.is_set():
@@ -481,6 +533,12 @@ class CrispWhisperEngine:
                 cancel_event.clear()
         if cancelled:
             raise RuntimeError("已取消。")
+        if stall_flag[0]:
+            detail = "　|　".join(tail[-5:]) if tail else "（无输出）"
+            raise RuntimeError(
+                f"crispasr.exe 超过 {_PROC_STALL_TIMEOUT_SECS} 秒无任何输出，疑似挂死，已终止。"
+                f"最后输出：{detail}\n"
+                "请检查显存是否充足、加速版本是否与显卡匹配，或改用 CPU 推理版本重试。")
         if proc.returncode != 0:
             detail = "　|　".join(tail[-5:]) if tail else "（无输出）"
             raise RuntimeError(
