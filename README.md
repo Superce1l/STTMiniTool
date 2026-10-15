@@ -8,7 +8,7 @@
 > 的本地改进分支（fork 起点 v2.0.0）。上游的繁体中文界面、批量识别、端点服务等内容在本分支中
 > 已按需移除或替换。本仓库地址：https://github.com/Superce1l/STTMiniTool
 >
-> 当前版本 **v2.2.4** · [下载最新版](https://github.com/Superce1l/STTMiniTool/releases/latest) · [版本历史](#版本历史)
+> 当前版本 **v2.2.5** · [下载最新版](https://github.com/Superce1l/STTMiniTool/releases/latest) · [版本历史](#版本历史)
 
 ---
 
@@ -139,7 +139,8 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 ## 版本历史
 
-- **v2.2.4（当前）**：CrispASR（Qwen3-ASR）转录「进度卡 0%」修复——qwen3 后端不输出进度行，改以行活跃度回报；消除 qwen3 启动的 44 秒静默等待（LID 模型联网下载失败）；新增停滞看门狗；GitHub 限流时不再重复下载核心
+- **v2.2.5（当前）**：模型下载「加载失败：CERTIFICATE_VERIFY_FAILED」修复——企业／校园代理重签 TLS 导致证书验证失败，下载自动降级重试；下载提示的 ⚠✅ 字符在简中 GBK 控制台崩溃并掩盖原始错误，改安全输出
+- **v2.2.4**：CrispASR（Qwen3-ASR）转录「进度卡 0%」修复——qwen3 后端不输出进度行，改以行活跃度回报；消除 qwen3 启动的 44 秒静默等待（LID 模型联网下载失败）；新增停滞看门狗；GitHub 限流时不再重复下载核心
 - **v2.2.3**：断句质量修复——以字级时间轴的声学停顿补位句界，解决「一行字幕混有上一句尾＋下一句头」；长语音段按停顿切分不再劈字；切片重叠区按完整度去重
 - **v2.2.2**：长音频切片转录可靠性修复——切片 SRT 写出崩溃、ffmpeg 切片参数语义错误；转录取消即时生效（子进程可随时终止）；上传数据截断修复；错误处理改进（结构化 500、日志附调用栈）
 - **v2.2.1**：三批代码审查健壮性修复（加载失败回退、并发保护、非 ASCII 路径等 19 项）
@@ -148,6 +149,13 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 <details>
 <summary>各版本变更明细（点击展开）</summary>
+
+### 2.2.5
+
+| 项目 | 说明 |
+|------|------|
+| 🔐 **SSL 证书验证降级** | 企业／校园网络（深信服等 HTTPS 代理）用自己的根证书重签 TLS，Python 不认 → 模型下载全部 `CERTIFICATE_VERIFY_FAILED`。遇证书错误自动降级不验证重试（来源全为固定可信主机，`log_warn` 留痕）；超时／DNS 等其他网络错误不受影响 |
+| 🖥️ **GBK 控制台安全输出** | 下载备援提示里的 `⚠✅❌` 在简体中文 Windows 的 GBK 控制台抛 `UnicodeEncodeError`，报错 print 反而取代原始网络错误（界面「加载失败」显示的正是它）。改 `_safe_print`：编码不了的字符替换输出 |
 
 ### 2.2.4
 

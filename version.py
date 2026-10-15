@@ -9,12 +9,24 @@
 """
 from __future__ import annotations
 
-__version__ = "2.2.4"
+__version__ = "2.2.5"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.2.5 更新汇总（本地改进版，基于上游 2.0.0）────────────────────────────
+#   本版修复用户反馈的「下载并加载模型失败」，两张截图两个报错，实为同一
+#   条链：企业／校园网络（深信服等 HTTPS 代理）用自己的根证书重签 TLS 连接，
+#   Python 不认 → 到 HuggingFace 的模型下载全部 CERTIFICATE_VERIFY_FAILED。
+#   SSL：下载函数遇证书验证失败自动降级为不验证重试一次（模型来源全为
+#         固定可信主机 huggingface.co / github.com，风险可控；log_warn
+#         留痕）。仅针对证书错误，超时／DNS 等其他网络错误仍走原备援逻辑。
+#   编码：下载备援与 CLI 提示里的 print（⚠✅❌ 等字符）在简体中文 Windows
+#         的 GBK 控制台抛 UnicodeEncodeError——报错 print 反而取代了原始
+#         网络错误，界面「加载失败」显示的正是这个编码错误（截图 2 实录）。
+#         改用 _safe_print：编码不了的字符替换输出，异常不再上抛。
 
 # ── 2.2.4 更新汇总（本地改进版，基于上游 2.0.0）────────────────────────────
 #   本版修复 CrispASR（Qwen3-ASR）转录「进度条永远 0%、疑似卡死」的用户

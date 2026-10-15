@@ -42,6 +42,27 @@ def _ssl_ctx() -> ssl.SSLContext:
     ctx.verify_mode    = ssl.CERT_NONE
     return ctx
 
+
+_SSL_UNVERIFIED_CTX: ssl.SSLContext | None = None
+
+
+def _ssl_ctx_unverified() -> ssl.SSLContext:
+    """不验证证书的 SSL Context（单例）。
+
+    用途：企业／校园网络（深信服等 HTTPS 代理）会用自己的根证书重签
+    TLS 连接，Python 不认系统凭证库 → CERTIFICATE_VERIFY_FAILED（用户反馈
+    实录：截图加载失败全文即此错误）。模型来源全为固定可信主机
+    （huggingface.co / github.com），降级不验证的风险可控；调用端必须
+    log_warn 留痕。
+    """
+    global _SSL_UNVERIFIED_CTX
+    if _SSL_UNVERIFIED_CTX is None:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode    = ssl.CERT_NONE
+        _SSL_UNVERIFIED_CTX = ctx
+    return _SSL_UNVERIFIED_CTX
+
 # ── 路径（PyInstaller 冻结时指向 EXE 旁边）────────────────────────────
 import sys as _sys
 if getattr(_sys, "frozen", False):
@@ -362,8 +383,22 @@ def crispasr_version() -> str:
         import json as _json
         req = urllib.request.Request(
             _CRISPASR_REPO_API, headers={"User-Agent": _UA, "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=_CRISPASR_API_TIMEOUT,
-                                    context=_ssl_ctx()) as resp:
+        try:
+            resp = urllib.request.urlopen(req, timeout=_CRISPASR_API_TIMEOUT,
+                                          context=_ssl_ctx())
+        except urllib.error.URLError as e:
+            # 证书验证失败（企业代理重签 TLS）→ 降级不验证重试（GitHub API
+            # 固定可信主机）；其他网络错误原样抛出走 fallback。
+            reason = getattr(e, "reason", None)
+            is_cert = isinstance(reason, ssl.SSLCertVerificationError) or \
+                "CERTIFICATE_VERIFY_FAILED" in str(reason)
+            if not is_cert:
+                raise
+            from applog import log_warn
+            log_warn("GitHub API 证书验证失败，降级为不验证查询版本")
+            resp = urllib.request.urlopen(req, timeout=_CRISPASR_API_TIMEOUT,
+                                          context=_ssl_ctx_unverified())
+        with resp:
             tag = (_json.loads(resp.read().decode("utf-8")).get("tag_name") or "").strip()
         if tag.lower().startswith("v") and tag[1:].replace(".", "").isdigit():
             ver = tag[1:]
@@ -1100,6 +1135,20 @@ def _download_file(url: str, dest: Path, progress_cb=None):
             # 416 Range Not Satisfiable = 文件已完整，直接视为成功
             return
         raise
+    except urllib.error.URLError as e:
+        # 证书验证失败（企业代理重签 TLS、系统缺根证书）→ 降级不验证重试一次。
+        # 来源全为固定可信主机（HF / GitHub），风险可控；留痕供诊断。
+        # 只接 URLError（SSLCertVerificationError 的 urllib 包装），
+        # 其他网络错误（超时/DNS）交由上层备援逻辑处理。
+        reason = getattr(e, "reason", None)
+        is_cert = isinstance(reason, ssl.SSLCertVerificationError) or \
+            "CERTIFICATE_VERIFY_FAILED" in str(reason)
+        if not is_cert:
+            raise
+        from applog import log_warn
+        log_warn(f"HTTPS 证书验证失败，降级为不验证下载：{url}")
+        resp = urllib.request.urlopen(req, timeout=30,
+                                      context=_ssl_ctx_unverified())
 
     content_length = int(resp.headers.get("Content-Length", 0))
 
@@ -1141,6 +1190,26 @@ def _download_file(url: str, dest: Path, progress_cb=None):
     log_download(f"{dest.name}: download OK ({done/1_048_576:.1f} MB)")
 
 
+def _safe_print(*args, **kwargs):
+    """GBK 等非 Unicode 控制台安全的 print。
+
+    消息含 ⚠✅❌ 等字符时，简体中文 Windows（GBK）的 print 会抛
+    UnicodeEncodeError——下载备援逻辑里的提示 print 反而把原始网络错误
+    取代掉（用户反馈实录：加载失败显示的正是这个编码错误）。
+    编码不了的字符替换为 '?'，保证消息能出去、异常不再上抛。
+    """
+    import sys as _sys
+    out = kwargs.get("file") or _sys.stdout
+    enc = getattr(out, "encoding", None) or "utf-8"
+    msg = " ".join(str(a) for a in args)
+    try:
+        msg.encode(enc, errors="strict")
+    except UnicodeEncodeError:
+        msg = msg.encode(enc, errors="replace").decode(enc, errors="replace")
+    kwargs.pop("file", None)
+    print(msg, **kwargs)
+
+
 def _download_file_with_fallback(
     fname: str,
     dest: Path,
@@ -1157,7 +1226,7 @@ def _download_file_with_fallback(
         _download_file(primary_url, dest, progress_cb)
     except (urllib.error.HTTPError, urllib.error.URLError, OSError) as primary_err:
         # 主要来源失败，切换备用
-        print(f"\n⚠ 主要来源失败（{primary_err}），切换至备用来源…")
+        _safe_print(f"\n⚠ 主要来源失败（{primary_err}），切换至备用来源…")
         _download_file(fallback_url, dest, progress_cb)
 
 
@@ -1227,33 +1296,33 @@ def download_all(model_dir: Path, progress_cb=None):
 def _cli_bar(pct: float, msg: str):
     filled = int(pct * 40)
     bar    = "█" * filled + "░" * (40 - filled)
-    print(f"\r[{bar}] {pct*100:5.1f}%  {msg:<45}", end="", flush=True)
+    _safe_print(f"\r[{bar}] {pct*100:5.1f}%  {msg:<45}", end="", flush=True)
 
 
 if __name__ == "__main__":
     check_only = "--check" in sys.argv
     model_dir  = _DEFAULT_MODEL_DIR
 
-    print("=== Qwen3-ASR 模型完整性检查 ===\n")
-    print(f"模型路径：{model_dir}\n")
+    _safe_print("=== Qwen3-ASR 模型完整性检查 ===\n")
+    _safe_print(f"模型路径：{model_dir}\n")
 
     if quick_check(model_dir):
-        print("所有文件存在，正在验证哈希…")
+        _safe_print("所有文件存在，正在验证哈希…")
         ok, msg = full_verify(model_dir, progress_cb=_cli_bar)
-        print()
+        _safe_print()
         if ok:
-            print("✅ 模型完整，无需下载")
+            _safe_print("✅ 模型完整，无需下载")
         else:
-            print(f"❌ {msg}")
+            _safe_print(f"❌ {msg}")
             if not check_only:
-                print("正在重新下载损坏的文件…")
+                _safe_print("正在重新下载损坏的文件…")
                 download_all(model_dir, _cli_bar)
-                print("\n✅ 完成")
+                _safe_print("\n✅ 完成")
     else:
-        print("模型不完整或尚未下载")
+        _safe_print("模型不完整或尚未下载")
         if check_only:
             sys.exit(1)
-        print(f"从 HuggingFace 下载（约 1.2 GB）：{_HF_REPO_PRIMARY}（备用：{_HF_REPO_FALLBACK}）")
-        print("首次下载视网络速度可能需要 5–30 分钟\n")
+        _safe_print(f"从 HuggingFace 下载（约 1.2 GB）：{_HF_REPO_PRIMARY}（备用：{_HF_REPO_FALLBACK}）")
+        _safe_print("首次下载视网络速度可能需要 5–30 分钟\n")
         download_all(model_dir, _cli_bar)
-        print("\n✅ 下载完成")
+        _safe_print("\n✅ 下载完成")
