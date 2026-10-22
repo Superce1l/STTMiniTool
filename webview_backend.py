@@ -12,13 +12,15 @@ ASREngine。不依赖 pywebview，也不依赖 HTTP —— 可被 webview_server
 """
 from __future__ import annotations
 
-import json
+import re
 import sys
 import threading
 import traceback
 from pathlib import Path
 
 import app as core          # 重用 ASREngine / 常数 / 诊断函数（__main__ guard 保护）
+from engine_types import TranscribeResult
+from settings_store import SettingsStore
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -277,6 +279,37 @@ def _srt_ts_fmt(sec: float) -> str:
 # OpenVINO 与 CRISPASR(whisper/qwen) 皆支持——前者 process_file 内置 use_diar 分支，
 # 后者由 crisp_engine._apply_diarization 依时间指派。diar_engine 由 _ensure_diarization 挂上。
 
+# 跨片说话者匹配阈值：声纹中心 cosine 相似度 ≥ 此值视为同一人。
+# 与 diarize.CENTROID_MERGE_DIST(0.30) 的「同一人中心距 ≤0.30」一致：sim ≥ 0.70。
+_SPK_MATCH_SIM = 0.70
+
+
+def _match_speaker(emb, global_spk: list) -> int:
+    """把一个片内声纹中心匹配到全局说话者；与谁都够不像则新开一人。
+
+    global_spk: [{"label": int, "emb": ndarray, "n": 样本数}]（中心就地更新）
+    返回全局说话者编号（1 起）。跨片映射的关键：每片独立聚类产生的「说话者1」
+    编号互不相干，唯有声纹可比——匹配上同一全局中心才能保证整份字幕里
+    同一人始终是同一个编号。
+    """
+    import numpy as _np
+    best, best_sim = None, _SPK_MATCH_SIM
+    for g in global_spk:
+        sim = float(emb @ g["emb"])
+        if sim > best_sim:
+            best, best_sim = g, sim
+    if best is None:
+        label = (global_spk[-1]["label"] + 1) if global_spk else 1
+        global_spk.append({"label": label, "emb": emb, "n": 1})
+        return label
+    # 运行中心更新：同一个人跨片的声纹微差取滑动平均，后续片匹配更稳
+    n = best["n"] + 1
+    c = best["emb"] * best["n"] + emb
+    nrm = float(_np.linalg.norm(c))
+    best["emb"] = c / nrm if nrm > 1e-9 else c
+    best["n"] = n
+    return best["label"]
+
 # 识别语言：crispasr 使用的常用语言清单（OpenVINO 改用 processor 的）
 _COMMON_LANGS = [
     "Chinese", "English", "Japanese", "Korean", "Cantonese", "French", "German",
@@ -328,7 +361,8 @@ def parse_srt_to_segments(srt_path) -> list[dict]:
         text, speaker = s["text"], None
         if "：" in text[:8]:
             head, _, rest = text.partition("：")
-            if head.startswith("说话者") or head.startswith("说话者"):
+            # 简体为主（引擎统一输出简体）；保留繁体判断以防上游标签未转换
+            if head.startswith("说话者") or head.startswith("說話者"):
                 digits = "".join(c for c in head if c.isdigit())
                 speaker = int(digits) if digits else None
                 text = rest
@@ -337,9 +371,9 @@ def parse_srt_to_segments(srt_path) -> list[dict]:
 
 
 def _rich_to_segments(rich) -> list[dict]:
-    """引擎侧通道 _last_segments_rich → 前端 segments（含字级 words，卡拉OK用）。
+    """引擎返回的字级 segments（TranscribeResult.segments_rich）→ 前端格式。
 
-    引擎存的 speaker 是原始标签（"说话者N" 或 None）；此处正规化成整数，
+    引擎给的 speaker 是原始标签（"说话者N" 或 None/int）；此处正规化成整数，
     与 parse_srt_to_segments 的前端契约一致。words 原样带出（[]=无对齐）。
     """
     out = []
@@ -377,6 +411,10 @@ class WebBackend:
         self._load_gate = threading.Lock()     # start_load 的 check-and-set（非重入，短持有）
         self._transcribe_gate = threading.Lock()  # transcribe 忙碌 check-and-set（非重入）
         self._active_label = None        # 实际加载的 (引擎标签, 模型标签)——字幕文件名/日志用
+        # settings.json 单点读写（锁 + 原子写 + mtime 缓存）；cli_mode 的临时
+        # 副本机制在构造本类前改 core.SETTINGS_FILE，故这里取到的已是生效路径。
+        self.settings = SettingsStore(
+            getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
         self._seed_defaults()            # 首次启动（无 backend）→ 种子默认模型
         self._apply_runtime_prefs()      # 启动即套用持久化偏好（VAD/简繁/镜像/格式）
 
@@ -388,20 +426,10 @@ class WebBackend:
         繁体佳）。写入 settings 后，后续 _persisted_backend/_load_worker 等皆读到它。
         既有使用者（已有 backend）不受影响。
         """
-        f = Path(getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
-        try:
-            cur = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-        except Exception:
-            cur = {}
-        if cur.get("backend"):
+        if self.settings.read().get("backend"):
             return                       # 既有设置 → 不覆盖
-        cur.setdefault("backend", "crispasr")
-        cur.setdefault("crisp_model", "qwen3")
-        cur.setdefault("crisp_qwen_quant", "q4")
-        try:
-            f.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        self.settings.update({"backend": "crispasr", "crisp_model": "qwen3",
+                              "crisp_qwen_quant": "q4"})
 
     # ── 事件推送 ────────────────────────────────────────────
     def _emit(self, event: str, payload: dict):
@@ -493,32 +521,27 @@ class WebBackend:
 
     # ── 各核心加载（重用既有引擎类别与 downloader）─────────────
     def _settings_raw(self) -> dict:
-        try:
-            f = getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json")
-            return json.loads(Path(f).read_text(encoding="utf-8")) if Path(f).exists() else {}
-        except Exception:
-            return {}
+        return self.settings.read()
 
     def _vk_device_id(self, s: dict) -> int:
         import re
         m = re.search(r"GPU:(\d+)", s.get("device", "") or "")
         return int(m.group(1)) if m else 0
 
-    # 每段最长秒数：使用者设置 → 套到当前引擎，但永远压到「模型天花板」。
-    # 天花板＝引擎类别的 max_chunk_secs（0.6B 30、1.7B 10），由音频
-    # 编码器导出长度写死，超过会被静默截断掉字，故只允许往短调，绝不超过。
-    # crispasr（无 max_chunk_secs 类别属性）走自身窗口，不受此设置影响。
-    _CHUNK_FLOOR = 5
-    def _apply_chunk_secs(self) -> None:
+    # 每段最长秒数已改为任务自适应（不再有设置项）：
+    # 开「字级对齐」→ 段上限压到 _ALIGN_CHUNK_SECS（抑制长段歌词/语音的
+    # 「段尾字级跑掉」漂移，与 1.7B 模型出厂上限一致）；关对齐 → 模型上限
+    # （0.6B 30s，段更少、吞吐更高）。永远不超过模型天花板（音频编码器导出
+    # 长度写死，超了会被静默截断掉字）。crispasr（无 max_chunk_secs 类别属性）
+    # 走自身窗口，不受影响。
+    _ALIGN_CHUNK_SECS = 10
+
+    def _apply_chunk_secs(self, align: bool) -> None:
         eng = getattr(self, "engine", None)
         ceiling = getattr(type(eng), "max_chunk_secs", None) if eng is not None else None
         if not isinstance(ceiling, int):
             return                                  # crispasr 等：不以 max_chunk_secs 分段
-        try:
-            want = int(self._settings_raw().get("chunk_secs", 0) or 0)
-        except Exception:
-            want = 0
-        eff = ceiling if want <= 0 else max(self._CHUNK_FLOOR, min(want, ceiling))
+        eff = min(self._ALIGN_CHUNK_SECS, ceiling) if align else ceiling
         try:
             eng.max_chunk_secs = eff                # 实例属性遮盖类别默认，仅影响本实例
         except Exception:
@@ -717,13 +740,7 @@ class WebBackend:
         return False
 
     def _persisted_backend(self) -> str:
-        try:
-            f = getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json")
-            if Path(f).exists():
-                return json.loads(Path(f).read_text(encoding="utf-8")).get("backend", "openvino")
-        except Exception:
-            pass
-        return "openvino"
+        return self.settings.read().get("backend", "openvino")
 
     def _app_version(self) -> str:
         try:
@@ -750,18 +767,11 @@ class WebBackend:
         if not path or not Path(path).exists():
             raise RuntimeError("找不到音频文件。")
         self._cancel = False
-        # 引擎侧取消事件：crispasr 的 _run_streaming 据此杀子进程，实现
-        # 「单片转录中」也能立即取消（此前只在切片边界生效）。
+        # 引擎侧取消事件（两引擎同契约）：crispasr 据此杀子进程；OpenVINO 在
+        # process_file 段间检查。「单片/单段转录中」也能立即取消。
         cancel_ev = getattr(self.engine, "cancel_event", None)
         if cancel_ev is not None:
             cancel_ev.clear()
-        # 清除上一轮残留的「未产生字幕」诊断：OpenVINO 引擎每次 process_file
-        # 会重置它，但 CrispASR 引擎从不写/清 → 不清的话，下一次非切片转录
-        # 无产出时会误报上一次切片运行的旧诊断。
-        try:
-            self.engine._last_vad_diag = None
-        except Exception:
-            pass
         self._transcribing = True
         _t0 = _time.monotonic()
         eng_label, model_label = getattr(self, "_active_label", None) or self._current_selection()
@@ -843,21 +853,16 @@ class WebBackend:
                 out_ref = srt_dir / "transcript"
 
             with self._lock:
-                self._apply_chunk_secs()      # 依设置确定本次 max_chunk_secs（压到模型上限）
-                # 清除上一轮字级残留，避免本轮若提前 return 时读到旧数据
-                try:
-                    self.engine._last_segments_rich = None
-                except Exception:
-                    pass
+                self._apply_chunk_secs(want_align)   # 任务自适应的每段上限（对齐→短段抗漂移）
 
                 # ── 长音频切片：超过阈值先用 ffmpeg 切片再逐片转录 ──────────
                 ff = self._resolve_ffmpeg()
                 dur = _ffprobe_duration(ff, audio_path) if ff else None
                 if dur and dur > _SLICE_THRESHOLD_SECS:
-                    srt = self._transcribe_sliced(
+                    res = self._transcribe_sliced(
                         audio_path, dur, out_ref, _cb, _lang, want_diar, n_speakers)
                 else:
-                    srt = self.engine.process_file(
+                    res = self.engine.process_file(
                         audio_path,
                         progress_cb=_cb,
                         language=_lang,
@@ -879,20 +884,21 @@ class WebBackend:
                 except Exception:
                     pass
 
-        if self._cancel:
+        if self._cancel or (res is not None and res.cancelled):
             log_transcribe(f"转录已取消：{Path(path).name}")
             raise RuntimeError("已取消。")
-        if not srt:
-            diag = getattr(self.engine, "_last_vad_diag", None)
+        if not res.output:
+            diag = res.diag
             log_transcribe(f"转录未产生字幕：{Path(path).name}（{diag or '未检测到人声'}）")
             raise RuntimeError(diag or "未产生字幕（未检测到人声）。")
 
         # UI 永远以内存中的 segments 渲染波形/字幕卡（需时间轴），故引擎固定产 SRT。
         # 但「输出格式」设置决定使用者实际取得的存档文件：选纯文字 → 另写 .txt、移除 .srt。
         # 优先用引擎的字级结构（含 words，驱动卡拉OK）；无则退回解析 SRT（行级）。
-        rich = getattr(self.engine, "_last_segments_rich", None)
-        segments = _rich_to_segments(rich) if rich else parse_srt_to_segments(srt)
-        saved = str(srt)
+        rich = res.segments_rich
+        srt_path = res.output
+        segments = _rich_to_segments(rich) if rich else parse_srt_to_segments(srt_path)
+        saved = str(srt_path)
         out_fmt = (self._settings_raw().get("output_format", "srt") or "srt").lower()
         if out_fmt == "txt":
             try:
@@ -900,9 +906,9 @@ class WebBackend:
                 lines = [(seg["start"], seg["end"], seg["text"],
                           (f'说话者{seg["speaker"]}' if seg.get("speaker") else None))
                          for seg in segments]
-                txt = write_transcript(Path(srt), lines, out_format="txt")
+                txt = write_transcript(Path(srt_path), lines, out_format="txt")
                 try:
-                    Path(srt).unlink(missing_ok=True)
+                    Path(srt_path).unlink(missing_ok=True)
                 except Exception:
                     pass
                 saved = str(txt)
@@ -936,6 +942,12 @@ class WebBackend:
         每片独立调 engine.process_file（重叠 15 秒防切点截字），产出各自 SRT
         后解析成 segments，合并去重，最后一次性写出整份 SRT（经 write_transcript
         以 out_ref 命名落盘）。任一片失败即中止（与整段转录的失败语义一致）。
+
+        说话者分离：不再交引擎逐片自做（每片独立聚类的标签编号互不相干，
+        同一人在片 1 是「说话者1」、片 2 可能变「说话者2」），改由本层统一
+        做——逐片聚类取声纹中心 → 跨片映射到全局编号（_match_speaker）→
+        合并去重后按时间中点统一指派，整份字幕的说话者编号保持一致。
+        返回 TranscribeResult（output=整份 SRT 路径；None=全片无声）。
         """
         import subprocess
         import tempfile
@@ -946,15 +958,28 @@ class WebBackend:
         if not ff:
             raise RuntimeError("长音频切片需要 ffmpeg，且自动下载失败。")
 
+        # 说话者分离引擎（want_diar 但未就绪 → 尝试补挂一次，与 transcribe 同语义）
+        diar = getattr(self.engine, "diar_engine", None) if want_diar else None
+        if want_diar and not (diar and getattr(diar, "ready", False)):
+            try:
+                self._ensure_diarization()
+            except Exception:
+                traceback.print_exc()
+            diar = getattr(self.engine, "diar_engine", None)
+        if not (diar and getattr(diar, "ready", False)):
+            diar = None
+
         plan = _slice_plan(duration)
         all_segments: list[list[dict]] = []
         _silent_parts: list[bool] = []   # 逐片记录是否无声（全静音时给诊断用）
+        global_spk: list[dict] = []      # 全局说话者声纹中心（跨片映射目标）
+        slice_diar: list[list[tuple[float, float, int]]] = []   # 各片 (绝对起, 绝对止, 全局标签)
 
         with tempfile.TemporaryDirectory(prefix="asr_slice_") as td:
             tmp = Path(td)
             for i, (start, end) in enumerate(plan, 1):
                 if self._cancel:
-                    raise RuntimeError("已取消。")
+                    return TranscribeResult(cancelled=True)
                 seg_wav = tmp / f"slice_{i:03d}.wav"
                 # -ss 放 -i 前（输入侧快速定位，大偏移时不解码整段前缀）。
                 # 此时输入时间戳被重置为 0，-to <全局终点> 会被误读成
@@ -973,6 +998,22 @@ class WebBackend:
                         f"ffmpeg 切片失败（片 {i}/{len(plan)}）："
                         f"{err[-1] if err else '未知错误'}")
 
+                # 说话者分离：转录前对本片独立聚类 → 标签映射到全局编号
+                if diar is not None:
+                    try:
+                        from audio_io import load_audio_16k_mono
+                        seg_audio, _ = load_audio_16k_mono(seg_wav, core.SAMPLE_RATE)
+                        segs, cents = diar.diarize_detailed(
+                            seg_audio, n_speakers=n_speakers)
+                        mapped = []
+                        for (t0, t1, lbl) in segs:
+                            g = (_match_speaker(cents[lbl], global_spk)
+                                 if lbl in cents else 1)
+                            mapped.append((t0 + start, t1 + start, g))
+                        slice_diar.append(mapped)
+                    except Exception:
+                        traceback.print_exc()   # 分离失败 → 本片无标签，不挡转录
+
                 def _slice_cb(done, total, msg, _i=i, _n=len(plan)):
                     # engine 的回调是 (i, total, msg) 三参；这里先把片内进度换算成
                     # 「全局百分比」再以 (pct, 100, msg) 交给 _cb——直接转发 done/total
@@ -983,29 +1024,31 @@ class WebBackend:
                     _cb(min(99, int((base + span * frac) * 100)), 100,
                         f"切片转录 {msg}（第 {_i}/{_n} 片）")
 
-                part_srt = self.engine.process_file(
+                # diarize=False：分离已由本层统一处理（引擎逐片自做标签会跨片漂移）
+                part = self.engine.process_file(
                     seg_wav,
                     progress_cb=_slice_cb,
                     language=lang,
                     context=None,
-                    diarize=want_diar,
+                    diarize=False,
                     n_speakers=n_speakers,
                     original_path=None,
                     out_format="srt",
                 )
-                if not part_srt:
+                if part.cancelled:
+                    return TranscribeResult(cancelled=True)
+                if not part.output:
                     _silent_parts.append(True)
                     continue      # 该片无声 → 跳过（如纯音乐片段）
                 _silent_parts.append(False)
                 # 片内时间已是绝对时间（-ss 放在 -i 前 = 输入侧定位，
                 # 输出的 pts 从 0 起算，故把片起点平移回全局时间轴）
-                part_segs = _rich_to_segments(
-                    getattr(self.engine, "_last_segments_rich", None)) \
-                    if getattr(self.engine, "_last_segments_rich", None) \
-                    else parse_srt_to_segments(part_srt)
+                part_segs = _rich_to_segments(part.segments_rich) \
+                    if part.segments_rich else parse_srt_to_segments(part.output)
                 for seg in part_segs:
                     seg["start"] += start
                     seg["end"] += start
+                    seg.pop("speaker", None)   # 说话者稍后由全局分离结果统一指派
                     for w in (seg.get("words") or []):
                         w["start"] = w.get("start", 0) + start
                         w["end"] = w.get("end", 0) + start
@@ -1015,10 +1058,22 @@ class WebBackend:
         if not merged:
             # 所有片都无声（每片 process_file 回 None）→ 给出与整段路径
             # 对等的诊断，而非笼统的「未检测到人声」。
-            self.engine._last_vad_diag = (
+            return TranscribeResult(diag=(
                 f"⚠ 切片转录未产生字幕：{sum(_silent_parts)}/{len(plan)} 片"
-                f"未识别到内容（音频可能为纯音乐/静音，或音轨编码异常）。")
-            return None
+                f"未识别到内容（音频可能为纯音乐/静音，或音轨编码异常）。"))
+
+        # 说话者指派：行时间中点落在哪个全局说话者段落；无覆盖段时取最近段
+        flat = [seg for segs in slice_diar for seg in segs]
+        if flat:
+            for seg in merged:
+                mid = (seg["start"] + seg["end"]) / 2.0
+                cov = [g for g in flat if g[0] <= mid < g[1]]
+                if cov:
+                    seg["speaker"] = cov[0][2]
+                else:
+                    seg["speaker"] = min(flat, key=lambda g: abs(
+                        (g[0] + g[1]) / 2.0 - mid))[2]
+
         lines = [(seg["start"], seg["end"], seg["text"],
                   (f'说话者{seg["speaker"]}' if seg.get("speaker") else None))
                  for seg in merged]
@@ -1029,7 +1084,10 @@ class WebBackend:
                 prefix = f"{spk}：" if spk else ""
                 f.write(f"{idx}\n{_srt_ts_fmt(s0)} --> {_srt_ts_fmt(e0)}\n"
                         f"{prefix}{text}\n\n")
-        return out
+        rich = [{"start": seg["start"], "end": seg["end"], "text": seg["text"],
+                 "speaker": seg.get("speaker"), "words": seg.get("words") or []}
+                for seg in merged]
+        return TranscribeResult(output=out, segments_rich=rich)
 
     def _ensure_ffmpeg(self):
         """返回可用的 ffmpeg；找不到时自 HF 下载精简 zip 解压后再找。
@@ -1210,6 +1268,84 @@ class WebBackend:
         except Exception as e:
             return {"ok": False, "url": url, "error": str(e)}
 
+    def check_update(self) -> dict:
+        """真实更新检查：GitHub API 查最新 release，与当前版本比对。
+
+        网络失败（离线/限流）回 ok=False，由前端提示而非误报「已是最新」。
+        """
+        try:
+            import version
+            cur = str(getattr(version, "WEBVIEW_VERSION", None)
+                      or getattr(version, "__version__", "") or "")
+            page = str(getattr(version, "GITHUB_RELEASES_PAGE", ""))
+            repo = str(getattr(version, "GITHUB_REPO", ""))
+            if not repo:
+                return {"ok": False, "error": "未配置更新来源", "url": page}
+            import requests
+            r = requests.get(
+                f"https://api.github.com/repos/{repo}/releases/latest",
+                timeout=8, headers={"Accept": "application/vnd.github+json"})
+            r.raise_for_status()
+            tag = str(r.json().get("tag_name") or "").strip()
+            latest = tag.lstrip("vV")
+            return {"ok": True, "current": cur, "latest": latest or tag,
+                    "hasUpdate": self._ver_newer(latest, cur), "url": page}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}", "url": ""}
+
+    @staticmethod
+    def _ver_newer(a: str, b: str) -> bool:
+        """语义化版本比较 a > b（逐段数值比较，短的补 0；非数字段记 0）。"""
+        def nums(v: str) -> list[int]:
+            return [int(x) if x.isdigit() else 0
+                    for x in re.split(r"[.\-+]", v.strip()) if x != ""]
+        na, nb = nums(a), nums(b)
+        n = max(len(na), len(nb))
+        na += [0] * (n - len(na))
+        nb += [0] * (n - len(nb))
+        return na > nb
+
+    # ── 转录历史（subtitles/ 目录的产出回填）───────────────────────────
+    def list_history(self) -> dict:
+        """subtitles/ 下最近的字幕文件（新→旧，最多 50 条）。"""
+        d = Path(getattr(core, "SRT_DIR", BASE_DIR / "subtitles"))
+        items = []
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for p in d.iterdir():
+                if p.suffix.lower() not in (".srt", ".txt") or not p.is_file():
+                    continue
+                st = p.stat()
+                items.append({"name": p.name, "mtime": int(st.st_mtime),
+                              "size": st.st_size})
+        except Exception:
+            traceback.print_exc()
+        items.sort(key=lambda x: -x["mtime"])
+        return {"items": items[:50]}
+
+    def load_history(self, name: str) -> dict:
+        """按文件名回填历史字幕 → segments（只接受基名，杜绝路径穿越）。"""
+        safe = Path(str(name or "").replace("\\", "/")).name
+        d = Path(getattr(core, "SRT_DIR", BASE_DIR / "subtitles"))
+        p = d / safe
+        try:
+            if d.resolve() not in p.resolve().parents:
+                return {"ok": False, "error": "路径不合法"}
+        except Exception:
+            return {"ok": False, "error": "路径不合法"}
+        if not p.is_file():
+            return {"ok": False, "error": "找不到文件"}
+        try:
+            if p.suffix.lower() == ".srt":
+                segments = parse_srt_to_segments(p)
+            else:
+                text = p.read_text(encoding="utf-8", errors="replace")
+                segments = ([{"start": 0.0, "end": 0.0, "speaker": None,
+                              "text": text}] if text.strip() else [])
+            return {"ok": True, "name": p.name, "segments": segments}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ── 模型下拉（核心 + 模型）＋ 识别语言 ─────────────────────────────
     #   持久化后走「切换=重启」(同 set_backend 的理由：避免就地切核心死机)。
     def _remember_active(self, backend: str):
@@ -1295,16 +1431,7 @@ class WebBackend:
                             f"（首次启用会自动下载对应模型）。")}
 
     def _persist_backend(self, backend: str):
-        f = Path(getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
-        try:
-            cur = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-        except Exception:
-            cur = {}
-        cur["backend"] = backend
-        try:
-            f.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        self.settings.update({"backend": backend})
 
     def get_model_options(self) -> dict:
         """核心/模型阶层 + 目前选择 + 每模型对应架构标签（前端渲染下拉用）。"""
@@ -1335,17 +1462,7 @@ class WebBackend:
                          _MODEL_CATALOG[0])
         core_label, model_label, backend, patch = entry
 
-        f = Path(getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
-        try:
-            cur = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-        except Exception:
-            cur = {}
-        cur["backend"] = backend
-        cur.update(patch)                 # cpu_model_size / crisp_model / crisp_quant
-        try:
-            f.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        cur = self.settings.update({"backend": backend, **patch})
 
         arch = self._backend_label(backend, backend)
         # 热切换：任何时刻都支持就地切换。转录/加载进行中 → 前端禁用切换
@@ -1624,13 +1741,7 @@ class WebBackend:
 
     # ── 设置（读写既有 settings.json）───────────────────────
     def get_settings(self) -> dict:
-        s = {}
-        try:
-            f = getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json")
-            if Path(f).exists():
-                s = json.loads(Path(f).read_text(encoding="utf-8"))
-        except Exception:
-            s = {}
+        s = self.settings.read()
         # 简繁词汇转换已从设置页移除：引擎固定输出模型原文（简体）。
         return {
             "scale": int(s.get("ui_scale", 100)),
@@ -1640,29 +1751,22 @@ class WebBackend:
             "ffmpeg": s.get("ffmpeg_path", ""),
             "theme": s.get("appearance", "light"),
             "uiLang": s.get("ui_lang", "简体中文"),
-            "vad": float(s.get("vad_threshold", 0.5)),
-            "chunkSecs": int(s.get("chunk_secs", 0) or 0),   # 0=自动（依模型上限）
-            # 模型页模式：basic（用途导向，默认）／advanced（核心+模型全手动）
+            # VAD 灵敏度与每段最长秒数已改任务自适应（无设置项，见 _apply_chunk_secs
+            # 与 app._vad_segment_auto）；settings.json 里的旧键忽略不读。
             "modelMode": (s.get("model_mode") if s.get("model_mode") in ("basic", "advanced")
                           else "basic"),
         }
 
     def set_settings(self, patch: dict) -> dict:
-        f = Path(getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
-        cur = {}
-        try:
-            if f.exists():
-                cur = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            cur = {}
+        old_model_dir = self._model_dir()
         patch = patch or {}
+        mapped = {}
         key_map = {"scale": "ui_scale", "format": "output_format",
                    "mirror": "hf_mirror", "ffmpeg": "ffmpeg_path", "theme": "appearance",
-                   "uiLang": "ui_lang", "vad": "vad_threshold", "chunkSecs": "chunk_secs",
-                   "modelMode": "model_mode"}
+                   "uiLang": "ui_lang", "modelMode": "model_mode"}
         for k, v in patch.items():
             if k in key_map:
-                cur[key_map[k]] = v
+                mapped[key_map[k]] = v
         # 模型下载位置：非空 → 创建目录并记绝对路径；空 → 回退默认（exe 旁 ov_models/）。
         # 变更后需重启才对新位置生效（已加载的引擎仍指向旧目录）。
         self._model_dir_changed = False
@@ -1673,20 +1777,18 @@ class WebBackend:
                     d = Path(raw).expanduser()
                     d.mkdir(parents=True, exist_ok=True)
                     new_dir = str(d)
-                    self._model_dir_changed = (new_dir != self._model_dir().__str__())
-                    cur["model_dir"] = new_dir
+                    self._model_dir_changed = (new_dir != str(old_model_dir))
+                    mapped["model_dir"] = new_dir
                 except Exception:
                     pass          # 无效路径 → 不写入
             else:
-                self._model_dir_changed = "model_dir" in cur
-                cur.pop("model_dir", None)      # 空 → 回退默认位置
-        try:
-            f.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+                self._model_dir_changed = "model_dir" in self.settings.read()
+                self.settings.remove("model_dir")      # 空 → 回退默认位置
+        if mapped:
+            cur = self.settings.update(mapped)
+        else:
+            cur = self.settings.read()
         # ── 实时套用副作用（与 app.py 的 _on_*_change 对齐）──────────────
-        if "vad" in patch:
-            self._apply_vad(patch["vad"])      # _detect_speech_groups 读全域，立即生效
         if "mirror" in patch:
             self._apply_mirror(patch["mirror"])
         if "format" in patch:
@@ -1712,16 +1814,7 @@ class WebBackend:
 
     def _persist_setting(self, key: str, value):
         """写单个设置键到 settings.json（保留其他键）。"""
-        f = Path(getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
-        try:
-            cur = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-        except Exception:
-            cur = {}
-        cur[key] = value
-        try:
-            f.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        self.settings.update({key: value})
 
     def _apply_mirror(self, base):
         try:
@@ -1737,23 +1830,13 @@ class WebBackend:
         except Exception:
             pass
 
-    def _apply_vad(self, value):
-        """把 VAD 阈值实时套到 app 模块全域 —— _detect_speech_groups 于调用时读取。"""
-        try:
-            core.VAD_THRESHOLD = float(value)
-        except Exception:
-            pass
-
     def _apply_runtime_prefs(self):
         """启动时把持久化偏好一次套用到各引擎模块全域。
 
-        在 start_load() 之前调用 → 模块标志先就位，VAD/镜像/输出格式皆于首次转录前生效。
+        在 start_load() 之前调用 → 模块标志先就位，镜像/输出格式皆于首次转录前生效。
+        （VAD 灵敏度已改自动重试、无设置项，见 app._vad_segment_auto。）
         """
         s = self._settings_raw()
-        try:
-            self._apply_vad(s.get("vad_threshold", 0.5))
-        except Exception:
-            pass
         self._apply_mirror(s.get("hf_mirror", ""))
         self._apply_output_format(s.get("output_format", "srt"))
 

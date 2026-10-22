@@ -30,6 +30,7 @@
     $("#view-ctx").textContent = "";
     if (name === "model") renderModel();
     if (name === "record") { enumerateMics(); refreshMicPerm(); }   // 列举设备 + 麦克风权限状态
+    if (name === "file") renderHistory();    // 最近转录（subtitles/ 产出回填）
   }
   $("#nav").addEventListener("click", e => {
     const btn = e.target.closest(".nav-item");
@@ -66,8 +67,8 @@
   }
   function renderDropEmpty() {
     drop.innerHTML = `<div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg></div>
-      <div class="big">拖曳音讯到此，或<b>点击选择文件</b></div>
-      <div class="sub">支持 mp3 / wav / m4a / 视频音轨</div>`;
+      <div class="big">${T("file.dropBig", "拖曳音讯到此，或<b>点击选择文件</b>")}</div>
+      <div class="sub">${T("file.dropSub", "支持 mp3 / wav / m4a / 视频音轨")}</div>`;
   }
 
   // 桌面：原生对话框；web/mock：fallback 到 <input type=file>
@@ -101,10 +102,10 @@
     if (!picked || running) return;
     running = true; _switchBusy = true;    // 转录中 → 模型页切换禁用
     const btn = $("#btn-run");
-    btn.disabled = true; btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>识别中…`;
+    btn.disabled = true; btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>${T("file.running", "识别中…")}`;
     $("#result").hidden = true;
-    showProgress(0, "准备中…");
-    logLine("▶ 开始转换：" + picked.name);
+    showProgress(0, T("file.preparing", "准备中…"));
+    logLine("▶ " + T("file.logStart", "开始转换：") + picked.name);
     try {
       const res = await API.transcribe({
         path: picked.path, file: picked.file || picked,
@@ -115,9 +116,11 @@
         hint: $("#hint-box").value.trim(),
       });
       renderResult(res.segments);
-      logLine("✓ 完成，共 " + res.segments.length + " 段" + (res.srtPath ? "，已输出 " + res.srtPath : ""));
+      logLine("✓ " + T("file.logDone", "完成，共 {n} 段", { n: res.segments.length })
+        + (res.srtPath ? T("file.logSaved", "，已输出 ") + res.srtPath : ""));
       $("#btn-open-dir").disabled = false;
       $("#btn-save-sub").disabled = false;
+      renderHistory();
     } catch (err) {
       showProgress(0, "");
       $("#progress").hidden = true;
@@ -125,7 +128,7 @@
     } finally {
       running = false; _switchBusy = false;
       btn.disabled = false;
-      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>开始转换`;
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>${T("file.run", "开始转换")}`;
     }
   });
 
@@ -150,11 +153,34 @@
   //   随播放高亮，皆可点击 seek —— 肉眼即可看字幕与音讯的对齐准确度。
   const WAVE_N = 200;
   let audioEl = null, audioUrl = null, waveDur = 0, curSegs = [];
+  // 播放高亮用的元素缓存与位置提示（长音频数千段时避免每帧 O(n) DOM 查询）
+  let _subEls = [], _blockEls = [], _playingIdx = -1, _playedBars = -1, _segHint = 0;
+
+  // 定位 t 所在段：先看上次位置附近（播放连续），未命中则二分。
+  // 返回段索引；间隙（无段覆盖）回 -1。
+  function segIndexAt(t) {
+    const n = curSegs.length;
+    if (!n) return -1;
+    for (const i of [_segHint, _segHint - 1, _segHint + 1]) {
+      if (i >= 0 && i < n && t >= curSegs[i].start && t < curSegs[i].end) {
+        _segHint = i; return i;
+      }
+    }
+    let lo = 0, hi = n - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1, s = curSegs[mid];
+      if (t < s.start) hi = mid - 1;
+      else if (t >= s.end) lo = mid + 1;
+      else { _segHint = mid; return mid; }
+    }
+    return -1;
+  }
 
   async function renderResult(segments) {
     $("#result").hidden = false;
     curSegs = segments;
     _karaCache = null;                      // 新结果 → 重建卡拉OK字级（段落索引已变）
+    _subEls = []; _blockEls = []; _playingIdx = -1; _playedBars = -1; _segHint = 0;
     cleanupAudio();
 
     const file = picked && (picked.file || (picked instanceof Blob ? picked : null));
@@ -226,6 +252,7 @@
     let host = $("#seg-strip");
     if (!host) { host = document.createElement("div"); host.id = "seg-strip"; host.className = "seg-strip"; $(".wave-panel").appendChild(host); }
     host.innerHTML = "";
+    _blockEls = [];
     segments.forEach((s, i) => {
       const left = (s.start / dur) * 100, w = Math.max(0.6, ((s.end - s.start) / dur) * 100);
       const blk = document.createElement("div");
@@ -235,12 +262,14 @@
       blk.textContent = s.text;
       blk.addEventListener("click", () => seekTo(s.start));
       host.appendChild(blk);
+      _blockEls.push(blk);
     });
   }
 
   function renderSubs(segments) {
     const host = $("#subs"); host.innerHTML = "";
-    segments.forEach((s, i) => host.appendChild(subCard(s, i)));
+    _subEls = [];
+    segments.forEach((s, i) => { const el = subCard(s, i); host.appendChild(el); _subEls.push(el); });
   }
   function subCard(s, idx) {
     const el = document.createElement("div");
@@ -321,14 +350,31 @@
     function onTime() {
       const t = audioEl.currentTime, ratio = waveDur ? t / waveDur : 0;
       const ph = $("#playhead"); if (ph) ph.style.left = (ratio * 100).toFixed(2) + "%";
-      const playedIdx = Math.floor(ratio * bars.length);
-      bars.forEach((b, i) => b.classList.toggle("played", i <= playedIdx));
-      const cur = curSegs.findIndex(s => t >= s.start && t < s.end);
-      $$(".sub-card").forEach(c => c.classList.toggle("playing", +c.dataset.seg === cur));
-      $$(".seg-block").forEach(c => c.classList.toggle("playing", +c.dataset.seg === cur));
+      // 波形已播色：只在前进/后退跨桶时重刷（200 根，避免每次 timeupdate 全量 toggle）
+      const playedIdx = Math.max(0, Math.min(bars.length - 1, Math.floor(ratio * bars.length)));
+      if (playedIdx !== _playedBars) {
+        if (playedIdx > _playedBars) {
+          for (let i = _playedBars + 1; i <= playedIdx; i++) bars[i].classList.add("played");
+        } else {
+          bars.forEach((b, i) => b.classList.toggle("played", i <= playedIdx));
+        }
+        _playedBars = playedIdx;
+      }
+      // 当前段高亮：只动换段时的两行（缓存的元素数组，无 DOM 查询）
+      const cur = segIndexAt(t);
+      if (cur !== _playingIdx) {
+        if (_playingIdx >= 0) {
+          if (_subEls[_playingIdx]) _subEls[_playingIdx].classList.remove("playing");
+          if (_blockEls[_playingIdx]) _blockEls[_playingIdx].classList.remove("playing");
+        }
+        if (cur >= 0) {
+          if (_subEls[cur]) _subEls[cur].classList.add("playing");
+          if (_blockEls[cur]) _blockEls[cur].classList.add("playing");
+          if (playFollow) _subEls[cur].scrollIntoView({ block: "nearest" });
+        }
+        _playingIdx = cur;
+      }
       const tm = $("#wave-cur"); if (tm) tm.textContent = fmtClock(t);
-      // 自动滚动到播放中的字幕卡
-      if (cur >= 0) { const el = $(`.sub-card[data-seg="${cur}"]`); if (el && playFollow) el.scrollIntoView({ block: "nearest" }); }
     }
   }
   let playFollow = true;
@@ -366,17 +412,17 @@
       const sung = t >= w.end;
       const active = t >= w.start && t < w.end;
       let scale = 1;
-      // ── TODO（你来写）：放大跳动曲线（5~8 行）──────────────────────────
-      //   目标：字被唱到的瞬间「弹」一下再回落（Apple Music 动态歌词风）。
-      //   手上的量：w.start / w.end（该字时间窗）、t（目前秒数）、active。
-      //   设计空间（任选或自创）：
-      //     • 进度 p = (t - w.start) / (w.end - w.start)，clamp 0..1
-      //     • 起跳即最大、唱完归位： if (active) scale = 1 + 0.25 * (1 - p)
-      //     • 预备动作：在 w.start 前 ~0.1s 先微幅放大（anticipation）
-      //     • 建议上限 scale ≤ 1.3，避免整行版面抖动过猛
-      //   （把你的曲线写进 scale 即可，其余渲染/映射都已接好。）
-      // ──────────────────────────────────────────────────────────────────
-      return { sung, active, scale };
+      if (active) {
+        // 起跳即最大、随进度二次缓出回落：唱到的瞬间「弹」一下再归位
+        const dur = Math.max(0.05, w.end - w.start);
+        const p = Math.min(1, (t - w.start) / dur);
+        scale = 1 + 0.24 * (1 - p) * (1 - p);
+      } else if (!sung) {
+        // 预备动作：开唱前 ~0.12s 先微幅抬起蓄力（Apple Music 动态歌词风）
+        const lead = w.start - t;
+        if (lead <= 0.12) scale = 1 + 0.06 * (1 - lead / 0.12);
+      }
+      return { sung, active, scale };   // scale 上限 1.24 ≤ 1.3，整行不至抖动过猛
     });
   }
 
@@ -424,10 +470,10 @@
     return { words, spans };
   }
 
-  // 每帧更新：定位目前段 → （换段才重绘）→ 算每字状态 → 套用 transform。
+  // 每帧更新：定位目前段（提示位置 + 二分，见 segIndexAt）→（换段才重绘）→ 套用状态。
   function updateKaraoke(t) {
     if (!curSegs.length) return;
-    let idx = curSegs.findIndex(s => t >= s.start && t < s.end);
+    let idx = segIndexAt(t);
     if (idx < 0) idx = _karaCache ? _karaCache.idx : 0;   // 空隙：停在上一段（唱完状态）
     if (!_karaCache || _karaCache.idx !== idx) {
       const built = renderKaraokeLine(idx);
@@ -483,21 +529,86 @@
       ? segs.map(s => (s.speaker ? `说话者${s.speaker}：` : "") + s.text).join("\n")
       : segs.map(s => s.text).join("");
   }
-  async function saveSubtitle() {
+  // LRC 歌词：行首时间戳 [mm:ss.xx]，带说话者前缀
+  function lrcTs(sec) {
+    const s = Math.max(0, sec);
+    const m = Math.floor(s / 60), ss = s - m * 60;
+    return `${String(m).padStart(2, "0")}:${ss.toFixed(2).padStart(5, "0")}`;
+  }
+  function buildLrc(segs) {
+    return segs.map(s =>
+      `[${lrcTs(s.start)}]${s.speaker ? `说话者${s.speaker}：` : ""}${s.text}`
+    ).join("\n") + "\n";
+  }
+  // ASS 卡拉OK：有字级 words 时输出 \k 逐字标签（厘秒拍点，播放器即卡拉OK高亮），
+  // 无 words 退回整行显示。字间空隙并入前一字拍子，保持拍点连续。
+  function buildAss(segs) {
+    const ts = sec => {
+      const cs = Math.max(0, Math.round(sec * 100));
+      const h = Math.floor(cs / 360000), m = Math.floor(cs / 6000) % 60;
+      const s = Math.floor(cs / 100) % 60, c = cs % 100;
+      return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(c).padStart(2, "0")}`;
+    };
+    const header = [
+      "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1920", "PlayResY: 1080", "",
+      "[V4+ Styles]",
+      "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+      "Style: Default,Noto Sans SC,72,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,2,1,2,80,80,80,1",
+      "", "[Events]",
+      "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ];
+    const lines = segs.map(s => {
+      const spk = s.speaker ? `说话者${s.speaker}：` : "";
+      const words = (s.words && s.words.length) ? s.words : null;
+      let text;
+      if (words) {
+        text = spk + words.map((w, i) => {
+          const endT = i < words.length - 1 ? Math.max(w.end, words[i + 1].start) : s.end;
+          const k = Math.max(1, Math.round((endT - w.start) * 100));
+          return `{\\k${k}}${w.text}`;
+        }).join("");
+      } else {
+        text = spk + s.text;
+      }
+      return `Dialogue: 0,${ts(s.start)},${ts(s.end)},Default,,0,0,0,,${text}`;
+    });
+    return header.concat(lines).join("\n") + "\n";
+  }
+  const _SAVE_EXTS = { srt: ".srt", txt: ".txt", lrc: ".lrc", ass: ".ass" };
+  async function saveSubtitle(fmt) {
     if (!curSegs.length) return;
-    let fmt = "srt";
-    try { fmt = (await API.getSettings()).format || "srt"; } catch (e) {}
-    const text = fmt === "txt" ? buildTxt(curSegs) : buildSrt(curSegs);
+    if (!fmt || !_SAVE_EXTS[fmt]) {
+      fmt = "srt";
+      try { fmt = (await API.getSettings()).format || "srt"; } catch (e) {}
+    }
+    const text = fmt === "txt" ? buildTxt(curSegs)
+      : fmt === "lrc" ? buildLrc(curSegs)
+      : fmt === "ass" ? buildAss(curSegs)
+      : buildSrt(curSegs);
     const base = (picked && picked.name) ? picked.name.replace(/\.[^.]+$/, "") : "字幕";
     const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = base + (fmt === "txt" ? ".txt" : ".srt");
+    a.download = base + (_SAVE_EXTS[fmt] || ".srt");
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    logLine("✓ 已存档字幕：" + a.download);
+    logLine("✓ " + T("file.saved", "已存档字幕：") + a.download);
   }
-  $("#btn-save-sub").addEventListener("click", saveSubtitle);
+  // 保存菜单：SRT（默认，按全局输出格式）/ ASS / LRC / TXT
+  const saveMenu = $("#save-menu");
+  $("#btn-save-sub").addEventListener("click", () => {
+    if (!curSegs.length) return;
+    saveMenu.hidden = !saveMenu.hidden;
+  });
+  saveMenu.addEventListener("click", e => {
+    const b = e.target.closest("button[data-fmt]");
+    if (!b) return;
+    saveMenu.hidden = true;
+    saveSubtitle(b.dataset.fmt);
+  });
+  document.addEventListener("click", e => {
+    if (!e.target.closest(".save-wrap") && !saveMenu.hidden) saveMenu.hidden = true;
+  });
 
   // ── 记录 ────────────────────────────────────────────────
   function logLine(msg) {
@@ -518,19 +629,19 @@
     try { h = await API.getHealthCheck(); } catch (e) { return; }
     const sum = $("#health-sum");
     if (h.summary) {
-      if (h.summary.red > 0) { sum.className = "chip chip-live"; sum.textContent = `${h.summary.red} 项需处理`; }
-      else if (h.summary.yellow > 0) { sum.className = "chip chip-accent"; sum.textContent = `核心就绪 · ${h.summary.yellow} 项将于启用时自动下载`; }
-      else { sum.className = "chip chip-ok"; sum.textContent = "全部就绪"; }
+      if (h.summary.red > 0) { sum.className = "chip chip-live"; sum.textContent = T("model.healthRed", "{n} 项需处理", { n: h.summary.red }); }
+      else if (h.summary.yellow > 0) { sum.className = "chip chip-accent"; sum.textContent = T("model.healthYellow", "核心就绪 · {n} 项将于启用时自动下载", { n: h.summary.yellow }); }
+      else { sum.className = "chip chip-ok"; sum.textContent = T("model.healthOk", "全部就绪"); }
     }
     const host = $("#health-panel"); host.innerHTML = "";
     const dot = s => `<span class="hdot hdot-${s}"></span>`;
     const groups = [...(h.cores || [])];
-    if (h.shared && h.shared.length) groups.push({ label: "共享组件", items: h.shared });
+    if (h.shared && h.shared.length) groups.push({ label: T("model.shared", "共享组件"), items: h.shared });
     groups.forEach(g => {
       const card = document.createElement("div"); card.className = "health-core";
       const active = g.backend && g.backend === h.activeBackend;
       card.innerHTML = `<div class="hc-title">${escapeHtml(g.label)}` +
-        (active ? ` <span class="chip chip-ok" style="font-size:10px">使用中</span>` : ``) + `</div>`;
+        (active ? ` <span class="chip chip-ok" style="font-size:10px">${T("model.inUse", "使用中")}</span>` : ``) + `</div>`;
       (g.items || []).forEach(it => {
         const row = document.createElement("div"); row.className = "hc-item";
         row.innerHTML = `${dot(it.status)}<span class="hi-label">${escapeHtml(it.label)}</span>` +
@@ -653,7 +764,7 @@
       } else rb.hidden = true;
     }
     accelMsg(a.needsDownload
-      ? `加速器尚未下载或版本不符（最新 ${a.latest}），点「下载并加载模型」时会一并取得。`
+      ? T("model.accelNeeds", "加速器尚未下载或版本不符（最新 {v}），点「下载并加载模型」时会一并取得。", { v: a.latest })
       : "", "info");
   }
   function accelMsg(text, level) {
@@ -778,10 +889,6 @@
     $("#set-mirror").value = s.mirror || "";
     $("#set-ffmpeg").value = s.ffmpeg || "";
     $("#set-model-dir").value = s.modelDir || "";
-    if (s.vad != null) { $("#set-vad").value = s.vad; $("#set-vad-val").textContent = (+s.vad).toFixed(2); }
-    // 每段最长秒数：0/未设 → 视为上限（slider 显示 30，后端依模型自动压低）
-    const cs = (+s.chunkSecs > 0) ? +s.chunkSecs : 30;
-    if ($("#set-chunk")) { $("#set-chunk").value = cs; $("#set-chunk-val").textContent = cs + "s"; }
     // 界面语言：菜单回填 + 套用 i18n（含目前视图标题）
     const uiLang = s.uiLang || "简体中文";
     if ([...$("#set-lang").options].some(o => o.value === uiLang)) $("#set-lang").value = uiLang;
@@ -793,12 +900,6 @@
 
   $("#set-scale").addEventListener("change", e => {
     const v = +e.target.value; applyScale(v); API.setSettings({ scale: v });
-  });
-  $("#set-vad").addEventListener("input", e => {
-    const v = +e.target.value; $("#set-vad-val").textContent = v.toFixed(2); API.setSettings({ vad: v });
-  });
-  $("#set-chunk") && $("#set-chunk").addEventListener("input", e => {
-    const v = +e.target.value; $("#set-chunk-val").textContent = v + "s"; API.setSettings({ chunkSecs: v });
   });
   // segmented 控制：点击切换 + 回写设置
   [["#set-format", "format"], ["#set-theme", "theme"]].forEach(([sel, key]) => {
@@ -857,16 +958,55 @@
     if (window.I18N) { I18N.setLang(v); refreshViewTitle(); }
     if (_curView === "model") renderModel();   // 重绘动态文字（核心卡描述等）
   });
-  // 检查更新：开启 GitHub Releases 页（系统浏览器）
+  // 检查更新：后端比对 GitHub 最新 release；有新版自动打开下载页
   $("#btn-check-update") && $("#btn-check-update").addEventListener("click", async () => {
-    const btn = $("#btn-check-update"); const o = btn.textContent;
-    btn.disabled = true; btn.textContent = "开启中…";
+    const btn = $("#btn-check-update");
+    btn.disabled = true; btn.textContent = T("set.checking", "检查中…");
     try {
       const res = await API.checkUpdate();
-      if (res && res.ok === false) flash(btn, "未配置更新链接");
-    } catch (e) {}
-    setTimeout(() => { btn.disabled = false; btn.textContent = o; }, 1500);
+      if (res && res.ok) {
+        if (res.hasUpdate) {
+          flash(btn, T("set.newVersion", "新版本 v{v}！打开下载页…", { v: res.latest }));
+          if (res.url) window.open(res.url, "_blank");
+        } else {
+          flash(btn, T("set.upToDate", "已是最新 v{v}", { v: res.current || res.latest }));
+        }
+      } else {
+        flash(btn, T("set.checkFailed", "检查失败（网络？）"));
+      }
+    } catch (e) { flash(btn, T("set.checkFailed", "检查失败（网络？）")); }
   });
+
+  // ── 转录历史：subtitles/ 最近产出，点击回填查看／再存档 ──────────────
+  async function renderHistory() {
+    const head = $("#history-head"), host = $("#history-list");
+    if (!head || !host) return;
+    let h;
+    try { h = await API.listHistory(); } catch (e) { return; }
+    const items = (h && h.items) || [];
+    if (!items.length) { head.hidden = true; host.hidden = true; return; }
+    head.hidden = false; host.hidden = false;
+    host.innerHTML = "";
+    items.forEach(it => {
+      const el = document.createElement("button");
+      el.className = "history-item";
+      const when = new Date(it.mtime * 1000).toLocaleString();
+      el.innerHTML = `<span class="hn">${escapeHtml(it.name)}</span>
+        <span class="hm">${when} · ${Math.max(1, Math.round(it.size / 1024))} KB</span>`;
+      el.addEventListener("click", async () => {
+        try {
+          const r = await API.loadHistory(it.name);
+          if (r && r.ok && (r.segments || []).length) {
+            renderResult(r.segments);
+            $("#btn-open-dir").disabled = false;
+            $("#btn-save-sub").disabled = false;
+            logLine("✓ " + T("file.historyLoaded", "已载入历史字幕：") + it.name);
+          }
+        } catch (e) {}
+      });
+      host.appendChild(el);
+    });
+  }
 
   // ── 共享工具 ────────────────────────────────────────────
   function fmtClock(sec) {
@@ -876,6 +1016,13 @@
     return `${m}:${s}`;
   }
   function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+  // 按钮短暂提示文字后还原（检查更新结果等一次性反馈）
+  function flash(btn, msg, ms = 2600) {
+    const o = btn.textContent;
+    btn.textContent = msg;
+    btn.disabled = true;
+    setTimeout(() => { btn.textContent = o; btn.disabled = false; }, ms);
+  }
 
   // ── 录制转换：MediaRecorder + 停顿检测(VAD)，分段上传识别 ──────
   //   127.0.0.1/localhost 属安全情境，getUserMedia 可用（不需 HTTPS）。
@@ -888,7 +1035,6 @@
     fileHandle: null,    // 实时存档的 File System Access 文件 handle（若支持）
   };
   const SILENCE_MS = 2200, MIN_SEG_MS = 500, MAX_SEG_MS = 20000, VAD_THRESH = 0.014;
-  const REC_LINE_SECS = 5;     // 录制无精确时间戳 → 每段合成固定 5s（比照 app.py）
 
   $("#rec-btn").addEventListener("click", () => REC.on ? stopRec() : startRec());
 
@@ -904,7 +1050,7 @@
     const chip = $("#rec-perm"), help = $("#rec-perm-help");
     if (!chip) return;
     if (!recSupported()) {
-      chip.hidden = false; chip.className = "chip chip-muted"; chip.textContent = "不支持录音";
+      chip.hidden = false; chip.className = "chip chip-muted"; chip.textContent = T("record.unsupported", "不支持录音");
       return;
     }
     let state = "prompt";
@@ -939,12 +1085,12 @@
       const mics = devs.filter(d => d.kind === "audioinput");
       sel.innerHTML = "";
       const def = document.createElement("option");
-      def.value = ""; def.textContent = "默认麦克风";
+      def.value = ""; def.textContent = T("record.defaultMic", "默认麦克风");
       sel.appendChild(def);
       mics.forEach((d, i) => {
         const o = document.createElement("option");
         o.value = d.deviceId;
-        o.textContent = d.label || `麦克风 ${i + 1}`;
+        o.textContent = d.label || T("record.micN", "麦克风 {n}", { n: i + 1 });
         sel.appendChild(o);
       });
       if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
@@ -956,7 +1102,7 @@
   }
 
   async function startRec() {
-    if (!recSupported()) { recNote("此环境不支持录音 API。", true); return; }
+    if (!recSupported()) { recNote(T("record.noApi", "此环境不支持录音 API。"), true); return; }
     // 依选定的麦克风建立音讯约束（空值 → 系统默认设备）。
     const micId = $("#rec-mic") ? $("#rec-mic").value : "";
     const audioConstraint = { echoCancellation: true, noiseSuppression: true };
@@ -966,7 +1112,7 @@
     } catch (err) {
       // 被拒 / 无设备 → 页核显示权限指引，不只丢一行错误
       const denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
-      recNote((denied ? "麦克风权限被拒。" : "无法取得麦克风：") + (err.message || err), true);
+      recNote((denied ? T("record.denied", "麦克风权限被拒。") : T("record.micFail", "无法取得麦克风：")) + (err.message || err), true);
       refreshMicPerm();
       if (denied && $("#rec-perm-help")) $("#rec-perm-help").hidden = false;
       return;
@@ -978,17 +1124,20 @@
     REC.analyser = REC.ctx.createAnalyser(); REC.analyser.fftSize = 1024;
     src.connect(REC.analyser);
     REC.on = true; REC.sec = 0;
+    REC.recStart = Date.now();      // 真实时间轴基准：段起止=录音内的真实秒数
     API.recordState(true);          // 同步后端：录音中 → 关窗需确认
     $("#rec-btn").classList.add("recording");
     const lw = $("#rec-live-wave"); lw.hidden = false;
     lw.innerHTML = Array.from({ length: 28 }, () => `<div class="b" style="height:4px"></div>`).join("");
     $("#rec-timer").textContent = "00:00";
     REC.timer = setInterval(() => { REC.sec++; $("#rec-timer").textContent = fmtClock(REC.sec); }, 1000);
-    recNote("聆听中…说完停顿约 2 秒会自动识别；再按一次结束并完成最后一段。");
+    recNote(T("record.listening", "聆听中…说完停顿约 2 秒会自动识别；再按一次结束并完成最后一段。"));
     startSeg(); monitor();
   }
+  function recElapsed() { return REC.recStart ? (Date.now() - REC.recStart) / 1000 : 0; }
   function startSeg() {
     REC.chunks = []; REC.speech = false; REC.silentSince = 0; REC.segStart = Date.now();
+    REC.segStartElapsed = recElapsed();   // 本段在录音里的真实起点
     const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
       .find(m => MediaRecorder.isTypeSupported(m)) || "";
     REC.recorder = mime ? new MediaRecorder(REC.stream, { mimeType: mime })
@@ -997,19 +1146,30 @@
     REC.recorder.onstop = onSegStop;
     REC.recorder.start();
   }
-  function cutSeg() { if (REC.recorder && REC.recorder.state === "recording") REC.recorder.stop(); }
+  function cutSeg() {
+    if (REC.recorder && REC.recorder.state === "recording") {
+      REC.segEndElapsed = recElapsed();   // 录制媒体止于 stop() 调用时刻
+      REC.recorder.stop();
+    }
+  }
   async function onSegStop() {
     const dur = Date.now() - REC.segStart;
     const blob = new Blob(REC.chunks, { type: REC.chunks[0] ? REC.chunks[0].type : "audio/webm" });
     const ok = REC.speech && dur >= MIN_SEG_MS && blob.size > 1200;
+    // 真实时间轴：本段起点=开录时刻、终点=切段时刻（静音间隔如实留白），
+    // 导出的 SRT 可直接用于同步（旧版固定 5s 顺排，时间轴是假的）。
+    const t0 = REC.segStartElapsed || 0;
+    const t1 = Math.max(t0 + 0.5, REC.segEndElapsed || recElapsed());
     if (REC.on) startSeg(); else teardownRec();    // 先续录，避免上传期间漏话
     if (ok) {
       try {
         const file = new File([blob], "recording.webm", { type: blob.type });
         const recLang = $("#rec-lang") ? $("#rec-lang").value : "";
         const res = await API.transcribe({ file, language: recLang || null, diarize: false, align: false });
-        (res.segments || []).forEach(s => { if (s.text && s.text.trim()) appendRecLine(s.text.trim()); });
-      } catch (err) { recNote("识别失败：" + (err.message || err), true); }
+        (res.segments || []).forEach(s => {
+          if (s.text && s.text.trim()) appendRecLine(s.text.trim(), t0, t1);
+        });
+      } catch (err) { recNote(T("record.recFailed", "识别失败：") + (err.message || err), true); }
     }
   }
   function monitor() {
@@ -1039,7 +1199,7 @@
     if (REC.raf) cancelAnimationFrame(REC.raf);
     clearInterval(REC.timer);
     $("#rec-live-wave").hidden = true;
-    recNote("已停止。");
+    recNote(T("record.stopped", "已停止。"));
     cutSeg();    // 收尾段（onSegStop 会上传并 teardown）
   }
   function teardownRec() {
@@ -1051,16 +1211,18 @@
     const el = $(".rec-note");
     if (el) { el.textContent = msg; el.style.color = warn ? "var(--live)" : "var(--muted)"; }
   }
-  function appendRecLine(text) {
+  function appendRecLine(text, t0, t1) {
     const host = $("#rec-subs");
     if (REC.firstResult) { host.innerHTML = ""; REC.firstResult = false; }
-    // 合成时间轴：录制无精确时间戳，每段固定 5s、段间 0.1s（比照 app.py _on_rt_save）。
-    const start = REC.segs.length ? REC.segs[REC.segs.length - 1].end + 0.1 : 0;
-    const seg = { start, end: start + REC_LINE_SECS, speaker: null, text };
+    // 真实时间轴：t0/t1 为该段在录音里的真实起止秒（onSegStop 传入）
+    const start = Number.isFinite(t0) ? t0
+      : (REC.segs.length ? REC.segs[REC.segs.length - 1].end + 0.1 : 0);
+    const end = Number.isFinite(t1) ? Math.max(t1, start + 0.5) : start + 5;
+    const seg = { start, end, speaker: null, text };
     REC.segs.push(seg);
     const el = document.createElement("div");
     el.className = "sub-card";
-    el.innerHTML = `<span class="tc">${fmtClock(REC.sec)}</span>
+    el.innerHTML = `<span class="tc">${fmtClock(start)}</span>
       <div class="body"><div class="txt">${escapeHtml(text)}</div></div>`;
     host.appendChild(el);
     host.scrollTop = host.scrollHeight;
@@ -1107,7 +1269,7 @@
         types: [{ description: "字幕档", accept: { "text/plain": ["." + ext] } }],
       });
       await recAutosaveWrite();           // 立即写一次（含既有片段）
-      recNote("实时存档已启用：每段识别完成后会自动写入所选文件。");
+      recNote(T("record.autosaveOn", "实时存档已启用：每段识别完成后会自动写入所选文件。"));
     } catch (err) {                         // 使用者取消选档 → 还原开关
       REC.fileHandle = null; e.target.checked = false;
     }
@@ -1120,7 +1282,7 @@
       const text = fmt === "txt" ? buildTxt(REC.segs) : buildSrt(REC.segs);
       const w = await REC.fileHandle.createWritable();   // 截断重写（内容小，安全可靠）
       await w.write(text); await w.close();
-    } catch (e) { recNote("实时存档写入失败：" + (e.message || e), true); REC.fileHandle = null; }
+    } catch (e) { recNote(T("record.autosaveFail", "实时存档写入失败：") + (e.message || e), true); REC.fileHandle = null; }
   }
 
   // ── 启动 ────────────────────────────────────────────────

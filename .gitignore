@@ -57,9 +57,12 @@ installer/
 !build_venv.bat
 !start-gpu.bat
 !make_release_zip.bat
+!build_webview.bat
 
 # ── 开发/测试用脚本 ──────────────────────────────────
 test_*.py
+# tests/ 是正式单元测试套件（unittest），不入此忽略规则
+!tests/*.py
 benchmark.py
 check_*.py
 export_onnx.*

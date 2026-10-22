@@ -52,32 +52,71 @@ def resolve_web_dir() -> Path:
 WEB_DIR = resolve_web_dir()
 
 
-def _parse_multipart(body: bytes, boundary: bytes):
-    """解析 multipart/form-data（原 api_server._parse_multipart 的内联精简版）。
+def _parse_multipart_stream(rfile, boundary: bytes, out_dir: Path,
+                            content_length: int, chunk_size: int = 1 << 20):
+    """流式解析 multipart/form-data，文件部件直接落盘（不全量进内存）。
 
-    返回 (fields: dict[str,str], files: dict[str,(filename,bytes)])。
+    旧实现 `rfile.read(Content-Length)` 把整个请求体（几 GB 的视频）读进
+    bytes，解析时 split 再复制一份——内存峰值 ≥ 2 倍文件大小。这里逐块读
+    （受限 content_length，绝不越过请求体边界），文件内容边扫边界边写盘，
+    任何时刻内存里只有 ≤ chunk_size + 一个边界长度的数据。
+
+    返回 (fields: dict[str,str], files: dict[str,(filename, Path)])。
+    解析失败（无边界等）返回已解析到的部分，由调用端校验 file 部件。
     """
     fields: dict[str, str] = {}
     files: dict[str, tuple] = {}
-    delim = b"--" + boundary
-    for part in body.split(delim):
-        # 不能用 strip(b"\r\n")：文件内容恰好以 \r\n 结尾时会把数据一并剥掉。
-        # 分隔符残留固定是「前导 \r\n + 尾部 \r\n」，逐边只剥一次。
-        if part.startswith(b"\r\n"):
-            part = part[2:]
-        if part.endswith(b"\r\n"):
-            part = part[:-2]
-        if not part or part == b"--":
-            continue
-        header_blob, _, content = part.partition(b"\r\n\r\n")
-        if not _:
-            continue
-        name = disp = filename = None
+    marker = b"--" + boundary              # 起始边界（首个部件前）
+    delim = b"\r\n" + marker               # 部件间分隔（含内容尾部的 \r\n）
+    remaining = content_length
+
+    def _read(n: int) -> bytes:
+        nonlocal remaining
+        if remaining <= 0:
+            return b""
+        n = min(n, remaining)
+        data = rfile.read(n)
+        remaining -= len(data)
+        return data
+
+    buf = b""
+    # ── 对齐到第一个边界（preamble 一般为空，但要容忍）────────────────
+    keep = len(marker) - 1
+    while True:
+        i = buf.find(marker)
+        if i >= 0:
+            buf = buf[i + len(marker):]
+            break
+        if len(buf) > keep:
+            buf = buf[-keep:]
+        chunk = _read(chunk_size)
+        if not chunk:
+            return fields, files           # 无边界：空表单
+        buf += chunk
+
+    # ── 逐部件 ────────────────────────────────────────────────────
+    while True:
+        while len(buf) < 2:
+            chunk = _read(chunk_size)
+            if not chunk:
+                return fields, files
+            buf += chunk
+        if buf[:2] == b"--":
+            return fields, files           # 关闭边界 → 结束
+        buf = buf[2:]                      # 吃掉部件前的 \r\n
+
+        # 头部（部件头很小，等凑齐 \r\n\r\n 再解析）
+        while b"\r\n\r\n" not in buf:
+            chunk = _read(chunk_size)
+            if not chunk:
+                return fields, files
+            buf += chunk
+        header_blob, _, buf = buf.partition(b"\r\n\r\n")
+        name = filename = None
         for line in header_blob.decode("utf-8", errors="replace").split("\r\n"):
             key, _, val = line.partition(":")
             key, val = key.strip().lower(), val.strip()
             if key == "content-disposition":
-                disp = val
                 for tok in val.split(";"):
                     tok = tok.strip()
                     if tok.startswith("name="):
@@ -85,12 +124,65 @@ def _parse_multipart(body: bytes, boundary: bytes):
                     elif tok.startswith("filename="):
                         filename = tok[9:].strip('"')
         if name is None:
-            continue
+            name = ""
+
+        # 内容：直到下一个 \r\n--boundary。边界可能跨块 → 永远压住末尾
+        # len(delim)-1 字节不写出，直到确认不是边界前缀。
+        sink = None
+        acc: bytearray | None = None
         if filename is not None:
-            files[name] = (filename, content)
+            ext = "".join(c for c in Path(filename).suffix
+                          if c.isalnum() or c == ".")[:16]
+            dest = out_dir / f"part_{len(files)}_upload{ext or '.bin'}"
+            sink = open(dest, "wb")
+            files[name] = (filename, dest)
         else:
-            fields[name] = content.decode("utf-8", errors="replace")
-    return fields, files
+            acc = bytearray()
+
+        def _emit(piece: bytes):
+            if sink is not None:
+                sink.write(piece)
+            elif acc is not None:
+                acc.extend(piece)
+
+        keep = len(delim) - 1
+        terminated = False
+        search_from = 0
+        try:
+            while True:
+                i = buf.find(delim, search_from)
+                if i >= 0:
+                    # 真边界后面必须是 \r\n（下一部件）或 --（关闭）；其余是
+                    # 内容里恰好出现的「伪边界」，按内容处理、继续找下一个。
+                    nxt = buf[i + len(delim): i + len(delim) + 2]
+                    if len(nxt) < 2:
+                        chunk = _read(chunk_size)
+                        if chunk:
+                            buf += chunk
+                            continue
+                    if nxt[:2] in (b"\r\n", b"--"):
+                        _emit(buf[:i])
+                        buf = buf[i + len(delim):]
+                        terminated = True
+                        break
+                    search_from = i + 1
+                    continue
+                if len(buf) > keep:
+                    _emit(buf[:-keep])
+                    buf = buf[-keep:]
+                    search_from = 0     # 前缀已写出，偏移全部左移
+                chunk = _read(chunk_size)
+                if not chunk:
+                    _emit(buf)             # 流提前结束：剩余全按内容处理
+                    buf = b""
+                    terminated = True
+                    break
+                buf += chunk
+        finally:
+            if sink is not None:
+                sink.close()
+        if acc is not None:
+            fields[name] = bytes(acc).decode("utf-8", errors="replace")
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -216,6 +308,8 @@ class WebViewServer:
                     return self._json(server.backend.get_languages())
                 if path == "/api/health-check":
                     return self._json(server.backend.health_check())
+                if path == "/api/history":
+                    return self._json(server.backend.list_history())
                 if path == "/api/events":
                     return self._sse()
                 if path.startswith("/api/"):
@@ -263,7 +357,11 @@ class WebViewServer:
                     if path == "/api/open-output":
                         return self._json({"ok": server.backend.open_output_dir()})
                     if path == "/api/check-update":
-                        return self._json(server.backend.open_releases())
+                        return self._json(server.backend.check_update())
+                    if path == "/api/history-load":
+                        body = self._read_json_body()
+                        return self._json(server.backend.load_history(
+                            body.get("name", "")))
                     return self._err(404, "unknown api")
                 except Exception as e:
                     return self._err(500, str(e))
@@ -337,23 +435,30 @@ class WebViewServer:
                 finally:
                     server.hub.unsubscribe(q)
 
-            # ── 转录（multipart 上传）─────────────────────────
+            # ── 转录（multipart 上传，流式落盘）────────────────
             def _transcribe(self):
                 ctype = self.headers.get("Content-Type", "")
                 if "multipart/form-data" not in ctype or "boundary=" not in ctype:
                     return self._err(400, "需以 multipart/form-data 上传 file")
                 boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
-                n = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(n)
-                fields, files = _parse_multipart(body, boundary)
-                if "file" not in files or not files["file"][1]:
-                    return self._err(400, "缺少 file 或内容为空")
-                filename, data = files["file"]
+                try:
+                    n = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    return self._err(400, "缺少 Content-Length")
+                if n <= 0:
+                    return self._err(400, "请求体为空")
 
                 tmp_dir = Path(tempfile.mkdtemp(prefix="asr_web_"))
-                ext = Path(filename).suffix or ".wav"
-                in_path = tmp_dir / ("upload" + ext)
-                in_path.write_bytes(data)
+                fields, files = _parse_multipart_stream(
+                    self.rfile, boundary, tmp_dir, n)
+                if "file" not in files:
+                    return self._err(400, "缺少 file 部件")
+                filename, in_path = files["file"]
+                try:
+                    if not in_path.is_file() or in_path.stat().st_size == 0:
+                        return self._err(400, "file 内容为空")
+                except OSError:
+                    return self._err(400, "file 保存失败")
 
                 opts = {
                     "path": str(in_path),

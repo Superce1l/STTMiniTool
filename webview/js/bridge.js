@@ -132,9 +132,18 @@
       return false;
     },
     async checkUpdate() {
-      // 更新链接由后端配置（RELEASES_URL）；未配置时后端返回 ok:false 且不跳转
+      // 后端真实比对 GitHub 最新 release；ok=false 含网络失败原因
       if (MODE === "web") { try { return await apiPost("/api/check-update", {}); } catch {} }
-      return { ok: false, url: "", error: "未配置更新链接" };
+      return { ok: false, url: "", error: "未配置更新来源" };
+    },
+    // 转录历史：subtitles/ 目录最近产出（新→旧）；load 按文件名回填 segments
+    async listHistory() {
+      if (MODE === "web") { try { return await apiGet("/api/history"); } catch {} }
+      return { items: [] };
+    },
+    async loadHistory(name) {
+      if (MODE === "web") { try { return await apiPost("/api/history-load", { name }); } catch {} }
+      return { ok: false, error: "history unavailable in mock mode" };
     },
 
     async listDevices() {
@@ -227,7 +236,7 @@
   const MOCK = {
     cancelled: false,
     status: { modelReady: true, backend: "GPU · CRISPASR（Vulkan）", device: "NVIDIA GeForce RTX", version: "webview 0.1", appName: "语音识别小工具", hasAnyModel: false, selectedReady: false },
-    settings: { scale: 100, format: "srt", vocab: "off", mirror: "", ffmpeg: "", theme: "light", uiLang: "简体中文", vad: 0.5, chunkSecs: 0 },
+    settings: { scale: 100, format: "srt", vocab: "off", mirror: "", ffmpeg: "", theme: "light", uiLang: "简体中文" },
     accel: {
       ok: true, applicable: true, engine: "crispasr",
       selected: "vulkan", recommended: "vulkan",

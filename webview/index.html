@@ -77,9 +77,17 @@
           <button class="btn btn-ghost" id="btn-open-dir" disabled>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span data-i18n="file.openDir">打开输出文件夹</span>
           </button>
-          <button class="btn btn-ghost" id="btn-save-sub" disabled>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg><span data-i18n="file.saveSub">保存字幕</span>
-          </button>
+          <div class="save-wrap">
+            <button class="btn btn-ghost" id="btn-save-sub" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg><span data-i18n="file.saveSub">保存字幕</span><svg class="caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+            </button>
+            <div class="save-menu" id="save-menu" hidden>
+              <button data-fmt="srt" data-i18n="save.srt">SRT 字幕</button>
+              <button data-fmt="ass" data-i18n="save.ass">ASS 卡拉OK（逐字）</button>
+              <button data-fmt="lrc" data-i18n="save.lrc">LRC 歌词</button>
+              <button data-fmt="txt" data-i18n="save.txt">纯文本</button>
+            </div>
+          </div>
           <div class="sp"></div>
           <select class="select" id="sel-lang" data-i18n-title="file.diar"><option value="" data-i18n="common.langAuto">语言 自动</option></select>
           <label class="switch"><input type="checkbox" id="sw-diar" checked><span class="track"></span><span data-i18n="file.diar">说话者分离</span></label>
@@ -89,6 +97,12 @@
           </select>
           <label class="switch"><input type="checkbox" id="sw-align" checked><span class="track"></span><span data-i18n="file.align">时间轴对齐</span></label>
         </div>
+
+        <!-- 最近转录：subtitles/ 最近产出，点击回填查看（有历史才显示） -->
+        <div class="hint-head" id="history-head" hidden>
+          <div class="l"><span class="t" data-i18n="file.history">最近转录</span></div>
+        </div>
+        <div id="history-list" class="history-list" hidden></div>
 
         <div class="hint-head">
           <div class="l"><span class="t" data-i18n="file.hintTitle">识别提示（可选）</span><span class="d" data-i18n="file.hintDesc">粘贴歌词、关键字或背景说明，可提升识别准确度</span></div>
@@ -226,10 +240,6 @@
             <select class="select" id="set-scale"><option value="80">80%</option><option value="90">90%</option><option value="100" selected>100%</option><option value="110">110%</option><option value="125">125%</option><option value="150">150%</option></select></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.format">输出格式</div><div class="d" data-i18n="set.formatDesc">全局默认，影响单文件输出</div></div>
             <div class="seg" id="set-format"><button class="on" data-v="srt" data-i18n="set.fmtSrt">SRT 字幕</button><button data-v="txt" data-i18n="set.fmtTxt">纯文本</button></div></div>
-          <div class="row"><div class="label"><div class="t" data-i18n="set.vad">语音检测灵敏度（VAD）</div><div class="d" data-i18n="set.vadDesc">降低阈值可减少漏识（被当成空白的片段可能有声音）；提高则减少假阳性。默认 0.50</div></div>
-            <input type="range" class="slider" id="set-vad" min="0.30" max="0.80" step="0.01" value="0.50"><span class="slider-val" id="set-vad-val">0.50</span></div>
-          <div class="row"><div class="label"><div class="t" data-i18n="set.chunk">每段最长秒数（字级对齐）</div><div class="d" data-i18n="set.chunkDesc">调短可减少长段歌词／语音“段尾字级逐渐跑掉、换段才归位”的漂移。实际上限依模型自动夹紧（0.6B 30s、1.7B 10s）；CrispASR 走自身窗口，不受此设置影响。</div></div>
-            <input type="range" class="slider" id="set-chunk" min="5" max="30" step="1" value="30"><span class="slider-val" id="set-chunk-val">30s</span></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.modelDir">模型下载位置</div><div class="d" data-i18n="set.modelDirDesc">Qwen / Whisper 模型的存储目录；留空＝程序目录下的 ov_models（重启后生效）</div></div>
             <div class="with-browse"><input class="input mono" id="set-model-dir" placeholder="（留空＝默认位置）" style="width:260px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-model-dir-browse">浏览…</button></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.mirror">HuggingFace 镜像站</div><div class="d" data-i18n="set.mirrorDesc">下载模型较慢时可改用镜像</div></div>

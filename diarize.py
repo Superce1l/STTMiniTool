@@ -159,6 +159,26 @@ class DiarizationEngine:
             raw  = self._segment(audio)
             return self._embed_and_cluster(audio, raw, n_speakers=n_speakers)
 
+    def diarize_detailed(
+        self,
+        audio: np.ndarray,
+        n_speakers: int | None = None,
+    ) -> tuple[list[tuple[float, float, int]], dict[int, np.ndarray]]:
+        """diarize() 的扩展版：标签用整数，并返回各说话者的声纹中心。
+
+        供长音频切片转录做跨片说话者映射：每片独立聚类的编号互不相干，
+        唯有声纹中心可比（webview_backend._match_speaker 据此对齐编号）。
+
+        返回 (segments, centroids)：
+          segments  : [(start_sec, end_sec, label_int), ...]（label 从 1 起）
+          centroids : {label_int: L2 正规化声纹向量}；个别标签可能缺
+                      （该说话者只有过短段落、提不出可靠声纹）
+        """
+        with self._lock:
+            raw = self._segment(audio)
+            return self._embed_and_cluster(audio, raw, n_speakers=n_speakers,
+                                           return_centroids=True)
+
     # ── 分割（Segmentation Model）────────────────────────────────
 
     def _segment(
@@ -270,7 +290,8 @@ class DiarizationEngine:
         audio: np.ndarray,
         raw_segs: list[tuple[float, float, int]],
         n_speakers: int | None = None,
-    ) -> list[tuple[float, float, str]]:
+        return_centroids: bool = False,
+    ):
         """
         三阶段设计（2026-08 改版）：
           Stage 1  — 长段落切成约 EMB_WIN_SEC 秒的子窗逐窗提声纹，
@@ -297,7 +318,16 @@ class DiarizationEngine:
 
         if not units:
             # 没有任何可靠长段落：短段全数视为单一说话者输出
-            return [(t0, t1, "说话者1") for t0, t1, _ in shorts]
+            if not return_centroids:
+                return [(t0, t1, "说话者1") for t0, t1, _ in shorts]
+            segs = [(t0, t1, 1) for t0, t1, _ in shorts]
+            embs = [e for (_t0, _t1, e) in shorts if e is not None]
+            cent: dict[int, np.ndarray] = {}
+            if embs:
+                c = np.mean(embs, axis=0)
+                nrm = np.linalg.norm(c)
+                cent[1] = c / nrm if nrm > 1e-9 else c
+            return segs, cent
 
         embeddings = [u[3] for u in units]
 
@@ -344,17 +374,29 @@ class DiarizationEngine:
             if lbl not in remap:
                 remap[lbl] = len(remap) + 1
 
-        # 合并相邻的同说话者段落
-        merged: list[tuple[float, float, str]] = []
+        # 合并相邻的同说话者段落（内部先以整数标签累积，字符串化放最后）
+        merged: list[tuple[float, float, int]] = []
         for t0, t1, lbl in placed:
-            spk = f"说话者{remap[lbl]}"
-            if (merged and merged[-1][2] == spk
+            new = remap[lbl]
+            if (merged and merged[-1][2] == new
                     and t0 - merged[-1][1] < MERGE_GAP_SEC):
-                merged[-1] = (merged[-1][0], t1, spk)
+                merged[-1] = (merged[-1][0], t1, new)
             else:
-                merged.append((t0, t1, spk))
+                merged.append((t0, t1, new))
 
-        return merged
+        if not return_centroids:
+            return [(t0, t1, f"说话者{lbl}") for (t0, t1, lbl) in merged]
+
+        # 各说话者声纹中心（长段落子窗的 embedding 平均，L2 正规化）
+        centroids: dict[int, np.ndarray] = {}
+        for local_lbl, new_lbl in remap.items():
+            vecs = [e for e, l in zip(embeddings, labels) if l == local_lbl]
+            if not vecs:
+                continue
+            c = np.mean(vecs, axis=0)
+            nrm = np.linalg.norm(c)
+            centroids[new_lbl] = c / nrm if nrm > 1e-9 else c
+        return merged, centroids
 
     def _cluster_fixed_n(
         self, embeddings: list[np.ndarray], n: int

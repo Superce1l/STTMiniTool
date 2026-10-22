@@ -39,6 +39,7 @@ import numpy as np
 # 与 Qwen 路径统一的字幕分行（字级时间轴 → 字幕行，全引擎共享）
 from subtitle_lines import (_ts_chatllm_to_subtitle_lines, _srt_ts, write_transcript,
                             _ZH_CLAUSE_END, _EN_SENT_END)
+from engine_types import TranscribeResult
 
 # 中文/英文标点集合（与断句器一致）：Qwen 模式下标点只当切点、不进 items
 _PUNCT = _ZH_CLAUSE_END | _EN_SENT_END
@@ -354,7 +355,8 @@ class CrispWhisperEngine:
     # ══ 子程序命令建构（★ 由你定夺：speed/quality 取舍）═════════════════
 
     def _build_cmd(self, audio_path: Path, out_base: Path,
-                   language: str | None, word_level: bool = True) -> list[str]:
+                   language: str | None, word_level: bool = True,
+                   context: str | None = None) -> list[str]:
         """组合 crispasr.exe 命令行参数。
 
         ───────────────────────────────────────────────────────────────
@@ -413,6 +415,13 @@ class CrispWhisperEngine:
         lang_code = _LANG_MAP.get(language, None) if language else None
         if lang_code:
             cmd += ["-l", lang_code]
+
+        # 识别提示（hint）→ --prompt 初始提示（whisper.cpp 语义：偏置解码的
+        # 用词与风格）。whisper 后端原生支持；qwen3 后端实测接受该标志、不
+        # 回显提示内容（2026-10 本地 0.8.4x 验证），故两后端统一传递。
+        # 截断到 500 字：提示最多占 n_text_ctx/2，过长会挤掉正文上下文。
+        if context:
+            cmd += ["--prompt", str(context).strip()[:500]]
 
         # ── 时间轴对齐（FA）：用 qwen3 ForcedAligner GGUF 覆盖 whisper native 时间戳 ──
         # 仅文件模式（word_level）需要精确字级时间轴；实时模式只取文字故不挂。
@@ -563,7 +572,10 @@ class CrispWhisperEngine:
         说话者段落，再依时间把每行字幕指派给对应说话者。whisper/qwen 后端皆适用
         —— crispasr 单次出字级时间轴 × diar 段落，零额外子程序。需先由上层
         （webview_backend._ensure_diarization / app.py）把 diar_engine 挂上。
-        context（hint）目前仍未支持，静默忽略。
+        context（hint）仅 whisper 后端支持（--prompt 初始提示）；qwen3 后端
+        无对应机制，静默忽略。
+
+        返回 TranscribeResult（output=字幕路径；None=未产出）。
         """
         audio_path = Path(audio_path)
         if progress_cb:
@@ -592,12 +604,13 @@ class CrispWhisperEngine:
         try:
             with tempfile.TemporaryDirectory() as td:
                 out_base = Path(td) / "crisp_out"
-                cmd = self._build_cmd(audio_path, out_base, language, word_level=True)
+                cmd = self._build_cmd(audio_path, out_base, language,
+                                      word_level=True, context=context)
                 with self._lock:
                     self._run_streaming(cmd, progress_cb)
                 srt_tmp = out_base.with_suffix(".srt")
                 if not srt_tmp.exists():
-                    return None
+                    return TranscribeResult()
                 raw = srt_tmp.read_text(encoding="utf-8", errors="replace")
         finally:
             if ascii_dir is not None:
@@ -610,7 +623,7 @@ class CrispWhisperEngine:
         is_qwen = (self._backend or "").startswith("qwen3")
         ts_items, raw_text = _parse_srt_words(raw, drop_punct=is_qwen)
         if not ts_items:
-            return None
+            return TranscribeResult()
         if getattr(self, "_fa_blocked", False):
             # 没有对齐器时 `-ml 1` 对 qwen3 后端无效，每个 item 会是一整段长文字，
             # 共享分行器便无从断句（实测整段可达 60 秒）。这里把长 item 依字符
@@ -619,13 +632,13 @@ class CrispWhisperEngine:
             # 之间，后者对字幕明显有用；且段落起止仍是后端给的真实时间。
             ts_items = _interpolate_chars(ts_items)
 
-        self._last_segments_rich = None   # 本次字级结果（卡拉OK侧通道）
+        self._last_segments_rich = None   # 旧侧通道属性：仅供外部兼容读取，本引擎不再依赖
         lines5 = _ts_chatllm_to_subtitle_lines(
             ts_items, raw_text, 0.0, None,
             break_on_space=(not is_qwen), with_words=True,
         )
         if not lines5:
-            return None
+            return TranscribeResult()
         if getattr(self, "_fa_blocked", False):
             lines5 = _fix_leading_punct(lines5)
         lines = [(s, e, t, sp) for (s, e, t, sp, _w) in lines5]
@@ -635,18 +648,19 @@ class CrispWhisperEngine:
         if diarize and self.diar_engine is not None and getattr(self.diar_engine, "ready", False):
             lines = self._apply_diarization(diar_audio, lines, n_speakers, progress_cb)
 
-        # 字级结果挂上实例：speaker 取 diarize 后的 lines，words 取 lines5
-        self._last_segments_rich = [
+        # 字级结果：speaker 取 diarize 后的 lines，words 取 lines5
+        rich = [
             {"start": a[0], "end": a[1], "text": a[2], "speaker": a[3], "words": b[4]}
             for a, b in zip(lines, lines5)
         ]
+        self._last_segments_rich = rich   # 兼容残留：旧调用端仍可从此读取
 
         # 共享写出层：依全域设置（或 out_format 覆盖）产出 .srt 或 .txt。
         ref = original_path if original_path is not None else diar_audio
         out = write_transcript(ref, lines, out_format)
         if progress_cb:
             progress_cb(1, 1, "完成")
-        return out
+        return TranscribeResult(output=out, segments_rich=rich)
 
     def _apply_diarization(self, audio_path, lines, n_speakers, progress_cb=None):
         """把每行字幕依时间中点指派给 diar_engine 检测到的说话者。
@@ -683,7 +697,8 @@ class CrispWhisperEngine:
             wav = Path(td) / "seg.wav"
             sf.write(str(wav), audio, SAMPLE_RATE)
             out_base = Path(td) / "seg_out"
-            cmd = self._build_cmd(wav, out_base, language, word_level=False)
+            cmd = self._build_cmd(wav, out_base, language, word_level=False,
+                                  context=context)
             with self._lock:
                 try:
                     subprocess.run(
