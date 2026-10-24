@@ -197,6 +197,10 @@
   // 说话者显示名（chip 用，默认带空格）与导出名（与后端写出格式一致，无空格）
   function spkDisplay(n) { return speakerNames[n] || ("说话者 " + n); }
   function spkLabel(n) { return speakerNames[n] || ("说话者" + n); }
+
+  // ── 段落编辑：拆分（编辑态光标处）与合并（相邻同说话者选择模式）────────
+  let _mergeMode = false;          // 合并选择模式中（点卡片＝选择而非跳播）
+  let _mergeSel = new Set();       // 已选段索引
   // 播放高亮用的元素缓存与位置提示（长音频数千段时避免每帧 O(n) DOM 查询）
   let _subEls = [], _blockEls = [], _playingIdx = -1, _playedBars = -1, _segHint = 0;
 
@@ -224,6 +228,7 @@
     $("#result").hidden = false;
     curSegs = segments;
     speakerNames = {};                 // 新结果 → 说话者名称重置
+    setMergeMode(false);               // 新结果 → 退出合并选择模式
     _karaCache = null;                      // 新结果 → 重建卡拉OK字级（段落索引已变）
     _subEls = []; _blockEls = []; _playingIdx = -1; _playedBars = -1; _segHint = 0;
     cleanupAudio();
@@ -314,6 +319,107 @@
     chip.addEventListener("blur", onBlur);
   }
 
+  // ── 拆分：编辑态光标处一分为二 ──────────────────────────────────────
+  // contentEditable 内的光标字符偏移（以元素纯文本为坐标系）
+  function caretOffsetIn(el) {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    if (!el.contains(range.endContainer)) return null;
+    const pre = range.cloneRange();
+    pre.selectNodeContents(el);
+    pre.setEnd(range.endContainer, range.endOffset);
+    return pre.toString().length;
+  }
+
+  function splitSegment(idx, full, pos) {
+    if (pos == null) { logLine("⚠ " + T("edit.splitNeedCaret", "请先点击文本放置光标，再拆分")); return; }
+    const seg = curSegs[idx];
+    if (!seg) return;
+    const L = full.slice(0, pos).trim(), R = full.slice(pos).trim();
+    if (!L || !R) { logLine("⚠ " + T("edit.splitEmpty", "拆分点两侧都需要有文字")); return; }
+    // 切点时间：无字级 → 按字符比例；有字级 → 比例值吸附到最近的字边界
+    let t = seg.start + (seg.end - seg.start) * (pos / Math.max(1, full.length));
+    const words = seg.words || [];
+    if (words.length) {
+      let best = t, bestD = Infinity;
+      for (const w of words) for (const b of [w.start, w.end]) {
+        const d = Math.abs(b - t);
+        if (d < bestD) { bestD = d; best = b; }
+      }
+      t = Math.max(seg.start + 0.05, Math.min(seg.end - 0.05, best));
+    }
+    curSegs.splice(idx, 1,
+      { start: seg.start, end: t, speaker: seg.speaker, text: L,
+        words: words.filter(w => (w.start + w.end) / 2 < t) },
+      { start: t, end: seg.end, speaker: seg.speaker, text: R,
+        words: words.filter(w => (w.start + w.end) / 2 >= t) });
+    rerenderAfterEdit();
+    logLine("✓ " + T("edit.splitDone", "已拆分为 2 段"));
+  }
+
+  // ── 合并：相邻同说话者的多段 ────────────────────────────────────────
+  function toggleMergeSel(idx, cardEl) {
+    if (_mergeSel.has(idx)) _mergeSel.delete(idx);
+    else _mergeSel.add(idx);
+    cardEl.classList.toggle("msel", _mergeSel.has(idx));
+    updateMergeBar();
+  }
+
+  function updateMergeBar() {
+    const bar = $("#merge-bar"), n = _mergeSel.size;
+    if (!bar) return;
+    $("#merge-count").textContent = T("merge.selCount", "已选 {n} 段 · 需相邻且同一说话者", { n });
+    $("#merge-ok").disabled = n < 2;
+  }
+
+  function setMergeMode(on) {
+    _mergeMode = on;
+    _mergeSel = new Set();
+    const bar = $("#merge-bar"), btn = $("#btn-merge-mode");
+    if (btn) { btn.classList.toggle("btn-primary", on); btn.classList.toggle("btn-ghost", !on); }
+    if (bar) bar.hidden = !on;
+    if (on) updateMergeBar();
+    // 卡片重绘以清除/应用选择态，并让点卡片行为切换
+    renderSubs(curSegs);
+    _playingIdx = -1;
+  }
+
+  function mergeSelectedSegments() {
+    const idxs = [..._mergeSel].sort((a, b) => a - b);
+    if (idxs.length < 2) { logLine("⚠ " + T("merge.needTwo", "请至少选择 2 段")); return; }
+    for (let i = 1; i < idxs.length; i++) {
+      if (idxs[i] !== idxs[i - 1] + 1) { logLine("⚠ " + T("merge.notAdjacent", "所选段落必须相邻")); return; }
+    }
+    const segs = idxs.map(i => curSegs[i]);
+    const spk0 = segs[0].speaker;
+    if (segs.some(s => s.speaker !== spk0)) { logLine("⚠ " + T("merge.diffSpeaker", "所选段落说话者不一致")); return; }
+    const join = (a, b) => {
+      const lat = s => /[A-Za-z]/.test(s);
+      return a + (lat(a.slice(-1)) || lat(b[0]) ? " " : "") + b;
+    };
+    const merged = {
+      start: segs[0].start,
+      end: segs[segs.length - 1].end,
+      speaker: spk0,
+      text: segs.map(s => s.text).reduce(join),
+      words: segs.flatMap(s => s.words || []),
+    };
+    curSegs.splice(idxs[0], idxs.length, merged);
+    setMergeMode(false);
+    rerenderAfterEdit();
+    logLine("✓ " + T("merge.done", "已合并 {n} 段", { n: idxs.length }));
+  }
+
+  // 拆分/合并/改名后的统一重绘（索引变化 → 全量重建卡片与时间轴区块）
+  function rerenderAfterEdit() {
+    _karaCache = null;
+    _playingIdx = -1;
+    renderSpeakerBar();
+    renderSegStrip(curSegs, waveDur);
+    renderSubs(curSegs);
+  }
+
   // 波形面板为 sticky 钉在顶端 → 滚动容器需保留等高的顶部空间，
   // 否则 scrollIntoView 自动卷到的字幕卡会被面板遮住。
   function syncStickyOffset() {
@@ -380,15 +486,20 @@
   function subCard(s, idx) {
     const el = document.createElement("div");
     // spkc-N：依说话者标示左侧外框色（与 chip 同色系，不污染卡片背景）
-    el.className = "sub-card" + (s.speaker ? " spkc-" + (((s.speaker - 1) % 3) + 1) : "");
+    el.className = "sub-card" + (s.speaker ? " spkc-" + (((s.speaker - 1) % 3) + 1) : "")
+      + (_mergeSel.has(idx) ? " msel" : "");
     el.dataset.seg = idx;
     const spk = s.speaker ? `<span class="chip spk-${((s.speaker - 1) % 3) + 1}" title="${T("file.spkRenameHint", "点击标签可重命名")}">${escapeHtml(spkDisplay(s.speaker))}</span>` : "";
     el.innerHTML = `<span class="tc">${fmtClock(s.start)} → ${fmtClock(s.end)}</span>
       <div class="body"><div class="spk">${spk}</div><div class="txt">${escapeHtml(s.text)}</div></div>
       <button class="sub-edit" title="编辑此行" aria-label="编辑此行">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      </button>
+      <button class="sub-split" title="${T("edit.split", "在光标处拆分为两段（Ctrl+Enter）")}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.12 15.88"/><path d="M14.47 14.48 20 20"/><path d="M8.12 8.12 12 12"/></svg>
       </button>`;
     el.addEventListener("click", e => {
+      if (_mergeMode) { toggleMergeSel(idx, el); return; }   // 合并模式：点卡片＝选择
       const chipEl = e.target.closest(".chip");
       if (chipEl && s.speaker) {          // 点说话者 chip → 就地改名（不触发跳播）
         beginSpkRename(s.speaker, chipEl);
@@ -398,6 +509,15 @@
       seekTo(s.start);
     });
     el.querySelector(".sub-edit").addEventListener("click", e => { e.stopPropagation(); beginEdit(el, idx); });
+    // 拆分：仅编辑态可见。mousedown preventDefault 保住光标（不触发 txt blur
+    // 提前收起编辑），click 时读「当前文本 + 光标偏移」执行拆分。
+    const splitBtn = el.querySelector(".sub-split");
+    splitBtn.addEventListener("mousedown", e => e.preventDefault());
+    splitBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      const txt = el.querySelector(".txt");
+      splitSegment(idx, txt.textContent || "", caretOffsetIn(txt));
+    });
     return el;
   }
 
@@ -430,6 +550,11 @@
       txt.blur();
     }
     function onKey(e) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {   // Ctrl+Enter：光标处拆分
+        e.preventDefault();
+        splitSegment(idx, txt.textContent || "", caretOffsetIn(txt));
+        return;
+      }
       if (e.key === "Enter") { e.preventDefault(); finish(true); }
       else if (e.key === "Escape") { e.preventDefault(); finish(false); }
     }
@@ -618,6 +743,10 @@
   $("#btn-karaoke") && $("#btn-karaoke").addEventListener("click", () => setKaraoke(!karaokeOn));
 
   $("#btn-open-dir").addEventListener("click", () => API.openOutputDir());
+  // 合并段落：进入/退出选择模式；确认/取消在 #merge-bar
+  $("#btn-merge-mode") && $("#btn-merge-mode").addEventListener("click", () => setMergeMode(!_mergeMode));
+  $("#merge-ok") && $("#merge-ok").addEventListener("click", mergeSelectedSegments);
+  $("#merge-cancel") && $("#merge-cancel").addEventListener("click", () => setMergeMode(false));
 
   // ── 字幕存档：由内存中的 curSegs 在前端组档，下载到使用者指定位置 ──
   //   （浏览器沙箱不暴露来源档真实路径，无法写回来源文件夹，故走下载。

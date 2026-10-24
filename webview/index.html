@@ -117,7 +117,17 @@
 
         <!-- 精华区：波形 + 字幕卡 -->
         <div class="result" id="result" hidden>
-          <div class="sec-title" data-i18n="file.resultTitle">识别结果</div>
+          <div class="sec-title" style="display:flex;align-items:center;gap:10px">
+            <span data-i18n="file.resultTitle">识别结果</span>
+            <button class="btn btn-ghost btn-sm" id="btn-merge-mode" data-i18n="merge.mode" title="">合并段落</button>
+          </div>
+          <!-- 合并选择模式操作栏：点卡片选择 → 确认合并相邻同说话者的段落 -->
+          <div class="merge-bar" id="merge-bar" hidden>
+            <span id="merge-count">已选 0 段</span>
+            <div class="sp"></div>
+            <button class="btn btn-primary btn-sm" id="merge-ok" disabled data-i18n="merge.ok">合并</button>
+            <button class="btn btn-ghost btn-sm" id="merge-cancel" data-i18n="merge.cancel">取消</button>
+          </div>
           <!-- 说话者标签栏：有分离结果才显示；点 chip 就地改名（导出同步） -->
           <div class="speaker-bar" id="speaker-bar" hidden></div>
           <div class="wave-panel">
