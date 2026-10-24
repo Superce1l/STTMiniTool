@@ -383,6 +383,7 @@
     // 卡片重绘以清除/应用选择态，并让点卡片行为切换
     renderSubs(curSegs);
     _playingIdx = -1;
+    syncStickyOffset();    // 操作栏显隐改变面板高度 → 滚动吸附偏移同步更新
   }
 
   function mergeSelectedSegments() {

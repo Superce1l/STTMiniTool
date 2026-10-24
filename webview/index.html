@@ -117,17 +117,7 @@
 
         <!-- 精华区：波形 + 字幕卡 -->
         <div class="result" id="result" hidden>
-          <div class="sec-title" style="display:flex;align-items:center;gap:10px">
-            <span data-i18n="file.resultTitle">识别结果</span>
-            <button class="btn btn-ghost btn-sm" id="btn-merge-mode" data-i18n="merge.mode" title="">合并段落</button>
-          </div>
-          <!-- 合并选择模式操作栏：点卡片选择 → 确认合并相邻同说话者的段落 -->
-          <div class="merge-bar" id="merge-bar" hidden>
-            <span id="merge-count">已选 0 段</span>
-            <div class="sp"></div>
-            <button class="btn btn-primary btn-sm" id="merge-ok" disabled data-i18n="merge.ok">合并</button>
-            <button class="btn btn-ghost btn-sm" id="merge-cancel" data-i18n="merge.cancel">取消</button>
-          </div>
+          <div class="sec-title" data-i18n="file.resultTitle">识别结果</div>
           <!-- 说话者标签栏：有分离结果才显示；点 chip 就地改名（导出同步） -->
           <div class="speaker-bar" id="speaker-bar" hidden></div>
           <div class="wave-panel">
@@ -145,6 +135,16 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>
               </button>
               <span class="play-time"><span id="wave-cur">00:00</span> · 点波形、字幕或下方区块可跳播</span>
+              <div class="sp"></div>
+              <!-- 合并段落（含操作栏）挂在波形面板内 → 随面板一起钉顶 -->
+              <button class="btn btn-ghost btn-sm" id="btn-merge-mode" data-i18n="merge.mode">合并段落</button>
+            </div>
+            <!-- 合并选择模式操作栏：点卡片选择 → 确认合并相邻同说话者的段落 -->
+            <div class="merge-bar" id="merge-bar" hidden>
+              <span id="merge-count">已选 0 段</span>
+              <div class="sp"></div>
+              <button class="btn btn-primary btn-sm" id="merge-ok" disabled data-i18n="merge.ok">合并</button>
+              <button class="btn btn-ghost btn-sm" id="merge-cancel" data-i18n="merge.cancel">取消</button>
             </div>
           </div>
           <!-- 卡拉OK舞台：逐字高亮放大跳动（由字级 words 驱动）。默认隐藏，按麦克风钮切换。 -->
