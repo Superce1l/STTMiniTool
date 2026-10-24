@@ -498,8 +498,9 @@
     const spk = s.speaker ? `<span class="chip spk-${((s.speaker - 1) % 3) + 1}" title="${T("file.spkRenameHint", "点击标签可重命名")}">${escapeHtml(spkDisplay(s.speaker))}</span>` : "";
     el.innerHTML = `<span class="tc">${fmtClock(s.start)} → ${fmtClock(s.end)}</span>
       <div class="body"><div class="spk">${spk}</div><div class="txt">${escapeHtml(s.text)}</div></div>
-      <button class="sub-edit" title="编辑此行" aria-label="编辑此行">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      <button class="sub-edit" title="${T("edit.line", "编辑此行")}" aria-label="编辑此行">
+        <svg class="ico-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
       </button>
       <button class="sub-split" title="${T("edit.split", "拆分此行：进入编辑后，在光标处点亮的 √ 切开（Ctrl+Enter）")}">
         <svg class="ico-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.12 15.88"/><path d="M14.47 14.48 20 20"/><path d="M8.12 8.12 12 12"/></svg>
@@ -507,6 +508,7 @@
       </button>`;
     el.addEventListener("click", e => {
       if (_mergeMode) { toggleMergeSel(idx, el); return; }   // 合并模式：点卡片＝选择
+      if (el.classList.contains("editing")) return;          // 任一编辑模式中：卡片不响应跳播
       const chipEl = e.target.closest(".chip");
       if (chipEl && s.speaker) {          // 点说话者 chip → 就地改名（不触发跳播）
         beginSpkRename(s.speaker, chipEl);
@@ -515,58 +517,49 @@
       if (e.target.closest(".sub-edit") || el.classList.contains("editing")) return;
       seekTo(s.start);
     });
-    el.querySelector(".sub-edit").addEventListener("click", e => { e.stopPropagation(); beginEdit(el, idx); });
-    // 拆分：hover 即现形。未编辑时点它＝进编辑并引导；编辑中读「当前文本 +
-    // 光标偏移（选中一段文字时取选区起点）」执行。mousedown preventDefault
-    // 保住光标（不触发 txt blur 提前收起编辑）。拆分点无效 → 文本框闪烁提示。
+    // 笔＝文字编辑模式（进入后按钮变 √ 保存）；剪刀＝拆分模式（进入后按钮变
+    // √ 按光标切开，文字锁定）。两按钮 mousedown preventDefault 保住焦点，
+    // 不让 blur 提前收起模式。
+    const editBtn = el.querySelector(".sub-edit");
+    editBtn.addEventListener("mousedown", e => e.preventDefault());
+    editBtn.addEventListener("click", e => { e.stopPropagation(); beginEdit(el, idx); });
     const splitBtn = el.querySelector(".sub-split");
     splitBtn.addEventListener("mousedown", e => e.preventDefault());
     splitBtn.addEventListener("click", e => {
       e.stopPropagation();
-      const txt = el.querySelector(".txt");
-      if (!el.classList.contains("editing")) {
-        beginEdit(el, idx);
-        logLine("ℹ " + T("edit.splitHow", "点击文本中要拆分的位置，再点剪刀或按 Ctrl+Enter"));
-        return;
-      }
-      if (!splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) {
-        txt.classList.remove("split-hint");
-        void txt.offsetWidth;               // 重启动画
-        txt.classList.add("split-hint");
-      }
+      if (el.classList.contains("editing")) return;   // 拆分模式中的点击由该模式自理
+      beginSplitEdit(el, idx);
+      logLine("ℹ " + T("edit.splitHow", "点击文本中要拆分的位置，再点亮的 √ 或按 Ctrl+Enter"));
     });
     return el;
   }
 
-  // 行内校对：笔 → 该行可编辑，Enter 存储 / Esc 取消；同步回 curSegs 与波形对齐区块。
-  // curSegs 为下载字幕的数据来源，故编辑后存档即反映校对结果。
-  // √（拆分）按钮随光标状态点亮：点击文字放置光标（或选中一段）且切点两侧
-  // 都有文字时亮起可点；全选态/未放置时置灰。
+  // 行内编辑两种互斥模式（同一时刻一张卡只能处其一）：
+  //   文字编辑（笔进入）：笔按钮变 √（保存，等同 Enter）；只能改字，无拆分入口。
+  //   拆分模式（剪刀进入）：剪刀按钮变 √（光标就绪点亮，点击切开）；文字锁定
+  //   不可改（contentEditable 仅为放光标，beforeinput/paste/cut/drop 全拦截）。
+  // 两模式的 Esc 退出、blur 收尾、Enter（编辑＝保存）行为一致。
   function beginEdit(card, idx) {
     if (card.classList.contains("editing")) return;
-    card.classList.add("editing");
+    card.classList.add("editing", "mode-edit");
     const txt = card.querySelector(".txt");
-    const splitBtn = card.querySelector(".sub-split");
+    const editBtn = card.querySelector(".sub-edit");
     const orig = curSegs[idx].text;
     txt.contentEditable = "true"; txt.spellcheck = false;
     txt.focus();
     const range = document.createRange(); range.selectNodeContents(txt);
     const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
-    const updateSplitReady = () => {
-      const pos = caretOffsetIn(txt, "start");
-      const full = txt.textContent || "";
-      const ok = pos != null && !!full.slice(0, pos).trim() && !!full.slice(pos).trim();
-      splitBtn.classList.toggle("ready", ok);
-    };
-    document.addEventListener("selectionchange", updateSplitReady);
-    updateSplitReady();               // 初始全选态 → 切点在首 → 置灰
+    editBtn.title = T("edit.save", "保存（Enter）");
+    let done = false;
     function finish(save) {
-      document.removeEventListener("selectionchange", updateSplitReady);
-      splitBtn.classList.remove("ready");
+      if (done) return;
+      done = true;
       txt.removeEventListener("keydown", onKey);
       txt.removeEventListener("blur", onBlur);
+      editBtn.removeEventListener("click", onSaveClick);
       txt.contentEditable = "false";
-      card.classList.remove("editing");
+      card.classList.remove("editing", "mode-edit");
+      editBtn.title = T("edit.line", "编辑此行");
       const val = (txt.textContent || "").trim();
       if (save && val && val !== orig) {
         curSegs[idx].text = val; txt.textContent = val;
@@ -580,21 +573,84 @@
       txt.blur();
     }
     function onKey(e) {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {   // Ctrl+Enter：光标处拆分
-        e.preventDefault();
-        if (!splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) {
-          txt.classList.remove("split-hint");
-          void txt.offsetWidth;
-          txt.classList.add("split-hint");
-        }
-        return;
-      }
       if (e.key === "Enter") { e.preventDefault(); finish(true); }
       else if (e.key === "Escape") { e.preventDefault(); finish(false); }
     }
     function onBlur() { finish(true); }
+    function onSaveClick(e) { e.stopPropagation(); e.preventDefault(); finish(true); }
     txt.addEventListener("keydown", onKey);
     txt.addEventListener("blur", onBlur);
+    editBtn.addEventListener("click", onSaveClick);
+  }
+
+  // 拆分模式：只能放光标/选区，文字不可编辑；√ 随光标就绪点亮，点击切开。
+  function beginSplitEdit(card, idx) {
+    if (card.classList.contains("editing")) return;
+    card.classList.add("editing", "mode-split");
+    const txt = card.querySelector(".txt");
+    const splitBtn = card.querySelector(".sub-split");
+    // 光标需要 contentEditable，但拆分模式禁止改字：先拦输入事件（键盘/
+    // 粘贴/剪切/拖放），再以 MutationObserver 兜底——IME 组合输入等路径
+    // 可能绕过 beforeinput，任何改动一律强制还原为原文。
+    const origText = txt.textContent;
+    const blockInput = e => { e.preventDefault(); };
+    const enforceLock = () => {
+      if (txt.textContent !== origText) {
+        txt.textContent = origText;
+        updateReady();
+      }
+    };
+    const mo = new MutationObserver(enforceLock);
+    txt.contentEditable = "true"; txt.spellcheck = false;
+    txt.addEventListener("beforeinput", blockInput);
+    txt.addEventListener("paste", blockInput);
+    txt.addEventListener("cut", blockInput);
+    txt.addEventListener("drop", blockInput);
+    mo.observe(txt, { characterData: true, childList: true, subtree: true });
+    txt.focus();
+    const range = document.createRange(); range.selectNodeContents(txt);
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+    const updateReady = () => {
+      const pos = caretOffsetIn(txt, "start");
+      const full = txt.textContent || "";
+      splitBtn.classList.toggle("ready",
+        pos != null && !!full.slice(0, pos).trim() && !!full.slice(pos).trim());
+    };
+    document.addEventListener("selectionchange", updateReady);
+    updateReady();               // 初始全选态 → 切点在首 → 置灰
+    let done = false;
+    function finish() {
+      if (done) return;
+      done = true;
+      mo.disconnect();
+      document.removeEventListener("selectionchange", updateReady);
+      txt.removeEventListener("beforeinput", blockInput);
+      txt.removeEventListener("paste", blockInput);
+      txt.removeEventListener("cut", blockInput);
+      txt.removeEventListener("drop", blockInput);
+      txt.removeEventListener("keydown", onKey);
+      txt.removeEventListener("blur", onBlur);
+      splitBtn.removeEventListener("click", onSplitClick);
+      splitBtn.classList.remove("ready");
+      txt.contentEditable = "false";
+      card.classList.remove("editing", "mode-split");
+      txt.blur();
+    }
+    function doSplit() {
+      if (splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) return;
+      txt.classList.remove("split-hint");   // 失败 → 闪红提示，留在拆分模式
+      void txt.offsetWidth;
+      txt.classList.add("split-hint");
+    }
+    function onKey(e) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSplit(); }
+      else if (e.key === "Escape") { e.preventDefault(); finish(); }
+    }
+    function onBlur() { finish(); }
+    function onSplitClick(e) { e.stopPropagation(); doSplit(); }
+    txt.addEventListener("keydown", onKey);
+    txt.addEventListener("blur", onBlur);
+    splitBtn.addEventListener("click", onSplitClick);
   }
 
   // ── 播放接线 ────────────────────────────────────────────

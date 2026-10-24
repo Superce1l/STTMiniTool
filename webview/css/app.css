@@ -478,6 +478,14 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .sub-split .ico-check { display: none; }
 .sub-card.editing .sub-split .ico-scissors { display: none; }
 .sub-card.editing .sub-split .ico-check { display: block; }
+/* 两种模式互斥：文字编辑模式（笔）→ 笔变 √、藏剪刀；拆分模式 → 藏笔 */
+.sub-edit .ico-check { display: none; }
+.sub-card.mode-edit .sub-edit .ico-pencil { display: none; }
+.sub-card.mode-edit .sub-edit .ico-check { display: block; }
+.sub-card.mode-edit .sub-split { display: none; }
+.sub-card.mode-split .sub-edit { display: none; }
+/* 拆分模式文本锁定：以虚线框区分「只放光标、不可改字」的编辑框 */
+.sub-card.mode-split .txt[contenteditable="true"] { box-shadow: 0 0 0 2px var(--warn-line); }
 /* 光标就绪：√ 点亮（绿色可切）；全选态/未放置光标 → 保持灰色不可切观感 */
 .sub-split.ready { color: var(--ok); }
 .sub-split.ready:hover { background: var(--ok-soft); border-color: var(--ok-soft); color: var(--ok); }
