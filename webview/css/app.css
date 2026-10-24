@@ -464,16 +464,22 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
   padding: 2px 7px; margin: -2px -7px; box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
-/* ── 拆分按钮：仅编辑态可见（与 .sub-edit 同款图标按钮）──────────── */
+/* ── 拆分按钮：与笔同款（hover/编辑态现形；未编辑时点它＝进编辑并引导）── */
 .sub-split {
   flex: 0 0 auto; width: 26px; height: 26px; margin-top: -1px;
   border-radius: 7px; border: 1px solid transparent; background: transparent;
-  color: var(--faint); cursor: pointer; display: none; place-items: center;
-  transition: opacity .12s, background .12s, color .12s, border-color .12s;
+  color: var(--faint); cursor: pointer; display: grid; place-items: center;
+  opacity: 0; transition: opacity .12s, background .12s, color .12s, border-color .12s;
 }
-.sub-card.editing .sub-split { display: grid; }
+.sub-card:hover .sub-split, .sub-card.editing .sub-split { opacity: 1; }
 .sub-split:hover { background: var(--accent-tint); color: var(--accent-strong); border-color: var(--accent-soft); }
 .sub-split svg { width: 14px; height: 14px; }
+/* 拆分点无效（光标在首尾/未放置）时的短暂红框提示 */
+@keyframes split-hint-flash {
+  0%, 100% { box-shadow: 0 0 0 2px var(--accent-soft); }
+  25%, 65% { box-shadow: 0 0 0 2px var(--live); }
+}
+.sub-card .txt.split-hint { animation: split-hint-flash .9s ease; }
 
 /* ── 合并选择模式（挂在波形面板内，随面板钉顶）────────────────────── */
 .merge-bar {

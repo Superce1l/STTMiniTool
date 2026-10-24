@@ -59,6 +59,7 @@
     "file.spkRenamed": ["说话者已重命名：{old} → {new}（各段落与导出同步）", "Speaker renamed: {old} → {new} (applied to all segments & exports)"],
 
     "edit.split": ["在光标处拆分为两段（Ctrl+Enter）", "Split at caret (Ctrl+Enter)"],
+    "edit.splitHow": ["点击文本中要拆分的位置，再点剪刀或按 Ctrl+Enter", "Click where to split in the text, then the scissors (or Ctrl+Enter)"],
     "edit.splitNeedCaret": ["请先点击文本放置光标，再拆分", "Click in the text to place the caret first"],
     "edit.splitEmpty": ["拆分点两侧都需要有文字", "Both sides of the split need text"],
     "edit.splitDone": ["已拆分为 2 段", "Split into 2 segments"],

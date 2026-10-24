@@ -320,24 +320,28 @@
   }
 
   // ── 拆分：编辑态光标处一分为二 ──────────────────────────────────────
-  // contentEditable 内的光标字符偏移（以元素纯文本为坐标系）
-  function caretOffsetIn(el) {
+  // contentEditable 内的光标字符偏移（以元素纯文本为坐标系）。
+  // anchor="start" 且选中了一段文字时取选区起点（「高亮到哪就切到哪」）。
+  function caretOffsetIn(el, anchor) {
     const sel = window.getSelection();
     if (!sel || !sel.rangeCount) return null;
     const range = sel.getRangeAt(0);
     if (!el.contains(range.endContainer)) return null;
+    const node = anchor === "start" && !range.collapsed ? range.startContainer : range.endContainer;
+    const off  = anchor === "start" && !range.collapsed ? range.startOffset : range.endOffset;
     const pre = range.cloneRange();
     pre.selectNodeContents(el);
-    pre.setEnd(range.endContainer, range.endOffset);
+    pre.setEnd(node, off);
     return pre.toString().length;
   }
 
+  // 拆分一段；成功返回 true，拆分点无效（null/首/尾）提示后返回 false
   function splitSegment(idx, full, pos) {
-    if (pos == null) { logLine("⚠ " + T("edit.splitNeedCaret", "请先点击文本放置光标，再拆分")); return; }
+    if (pos == null) { logLine("⚠ " + T("edit.splitNeedCaret", "请先点击文本放置光标，再拆分")); return false; }
     const seg = curSegs[idx];
-    if (!seg) return;
+    if (!seg) return false;
     const L = full.slice(0, pos).trim(), R = full.slice(pos).trim();
-    if (!L || !R) { logLine("⚠ " + T("edit.splitEmpty", "拆分点两侧都需要有文字")); return; }
+    if (!L || !R) { logLine("⚠ " + T("edit.splitEmpty", "拆分点两侧都需要有文字")); return false; }
     // 切点时间：无字级 → 按字符比例；有字级 → 比例值吸附到最近的字边界
     let t = seg.start + (seg.end - seg.start) * (pos / Math.max(1, full.length));
     const words = seg.words || [];
@@ -356,6 +360,7 @@
         words: words.filter(w => (w.start + w.end) / 2 >= t) });
     rerenderAfterEdit();
     logLine("✓ " + T("edit.splitDone", "已拆分为 2 段"));
+    return true;
   }
 
   // ── 合并：相邻同说话者的多段 ────────────────────────────────────────
@@ -510,14 +515,24 @@
       seekTo(s.start);
     });
     el.querySelector(".sub-edit").addEventListener("click", e => { e.stopPropagation(); beginEdit(el, idx); });
-    // 拆分：仅编辑态可见。mousedown preventDefault 保住光标（不触发 txt blur
-    // 提前收起编辑），click 时读「当前文本 + 光标偏移」执行拆分。
+    // 拆分：hover 即现形。未编辑时点它＝进编辑并引导；编辑中读「当前文本 +
+    // 光标偏移（选中一段文字时取选区起点）」执行。mousedown preventDefault
+    // 保住光标（不触发 txt blur 提前收起编辑）。拆分点无效 → 文本框闪烁提示。
     const splitBtn = el.querySelector(".sub-split");
     splitBtn.addEventListener("mousedown", e => e.preventDefault());
     splitBtn.addEventListener("click", e => {
       e.stopPropagation();
       const txt = el.querySelector(".txt");
-      splitSegment(idx, txt.textContent || "", caretOffsetIn(txt));
+      if (!el.classList.contains("editing")) {
+        beginEdit(el, idx);
+        logLine("ℹ " + T("edit.splitHow", "点击文本中要拆分的位置，再点剪刀或按 Ctrl+Enter"));
+        return;
+      }
+      if (!splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) {
+        txt.classList.remove("split-hint");
+        void txt.offsetWidth;               // 重启动画
+        txt.classList.add("split-hint");
+      }
     });
     return el;
   }
@@ -553,7 +568,11 @@
     function onKey(e) {
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {   // Ctrl+Enter：光标处拆分
         e.preventDefault();
-        splitSegment(idx, txt.textContent || "", caretOffsetIn(txt));
+        if (!splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) {
+          txt.classList.remove("split-hint");
+          void txt.offsetWidth;
+          txt.classList.add("split-hint");
+        }
         return;
       }
       if (e.key === "Enter") { e.preventDefault(); finish(true); }
