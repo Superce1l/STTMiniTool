@@ -474,6 +474,9 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .sub-card:hover .sub-split, .sub-card.editing .sub-split { opacity: 1; }
 .sub-split:hover { background: var(--accent-tint); color: var(--accent-strong); border-color: var(--accent-soft); }
 .sub-split svg { width: 14px; height: 14px; }
+/* 光标就绪：√ 点亮（绿色可切）；全选态/未放置光标 → 保持灰色不可切观感 */
+.sub-split.ready { color: var(--ok); }
+.sub-split.ready:hover { background: var(--ok-soft); border-color: var(--ok-soft); color: var(--ok); }
 /* 拆分点无效（光标在首尾/未放置）时的短暂红框提示 */
 @keyframes split-hint-flash {
   0%, 100% { box-shadow: 0 0 0 2px var(--accent-soft); }
