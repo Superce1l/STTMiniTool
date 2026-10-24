@@ -501,8 +501,9 @@
       <button class="sub-edit" title="编辑此行" aria-label="编辑此行">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
       </button>
-      <button class="sub-split" title="${T("edit.split", "在光标处拆分（先点击文字放置光标，√ 点亮后可切；Ctrl+Enter）")}">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+      <button class="sub-split" title="${T("edit.split", "拆分此行：进入编辑后，在光标处点亮的 √ 切开（Ctrl+Enter）")}">
+        <svg class="ico-scissors" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4 8.12 15.88"/><path d="M14.47 14.48 20 20"/><path d="M8.12 8.12 12 12"/></svg>
+        <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
       </button>`;
     el.addEventListener("click", e => {
       if (_mergeMode) { toggleMergeSel(idx, el); return; }   // 合并模式：点卡片＝选择

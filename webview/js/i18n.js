@@ -58,7 +58,7 @@
     "file.spkRenameHint": ["点击标签可重命名", "Click a label to rename"],
     "file.spkRenamed": ["说话者已重命名：{old} → {new}（各段落与导出同步）", "Speaker renamed: {old} → {new} (applied to all segments & exports)"],
 
-    "edit.split": ["在光标处拆分（先点击文字放置光标，√ 点亮后可切；Ctrl+Enter）", "Split at caret (place the caret first — ✓ lights up; Ctrl+Enter)"],
+    "edit.split": ["拆分此行：进入编辑后，在光标处点亮的 √ 切开（Ctrl+Enter）", "Split this line: enter edit, then click the lit ✓ at the caret (Ctrl+Enter)"],
     "edit.splitHow": ["点击文本中要拆分的位置，再点亮的 √ 或按 Ctrl+Enter", "Click where to split in the text, then the lit ✓ (or Ctrl+Enter)"],
     "edit.splitNeedCaret": ["请先点击文本放置光标，再拆分", "Click in the text to place the caret first"],
     "edit.splitEmpty": ["拆分点两侧都需要有文字", "Both sides of the split need text"],
