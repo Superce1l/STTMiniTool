@@ -190,6 +190,13 @@
   //   随播放高亮，皆可点击 seek —— 肉眼即可看字幕与音讯的对齐准确度。
   const WAVE_N = 200;
   let audioEl = null, audioUrl = null, waveDur = 0, curSegs = [];
+  // 说话者自定义名称：{编号: 名字}。新一轮转录/载入历史时重置（不同音频不同人）；
+  // 未命中的编号回落默认「说话者N」。界面与导出（SRT/TXT/ASS/LRC）同步使用。
+  let speakerNames = {};
+
+  // 说话者显示名（chip 用，默认带空格）与导出名（与后端写出格式一致，无空格）
+  function spkDisplay(n) { return speakerNames[n] || ("说话者 " + n); }
+  function spkLabel(n) { return speakerNames[n] || ("说话者" + n); }
   // 播放高亮用的元素缓存与位置提示（长音频数千段时避免每帧 O(n) DOM 查询）
   let _subEls = [], _blockEls = [], _playingIdx = -1, _playedBars = -1, _segHint = 0;
 
@@ -216,6 +223,7 @@
   async function renderResult(segments) {
     $("#result").hidden = false;
     curSegs = segments;
+    speakerNames = {};                 // 新结果 → 说话者名称重置
     _karaCache = null;                      // 新结果 → 重建卡拉OK字级（段落索引已变）
     _subEls = []; _blockEls = []; _playingIdx = -1; _playedBars = -1; _segHint = 0;
     cleanupAudio();
@@ -242,8 +250,68 @@
     drawWave($("#wave"), peaks, segments, waveDur);
     renderSegStrip(segments, waveDur);
     renderSubs(segments);
+    renderSpeakerBar();
     wireAudio();
     syncStickyOffset();
+  }
+
+  // ── 说话者标签：结果区标签栏 + 点击改名（标签栏 chip 与字幕卡 chip 皆可）──
+  function renderSpeakerBar() {
+    const bar = $("#speaker-bar");
+    if (!bar) return;
+    const nums = [];
+    curSegs.forEach(s => { if (s.speaker && !nums.includes(s.speaker)) nums.push(s.speaker); });
+    if (!nums.length) { bar.hidden = true; bar.innerHTML = ""; return; }
+    bar.hidden = false;
+    const hint = T("file.spkRenameHint", "点击标签可重命名");
+    bar.innerHTML = `<span class="lbl">${T("file.speakers", "说话者")}</span>`
+      + `<span class="lbl-hint">${hint}</span>`;
+    nums.sort((a, b) => a - b).forEach(n => {
+      const chip = document.createElement("span");
+      chip.className = "chip spk-" + (((n - 1) % 3) + 1);
+      chip.textContent = spkDisplay(n);
+      chip.title = hint;
+      chip.addEventListener("click", e => { e.stopPropagation(); beginSpkRename(n, chip); });
+      bar.appendChild(chip);
+    });
+  }
+
+  // 就地改名（contentEditable，与字幕行编辑同一交互语言：Enter 存 / Esc 取消）。
+  // 存入 speakerNames 后重渲染全部说话者视图——字幕卡、时间轴区块、标签栏。
+  function beginSpkRename(n, chip) {
+    if (chip.classList.contains("editing")) return;
+    chip.classList.add("editing");
+    const orig = spkDisplay(n);
+    chip.contentEditable = "true"; chip.spellcheck = false;
+    chip.focus();
+    const range = document.createRange(); range.selectNodeContents(chip);
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+    function finish(save) {
+      chip.removeEventListener("keydown", onKey);
+      chip.removeEventListener("blur", onBlur);
+      chip.contentEditable = "false";
+      chip.classList.remove("editing");
+      const val = (chip.textContent || "").trim();
+      if (save && val && val !== orig) {
+        speakerNames[n] = val;
+        _playingIdx = -1;                     // 重渲染后高亮状态重建
+        renderSpeakerBar();
+        renderSegStrip(curSegs, waveDur);
+        renderSubs(curSegs);
+        logLine("✓ " + T("file.spkRenamed", "说话者已重命名：{old} → {new}（各段落与导出同步）",
+                         { old: orig, new: val }));
+      } else {
+        chip.textContent = orig;               // 取消／清空 → 还原
+      }
+      chip.blur();
+    }
+    function onKey(e) {
+      if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); finish(true); }
+      else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); }
+    }
+    function onBlur() { finish(true); }
+    chip.addEventListener("keydown", onKey);
+    chip.addEventListener("blur", onBlur);
   }
 
   // 波形面板为 sticky 钉在顶端 → 滚动容器需保留等高的顶部空间，
@@ -295,7 +363,8 @@
       const blk = document.createElement("div");
       blk.className = "seg-block" + (s.speaker ? " spk-" + (((s.speaker - 1) % 3) + 1) : "");
       blk.style.left = left.toFixed(2) + "%"; blk.style.width = w.toFixed(2) + "%";
-      blk.dataset.seg = i; blk.title = s.text;
+      blk.dataset.seg = i;
+      blk.title = (s.speaker ? spkDisplay(s.speaker) + "：" : "") + s.text;
       blk.textContent = s.text;
       blk.addEventListener("click", () => seekTo(s.start));
       host.appendChild(blk);
@@ -313,13 +382,18 @@
     // spkc-N：依说话者标示左侧外框色（与 chip 同色系，不污染卡片背景）
     el.className = "sub-card" + (s.speaker ? " spkc-" + (((s.speaker - 1) % 3) + 1) : "");
     el.dataset.seg = idx;
-    const spk = s.speaker ? `<span class="chip spk-${((s.speaker - 1) % 3) + 1}">说话者 ${s.speaker}</span>` : "";
+    const spk = s.speaker ? `<span class="chip spk-${((s.speaker - 1) % 3) + 1}" title="${T("file.spkRenameHint", "点击标签可重命名")}">${escapeHtml(spkDisplay(s.speaker))}</span>` : "";
     el.innerHTML = `<span class="tc">${fmtClock(s.start)} → ${fmtClock(s.end)}</span>
       <div class="body"><div class="spk">${spk}</div><div class="txt">${escapeHtml(s.text)}</div></div>
       <button class="sub-edit" title="编辑此行" aria-label="编辑此行">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
       </button>`;
     el.addEventListener("click", e => {
+      const chipEl = e.target.closest(".chip");
+      if (chipEl && s.speaker) {          // 点说话者 chip → 就地改名（不触发跳播）
+        beginSpkRename(s.speaker, chipEl);
+        return;
+      }
       if (e.target.closest(".sub-edit") || el.classList.contains("editing")) return;
       seekTo(s.start);
     });
@@ -557,13 +631,13 @@
   }
   function buildSrt(segs) {
     return segs.map((s, i) => {
-      const spk = s.speaker ? `说话者${s.speaker}：` : "";
+      const spk = s.speaker ? `${spkLabel(s.speaker)}：` : "";
       return `${i + 1}\n${srtTs(s.start)} --> ${srtTs(s.end)}\n${spk}${s.text}\n`;
     }).join("\n");
   }
   function buildTxt(segs) {
     return segs.some(s => s.speaker)
-      ? segs.map(s => (s.speaker ? `说话者${s.speaker}：` : "") + s.text).join("\n")
+      ? segs.map(s => (s.speaker ? `${spkLabel(s.speaker)}：` : "") + s.text).join("\n")
       : segs.map(s => s.text).join("");
   }
   // LRC 歌词：行首时间戳 [mm:ss.xx]，带说话者前缀
@@ -574,7 +648,7 @@
   }
   function buildLrc(segs) {
     return segs.map(s =>
-      `[${lrcTs(s.start)}]${s.speaker ? `说话者${s.speaker}：` : ""}${s.text}`
+      `[${lrcTs(s.start)}]${s.speaker ? `${spkLabel(s.speaker)}：` : ""}${s.text}`
     ).join("\n") + "\n";
   }
   // ASS 卡拉OK：有字级 words 时输出 \k 逐字标签（厘秒拍点，播放器即卡拉OK高亮），
@@ -595,7 +669,7 @@
       "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ];
     const lines = segs.map(s => {
-      const spk = s.speaker ? `说话者${s.speaker}：` : "";
+      const spk = s.speaker ? `${spkLabel(s.speaker)}：` : "";
       const words = (s.words && s.words.length) ? s.words : null;
       let text;
       if (words) {

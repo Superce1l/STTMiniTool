@@ -425,6 +425,21 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .spk-1 { background: var(--accent-soft); color: var(--accent-strong); }
 .spk-2 { background: #EDEAF6; color: #5B4B9A; }
 .spk-3 { background: #F6EFE3; color: #8A6312; }
+
+/* ── 说话者标签栏（识别结果顶部；点击 chip 改名）──────────────────── */
+.speaker-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: -4px 0 10px; }
+.speaker-bar[hidden] { display: none; }
+.speaker-bar .lbl { font-size: 12px; color: var(--muted); font-weight: 600; }
+.speaker-bar .lbl-hint { font-size: 11px; color: var(--faint); }
+/* chip 可改名：文本光标 + hover 虚线框暗示（标签栏与字幕卡内一致） */
+.speaker-bar .chip[class*="spk-"], .sub-card .chip[class*="spk-"] { cursor: text; }
+.speaker-bar .chip[class*="spk-"]:hover, .sub-card .chip[class*="spk-"]:hover {
+  outline: 1.5px dashed currentColor; outline-offset: 1px;
+}
+.chip[class*="spk-"].editing {
+  outline: 1.5px dashed var(--accent); outline-offset: 1px;
+  background: var(--accent-tint); min-width: 60px;
+}
 .sub-card .txt { font-size: 13.5px; color: var(--ink); line-height: 1.6; }
 
 /* 说话者外框色：左侧边框依说话者著色（与 chip 同色系），快速识别发言者 */

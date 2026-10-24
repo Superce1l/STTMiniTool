@@ -54,6 +54,9 @@
     "file.hintPh": ["例如：本段为产品营销 Podcast，会出现“转化率”“漏斗”等营销术语…", "e.g. This is a marketing podcast with terms like 'conversion rate', 'funnel'…"],
     "file.loadTxt": ["读入 TXT…", "Load TXT…"],
     "file.resultTitle": ["识别结果", "Result"],
+    "file.speakers": ["说话者", "Speakers"],
+    "file.spkRenameHint": ["点击标签可重命名", "Click a label to rename"],
+    "file.spkRenamed": ["说话者已重命名：{old} → {new}（各段落与导出同步）", "Speaker renamed: {old} → {new} (applied to all segments & exports)"],
     "common.langAuto": ["语言 自动", "Lang Auto"],
     "common.spkAuto": ["人数 自动", "Count Auto"],
 
