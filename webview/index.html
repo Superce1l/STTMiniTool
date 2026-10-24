@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/app.css?v=4">
+<link rel="stylesheet" href="css/app.css?v=5">
 </head>
 <body>
 <div class="app">
@@ -134,7 +134,7 @@
               <button class="play-btn play-btn-ghost" id="btn-karaoke" aria-label="卡拉OK模式" title="卡拉OK模式（逐字高亮）">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>
               </button>
-              <span class="play-time"><span id="wave-cur">00:00</span> · 点波形、字幕或下方区块可跳播</span>
+              <span class="play-time"><span id="wave-cur">00:00</span> · <span data-i18n="file.waveHint">点字幕选中片段，播放键循环播放；点波形移动播放头</span></span>
               <div class="sp"></div>
               <!-- 合并段落（含操作栏）挂在波形面板内 → 随面板一起钉顶 -->
               <button class="btn btn-ghost btn-sm" id="btn-merge-mode" data-i18n="merge.mode">合并段落</button>
@@ -277,6 +277,6 @@
 <input id="hidden-file" type="file" accept="audio/*,video/*" style="display:none">
 <script src="js/bridge.js"></script>
 <script src="js/i18n.js"></script>
-<script src="js/app.js?v=4"></script>
+<script src="js/app.js?v=5"></script>
 </body>
 </html>

@@ -61,6 +61,7 @@
     "file.spkCur": ["当前", "current"],
     "file.spkNew": ["＋ 新说话者", "＋ New speaker"],
     "file.spkRenameMenu": ["重命名说话者…", "Rename speaker…"],
+    "file.waveHint": ["点字幕选中片段，播放键循环播放；点波形移动播放头", "Click a line to select its span (▶ loops it); click the wave to move the playhead"],
     "file.spkRenamed": ["说话者已重命名：{old} → {new}（各段落与导出同步）", "Speaker renamed: {old} → {new} (applied to all segments & exports)"],
 
     "edit.line": ["编辑此行", "Edit this line"],

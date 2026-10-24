@@ -203,6 +203,7 @@
   let _mergeSel = new Set();       // 已选段索引
   // 播放高亮用的元素缓存与位置提示（长音频数千段时避免每帧 O(n) DOM 查询）
   let _subEls = [], _blockEls = [], _playingIdx = -1, _playedBars = -1, _segHint = 0;
+  let selRange = null;   // 当前选中片段 {start, end, idx}：点字幕行/区块设定，播放键循环
 
   // 定位 t 所在段：先看上次位置附近（播放连续），未命中则二分。
   // 返回段索引；间隙（无段覆盖）回 -1。
@@ -231,6 +232,7 @@
     setMergeMode(false);               // 新结果 → 退出合并选择模式
     _karaCache = null;                      // 新结果 → 重建卡拉OK字级（段落索引已变）
     _subEls = []; _blockEls = []; _playingIdx = -1; _playedBars = -1; _segHint = 0;
+    selRange = null;                     // 新结果 → 片段选中态重置
     cleanupAudio();
 
     const file = picked && (picked.file || (picked instanceof Blob ? picked : null));
@@ -508,6 +510,7 @@
   function rerenderAfterEdit() {
     _karaCache = null;
     _playingIdx = -1;
+    clearSel();                           // 时间轴已变 → 选中区间失效
     renderSpeakerBar();
     renderSegStrip(curSegs, waveDur);
     renderSubs(curSegs);
@@ -565,16 +568,18 @@
       blk.dataset.seg = i;
       blk.title = (s.speaker ? spkDisplay(s.speaker) + "：" : "") + s.text;
       blk.textContent = s.text;
-      blk.addEventListener("click", () => seekTo(s.start));
+      blk.addEventListener("click", () => selectSeg(i));
       host.appendChild(blk);
       _blockEls.push(blk);
     });
+    if (selRange && _blockEls[selRange.idx]) _blockEls[selRange.idx].classList.add("sel");
   }
 
   function renderSubs(segments) {
     const host = $("#subs"); host.innerHTML = "";
     _subEls = [];
     segments.forEach((s, i) => { const el = subCard(s, i); host.appendChild(el); _subEls.push(el); });
+    if (selRange && _subEls[selRange.idx]) _subEls[selRange.idx].classList.add("sel");
   }
   function subCard(s, idx) {
     const el = document.createElement("div");
@@ -602,7 +607,7 @@
         return;
       }
       if (e.target.closest(".sub-edit") || el.classList.contains("editing")) return;
-      seekTo(s.start);
+      selectSeg(idx);                      // 点行 → 选中该句区间（不播放；播放键循环）
     });
     // 笔＝文字编辑模式（进入后按钮变 √ 保存）；剪刀＝拆分模式（进入后按钮变
     // √ 按光标切开，文字锁定）。两按钮 mousedown preventDefault 保住焦点，
@@ -750,17 +755,38 @@
       audioEl.addEventListener("pause", () => setPlayIcon(false));
       audioEl.addEventListener("ended", () => { setPlayIcon(false); });
     }
-    // 点波形 seek
+    // 点波形：只移动播放头（不自动播）；手动定位视为放弃片段选中
     wave.onclick = e => {
       const r = wave.getBoundingClientRect();
-      seekTo(Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * waveDur);
+      const t = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * waveDur;
+      clearSel();
+      if (audioEl) { audioEl.currentTime = t; onTime(); }
     };
-    if (play) play.onclick = () => { if (!audioEl) return; audioEl.paused ? audioEl.play() : audioEl.pause(); };
-    // 停止：暂停并回到开头（像播放器的 stop）
+    // 播放键：有选中片段 → 从片段头起循环播放；无 → 正常连播
+    if (play) play.onclick = () => {
+      if (!audioEl) return;
+      if (audioEl.paused) {
+        if (selRange && (audioEl.currentTime < selRange.start
+                         || audioEl.currentTime >= selRange.end - 0.02)) {
+          audioEl.currentTime = selRange.start;
+        }
+        audioEl.play();
+      } else audioEl.pause();
+    };
+    // 停止：暂停并回到片段头（无选中则回开头）
     const stop = $("#wave-stop");
-    if (stop) stop.onclick = () => { if (!audioEl) return; audioEl.pause(); audioEl.currentTime = 0; onTime(); };
+    if (stop) stop.onclick = () => {
+      if (!audioEl) return;
+      audioEl.pause();
+      audioEl.currentTime = selRange ? selRange.start : 0;
+      onTime();
+    };
 
     function onTime() {
+      // 片段循环：播过区间尾 → 回区间头（timeupdate ~4fps，短片段也能回卷）
+      if (selRange && !audioEl.paused && audioEl.currentTime >= selRange.end - 0.02) {
+        audioEl.currentTime = selRange.start;
+      }
       const t = audioEl.currentTime, ratio = waveDur ? t / waveDur : 0;
       const ph = $("#playhead"); if (ph) ph.style.left = (ratio * 100).toFixed(2) + "%";
       // 波形已播色：只在前进/后退跨桶时重刷（200 根，避免每次 timeupdate 全量 toggle）
@@ -797,7 +823,25 @@
       ? `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>`
       : `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`;
   }
-  function seekTo(sec) { if (audioEl) { audioEl.currentTime = sec; audioEl.play().catch(() => {}); } }
+  // ── 片段选中：点字幕行/区块 → 波形上亮出区间，播放键循环该片段 ──────
+  function selectSeg(idx) {
+    const s = curSegs[idx];
+    if (!s || !waveDur) return;
+    selRange = { start: s.start, end: Math.max(s.end, s.start + 0.05), idx };
+    let ov = $("#wave-sel");
+    if (!ov) { ov = document.createElement("div"); ov.id = "wave-sel"; ov.className = "wave-sel"; $("#wave").appendChild(ov); }
+    ov.style.left = ((selRange.start / waveDur) * 100).toFixed(2) + "%";
+    ov.style.width = (Math.max(0.4, ((selRange.end - selRange.start) / waveDur) * 100)).toFixed(2) + "%";
+    _subEls.forEach((el, i) => el.classList.toggle("sel", i === idx));
+    _blockEls.forEach((el, i) => el.classList.toggle("sel", i === idx));
+  }
+
+  function clearSel() {
+    selRange = null;
+    const ov = $("#wave-sel"); if (ov) ov.style.width = "0%";
+    _subEls.forEach(el => el.classList.remove("sel"));
+    _blockEls.forEach(el => el.classList.remove("sel"));
+  }
   function cleanupAudio() {
     try { if (audioEl) { audioEl.pause(); audioEl.src = ""; } } catch (e) {}
     if (audioUrl) { try { URL.revokeObjectURL(audioUrl); } catch (e) {} audioUrl = null; }
