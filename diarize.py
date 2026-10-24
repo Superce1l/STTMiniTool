@@ -7,16 +7,18 @@ diarize.py
   segmentation-community-1.onnx  — 检测语音段落 + 粗略说话者类别
   embedding_model.onnx           — 提取说话者声纹向量（WeSpeaker）
 
-聚类算法（2026-08 改版）：
+聚类算法（2026-10 改版）：
   三阶段设计 — 长段落先切成约 3 秒子窗逐窗提声纹（避免段内换人
   被单一声纹摊平），再对全部子窗做一次全局聚类，最后把短段落
   指派给最近的群（不再丢弃，修正漏字）。
 
   ┌─ 自动模式（n_speakers=None）
-  │   Average-linkage 层次聚类；对 2..6 人各切一次树状图，
-  │   以 silhouette 分数挑分离度最佳的人数；整体分数过低
-  │   → 判定整档仅一位说话者。（取代旧版固定 0.38 距离阈值——
-  │   固定阈值对相近音色会并人、对环境变化大会拆人）
+  │   Average-linkage 层次树上自深而浅搜索：取「所有群中心两两
+  │   cosine 距离 ≥ SPLIT_SURE_DIST」的最深切割；没有任何切割
+  │   达标 → 整档仅一位说话者。群心距离是实测中区分「同一人被
+  │   拆」与「真正不同人」最可靠的量（同一人子群 ≤0.37、不同人
+  │   ≥0.39，界限两侧都有真实样本），silhouette 与特征值间隙
+  │   都在这两类真实样本上翻过车（见 _cluster_auto 文档）。
   └─ 指定人数（n_speakers=N）
       强制分成 N 组（maxclust criterion）
       → 适合已知说话者数量的情境，避免过度分割
@@ -56,17 +58,21 @@ MERGE_GAP_SEC  = 0.30                      # 相邻同说话者合并间距（�
 
 # 自动模式的 cosine distance 切割阈值
 # cosine_dist = 1 - cosine_sim；值越小 → 聚类越严格（说话者数越多）
-# 2026-08 起仅作为「样本数 < 4」时的 fallback；主要人数判定改用 silhouette
+# 2026-08 起仅作为「样本数 < 4」时的 fallback；主要人数判定见 _cluster_auto
 AUTO_DIST_THRESH = 0.38
 
 # ── 聚类质量改良参数（2026-08）───────────────────────────────────
 EMB_WIN_SEC       = 3.0    # 长段落切子窗提声纹的窗口长度（秒）
 KEEP_MIN_SEC      = 0.30   # 段落保留下限：低于此秒数视为杂讯丢弃
 MAX_AUTO_SPEAKERS = 6      # 自动模式最多尝试的说话者数
-# 以下两个阈值由 test_audio 实测校准（真1人 sil≤0.17/中心距≤0.25；
-# 真多人 sil≥0.41/中心距≥0.39，中间有明确空隙）：
-SIL_SINGLE_THRESH   = 0.25  # silhouette 低于此值 → 判定整档仅一位说话者
-CENTROID_MERGE_DIST = 0.30  # 群中心 cosine 距离低于此值 → 两群视为同一人合并
+# 「确为不同说话者」的群心距离门槛（cosine 距离）。实测校准：
+#   同一人被拆出的子群中心距 ≤ 0.368（真实对唱歌曲 k=3 切割、
+#   TTS 双人子簇 0.34）；真正不同人 ≥ 0.39（TTS 校准值）与
+#   0.417（真实男女对唱）。0.38 落在两者之间的空隙里。
+SPLIT_SURE_DIST = 0.38
+# 少于此数的子窗自成一群 → 视为碎群（间奏/换气/伴奏窗），并入最近大群。
+# 3 窗 ≈ 4.5 秒语音；真实说话者在 ≥2 分钟音频里几乎必然超过这个量。
+TINY_CLUSTER_WINDOWS = 3
 
 
 def _subwindows(t0: float, t1: float,
@@ -94,43 +100,39 @@ def _subwindows(t0: float, t1: float,
     return [(s, s + win) for s in dedup]
 
 
-def _eigengap_k(emb: np.ndarray, kmax: int = MAX_AUTO_SPEAKERS) -> int:
-    """谱特征值间隙估计说话者人数：相似度矩阵前若干个大特征值 ≈ 人数。
+def _absorb_tiny(labels: np.ndarray, emb: np.ndarray,
+                 min_size: int = TINY_CLUSTER_WINDOWS) -> np.ndarray:
+    """把少于 min_size 个子窗的碎群并入 cosine 最近的够大群。
 
-    取代「argmax silhouette」选人数——silhouette 有经典病态：把一个紧致的
-    大簇继续切开分数反而升高（实测双人对话被切成 3 人）；特征值结构对
-    「几个紧致簇」这一信号更直接：k 个说话者 → 恰好 k 个显著特征值，
-    其后的间隙（eigengap）在真实人数处最大。
+    间奏、换气、伴奏残留等杂讯窗在深切割下会自成一群，把「群心两两
+    够远」的判定干扰成假说话者；先吸收再判定。一个够大群都没有时
+    原样返回（交由调用端的 <2 群分支跳过该切割）。
     """
-    sim = np.clip(emb @ emb.T, 0.0, 1.0)
-    w = np.maximum(np.sort(np.linalg.eigvalsh(sim))[::-1], 0.0)
-    gaps = [float(w[k - 1] - (w[k] if k < len(w) else 0.0))
-            for k in range(1, min(kmax, len(w)) + 1)]
-    return int(np.argmax(gaps)) + 1
+    labels = labels.copy()
+    uniq, counts = np.unique(labels, return_counts=True)
+    big = {int(c) for c, n in zip(uniq, counts) if n >= min_size}
+    if not big or len(big) == len(uniq):
+        return labels
+    cents = {}
+    for c in big:
+        v = emb[labels == c].mean(axis=0)
+        nrm = np.linalg.norm(v)
+        cents[c] = v / nrm if nrm > 1e-9 else v
+    for i, l in enumerate(labels):
+        if l not in big:
+            labels[i] = max(cents, key=lambda c: float(emb[i] @ cents[c]))
+    return labels
 
 
-def _silhouette_from_dist(dist: np.ndarray, labels) -> float:
-    """由预先算好的距离矩阵计算平均 silhouette 分数。
-
-    单元素群的 silhouette 依标准定义记 0（避免噪音子窗自成一群
-    反而拉高分数）。返回值域约 [-1, 1]，越高代表群间分得越开。
-    """
-    labels = np.asarray(labels)
-    uniq   = np.unique(labels)
-    if len(uniq) < 2:
-        return -1.0
-    scores = np.zeros(len(labels))
-    for i in range(len(labels)):
-        same    = labels == labels[i]
-        same_i  = same.copy()
-        same_i[i] = False
-        if not same_i.any():          # 单元素群 → 0
-            continue
-        a = dist[i, same_i].mean()
-        b = min(dist[i, labels == c].mean() for c in uniq if c != labels[i])
-        m = max(a, b)
-        scores[i] = (b - a) / m if m > 1e-12 else 0.0
-    return float(scores.mean())
+def _min_centroid_dist(emb: np.ndarray, labels: np.ndarray) -> float:
+    """各群中心两两 cosine 距离的最小值（群心越远 → 越像不同的人）。"""
+    cents = []
+    for c in np.unique(labels):
+        v = emb[labels == c].mean(axis=0)
+        nrm = np.linalg.norm(v)
+        cents.append(v / nrm if nrm > 1e-9 else v)
+    return min(1.0 - float(a @ b)
+               for i, a in enumerate(cents) for b in cents[i + 1:])
 
 
 class DiarizationEngine:
@@ -459,15 +461,22 @@ class DiarizationEngine:
         self, embeddings: list[np.ndarray]
     ) -> list[int]:
         """
-        自动模式（2026-10 改版）：人数由「谱特征值间隙」估计（_eigengap_k），
-        silhouette 降级为结构校验（切出的聚类分离度过低 → 判定仅一人）。
+        自动模式（2026-10 二次改版）：在层次树上自深而浅搜索，取
+        「碎群吸收后，所有群中心两两 cosine 距离 ≥ SPLIT_SURE_DIST」
+        的最深切割；一个达标的都没有 → 整档仅一位说话者。
 
-        取代旧版「argmax silhouette 选人数」：silhouette 有经典病态——把一个
-        紧致的大簇继续切开分数反而升高（实测双人 TTS 对话被切成 3 人：
-        k=3 时 sil 0.864 > 正确 k=2 的 0.776，且同一人的子簇心距 0.34 恰好
-        躲过 0.30 的合并线）。特征值间隙对「几个紧致簇」直接计数，单人/
-        双人实测均正确。固定阈值仅保留给样本数 < 4 的极短音频。
+        前两版都在真实音频上翻过车，教训值得留档：
+        • argmax-silhouette（08 版）：紧致大簇继续切分数反而升高，
+          双人 TTS 被切成 3 人（k=3 sil 0.864 > 正确 k=2 的 0.776）。
+        • 谱特征值间隙（10 月一版）：相似度矩阵的 λ1 被「全局公共
+          成分」占据（同语言+共享伴奏 → 所有窗两两 ~0.3 相似，
+          真实对唱 λ=[39.6, 13.0, 6.6,…]，λ1-λ2 间隙 26.6 一家独大
+          → 恒判 1 人）；且 0.25 的 silhouette 门槛把真实双人的
+          0.206 也误杀。合成测试因跨群相似度 ≈0 而全数通过——
+          正是这种「过干净」让两版缺陷都漏网。
 
+        群心距离是唯一在全部实测样本上界限分明的量（同一人子群
+        ≤0.368 / 不同人 ≥0.39-0.417），故以它为唯一判定依据。
         返回 1-indexed 标签列表。
         """
         _require_scipy()
@@ -483,37 +492,15 @@ class DiarizationEngine:
         np.fill_diagonal(dist, 0.0)
         Z = linkage(squareform(dist, checks=False), method="average")
 
-        if M < 4:   # 样本太少特征值不可靠 → 退回固定阈值
+        if M < 4:   # 样本太少 → 退回固定阈值
             return fcluster(Z, t=AUTO_DIST_THRESH,
                             criterion="distance").tolist()
 
-        k_est = _eigengap_k(emb_mat)
-        if k_est <= 1:
-            return [1] * M      # 单一显著特征值 → 整档视为一位说话者
-        labels = np.asarray(fcluster(Z, t=k_est, criterion="maxclust"))
-
-        # 结构校验：切出的聚类分离度过低（噪声性碎裂）→ 退回一人
-        if _silhouette_from_dist(dist, labels) < SIL_SINGLE_THRESH:
-            return [1] * M
-
-        # 第二重防护：群中心距离过近（同一人被拆）→ 反复合并最近的两群。
-        labels = labels.copy()
-        while True:
-            uniq = np.unique(labels)
-            if len(uniq) < 2:
-                break
-            cents = {}
-            for c in uniq:
-                v = emb_mat[labels == c].mean(axis=0)
-                nrm = np.linalg.norm(v)
-                cents[c] = v / nrm if nrm > 1e-9 else v
-            pair, mind = None, 2.0
-            for i in range(len(uniq)):
-                for j in range(i + 1, len(uniq)):
-                    d = 1.0 - float(cents[uniq[i]] @ cents[uniq[j]])
-                    if d < mind:
-                        pair, mind = (uniq[i], uniq[j]), d
-            if mind >= CENTROID_MERGE_DIST:
-                break
-            labels[labels == pair[1]] = pair[0]
-        return labels.tolist()
+        for k in range(min(MAX_AUTO_SPEAKERS, M - 1), 1, -1):
+            labels = _absorb_tiny(
+                np.asarray(fcluster(Z, t=k, criterion="maxclust")), emb_mat)
+            if len(np.unique(labels)) < 2:
+                continue
+            if _min_centroid_dist(emb_mat, labels) >= SPLIT_SURE_DIST:
+                return labels.tolist()
+        return [1] * M

@@ -280,7 +280,8 @@ def _srt_ts_fmt(sec: float) -> str:
 # 后者由 crisp_engine._apply_diarization 依时间指派。diar_engine 由 _ensure_diarization 挂上。
 
 # 跨片说话者匹配阈值：声纹中心 cosine 相似度 ≥ 此值视为同一人。
-# 与 diarize.CENTROID_MERGE_DIST(0.30) 的「同一人中心距 ≤0.30」一致：sim ≥ 0.70。
+# 跨片匹配同一人要比 diarize.SPLIT_SURE_DIST（0.38 → sim 0.62）宽松——
+# 同一人跨片的中心漂移大于片内子群，取 sim ≥ 0.70 折衷误并/误开两类错误。
 _SPK_MATCH_SIM = 0.70
 
 
