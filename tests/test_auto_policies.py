@@ -1,5 +1,5 @@
 """设置项自动化后的策略测试：每段秒数任务自适应 + VAD 自动降阈值重试"""
-import shutil
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,13 +15,16 @@ MODEL = PROJECT / "ov_models" / "silero_vad_v4.onnx"
 
 
 class _BackendCase(unittest.TestCase):
-    """构造临时 settings 的 WebBackend（不碰使用者的 settings.json）"""
+    """构造固定 settings 的 WebBackend（写自己的夹具，不依赖开发者本机
+    的实时 settings.json——它会被 GUI 使用者的真实选择改写）"""
 
     def setUp(self):
         self._prev = core_app.SETTINGS_FILE
         d = Path(tempfile.mkdtemp())
         core_app.SETTINGS_FILE = d / "settings.json"
-        shutil.copyfile(PROJECT / "settings.json", core_app.SETTINGS_FILE)
+        core_app.SETTINGS_FILE.write_text(
+            json.dumps({"backend": "openvino", "cpu_model_size": "0.6B"}),
+            encoding="utf-8")
         self.be = WebBackend()
 
     def tearDown(self):

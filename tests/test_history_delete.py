@@ -19,10 +19,9 @@ class _HistCase(unittest.TestCase):
         self.d = Path(tempfile.mkdtemp()) / "subtitles"
         self.d.mkdir(parents=True)
         core.SRT_DIR = self.d
-        import shutil
         self._prev_settings = core.SETTINGS_FILE
         core.SETTINGS_FILE = Path(tempfile.mkdtemp()) / "settings.json"
-        shutil.copyfile(PROJECT / "settings.json", core.SETTINGS_FILE)
+        core.SETTINGS_FILE.write_text("{}", encoding="utf-8")   # 自备夹具，不读实时设置
         self.be = WebBackend()
 
     def tearDown(self):
