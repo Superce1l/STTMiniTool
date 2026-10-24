@@ -717,3 +717,14 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .history-item .hm { margin-left: auto; flex: 0 0 auto;
   font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+/* 删除按钮：span[role=button]（条目本身是 <button>，不能嵌套）——hover 才现形 */
+.history-item .hx {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; margin: -4px -6px -4px 0; border-radius: 6px;
+  color: var(--muted); opacity: 0; cursor: pointer;
+  transition: opacity .12s, color .12s, background .12s;
+}
+.history-item:hover .hx, .history-item .hx:focus-visible { opacity: 1; }
+.history-item .hx:hover { color: var(--live); background: var(--live-soft); }
+.history-item .hx svg { width: 14px; height: 14px; }
+.history-item:disabled { opacity: .5; cursor: default; }

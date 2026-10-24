@@ -1029,8 +1029,12 @@
       el.className = "history-item";
       const when = new Date(it.mtime * 1000).toLocaleString();
       el.innerHTML = `<span class="hn">${escapeHtml(it.name)}</span>
-        <span class="hm">${when} · ${Math.max(1, Math.round(it.size / 1024))} KB</span>`;
-      el.addEventListener("click", async () => {
+        <span class="hm">${when} · ${Math.max(1, Math.round(it.size / 1024))} KB</span>
+        <span class="hx" role="button" tabindex="0" title="${T("file.historyDel", "删除（到回收站）")}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+        </span>`;
+      el.addEventListener("click", async e => {
+        if (e.target.closest(".hx")) { deleteHistoryItem(it, el); return; }
         try {
           const r = await API.loadHistory(it.name);
           if (r && r.ok && (r.segments || []).length) {
@@ -1043,6 +1047,26 @@
       });
       host.appendChild(el);
     });
+  }
+
+  // 删除历史条目：确认 → 后端删（Windows 到回收站）→ 刷新列表
+  async function deleteHistoryItem(it, el) {
+    if (!window.confirm(T("file.historyDelConfirm", "确定删除字幕文件「{name}」吗？\n（移到回收站，可恢复）", { name: it.name }))) return;
+    el.disabled = true;
+    try {
+      const r = await API.deleteHistory(it.name);
+      if (r && r.ok) {
+        logLine("✓ " + T("file.historyDeleted", "已删除：") + it.name
+          + (r.recycled === false ? T("file.historyDeletedPerm", "（已直接删除）") : ""));
+        renderHistory();
+      } else {
+        el.disabled = false;
+        logLine("✕ " + T("file.historyDelFail", "删除失败：") + ((r && r.error) || "未知错误"));
+      }
+    } catch (err) {
+      el.disabled = false;
+      logLine("✕ " + T("file.historyDelFail", "删除失败：") + (err.message || err));
+    }
   }
 
   // ── 共享工具 ────────────────────────────────────────────

@@ -1751,6 +1751,49 @@ class WebBackend:
             "activeBackend": getattr(self, "_active_backend", None),
         }
 
+    def delete_history(self, name: str) -> dict:
+        """删除 subtitles/ 里的一个历史字幕文件到回收站（Windows）。
+
+        与 list_history/load_history 同一套 basename 防穿越约束。回收站
+        删除走 PowerShell VisualBasic API；非 Windows／调用失败回退为普通
+        删除（调用端如实收到 recycled=False）。文件不存在回 ok=False。
+        """
+        safe = Path(str(name or "").replace("\\", "/")).name
+        d = Path(getattr(core, "SRT_DIR", BASE_DIR / "subtitles"))
+        p = d / safe
+        if not safe or safe.startswith("."):
+            return {"ok": False, "error": "路径不合法"}
+        try:
+            if d.resolve() not in p.resolve().parents:
+                return {"ok": False, "error": "路径不合法"}
+        except Exception:
+            return {"ok": False, "error": "路径不合法"}
+        if not p.is_file():
+            return {"ok": False, "error": "找不到文件"}
+
+        recycled = False
+        if sys.platform == "win32":
+            try:
+                import subprocess
+                # 单引号转义：文件名含 ' 时以 '' 闭合再重启字符串
+                ps = ("Add-Type -AssemblyName Microsoft.VisualBasic; "
+                      "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("
+                      f"'{str(p).replace(chr(39), chr(39)*2)}', "
+                      "'OnlyErrorDialogs', 'SendToRecycleBin')")
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    capture_output=True, timeout=15,
+                    creationflags=0x08000000)
+                recycled = (r.returncode == 0 and not p.exists())
+            except Exception:
+                traceback.print_exc()
+        if not recycled:
+            try:
+                p.unlink()
+            except OSError as e:
+                return {"ok": False, "error": f"删除失败：{e}"}
+        return {"ok": True, "recycled": recycled}
+
     # ── 设置（读写既有 settings.json）───────────────────────
     def get_settings(self) -> dict:
         s = self.settings.read()

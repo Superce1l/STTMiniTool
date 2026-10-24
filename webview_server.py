@@ -362,6 +362,10 @@ class WebViewServer:
                         body = self._read_json_body()
                         return self._json(server.backend.load_history(
                             body.get("name", "")))
+                    if path == "/api/history-delete":
+                        body = self._read_json_body()
+                        return self._json(server.backend.delete_history(
+                            body.get("name", "")))
                     return self._err(404, "unknown api")
                 except Exception as e:
                     return self._err(500, str(e))

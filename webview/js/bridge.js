@@ -145,6 +145,11 @@
       if (MODE === "web") { try { return await apiPost("/api/history-load", { name }); } catch {} }
       return { ok: false, error: "history unavailable in mock mode" };
     },
+    // 删除一个历史字幕文件（Windows 到回收站）；返回 {ok, recycled}
+    async deleteHistory(name) {
+      if (MODE === "web") { try { return await apiPost("/api/history-delete", { name }); } catch {} }
+      return { ok: false, error: "history unavailable in mock mode" };
+    },
 
     async listDevices() {
       if (MODE === "web") return apiGet("/api/devices");
