@@ -56,6 +56,11 @@
     "file.resultTitle": ["识别结果", "Result"],
     "file.speakers": ["说话者", "Speakers"],
     "file.spkRenameHint": ["点击标签可重命名", "Click a label to rename"],
+    "file.spkSwitchHint": ["点击切换此行的说话者", "Click to switch this line's speaker"],
+    "file.spkSwitched": ["第 {i} 行说话者：{old} → {new}（导出与合并判定同步）", "Line {i} speaker: {old} → {new} (exports & merge rules follow)"],
+    "file.spkCur": ["当前", "current"],
+    "file.spkNew": ["＋ 新说话者", "＋ New speaker"],
+    "file.spkRenameMenu": ["重命名说话者…", "Rename speaker…"],
     "file.spkRenamed": ["说话者已重命名：{old} → {new}（各段落与导出同步）", "Speaker renamed: {old} → {new} (applied to all segments & exports)"],
 
     "edit.line": ["编辑此行", "Edit this line"],

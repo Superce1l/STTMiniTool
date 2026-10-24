@@ -319,6 +319,91 @@
     chip.addEventListener("blur", onBlur);
   }
 
+  // ── 单行说话者切换：点字幕卡 chip 弹菜单 ────────────────────────────
+  // 列出现有说话者（当前项打勾）＋「新说话者」（分离并错一人时的手工补救）
+  // ＋「重命名…」（保留旧 chip 点击的改名入口）。切换只改这一行的
+  // s.speaker；导出前缀、合并判定（同说话者相邻才可并）、波形区块
+  // 颜色、标签栏都随 curSegs 自动同步。
+  function spkSwitchMenu(idx, chipEl) {
+    closeSpkMenu();                                  // 同时最多一个
+    const cur = curSegs[idx].speaker;
+    const nums = [];
+    curSegs.forEach(s => { if (s.speaker && !nums.includes(s.speaker)) nums.push(s.speaker); });
+    nums.sort((a, b) => a - b);
+
+    const menu = document.createElement("div");
+    menu.className = "spk-menu";
+    nums.forEach(n => {
+      const row = document.createElement("button");
+      row.type = "button";
+      if (n === cur) row.classList.add("cur");
+      row.innerHTML = `<span class="dot spk-${((n - 1) % 3) + 1}"></span>`
+        + `<span class="nm">${escapeHtml(spkDisplay(n))}</span>`
+        + (n === cur ? `<span class="tick" title="${T("file.spkCur", "当前")}">✓</span>` : "");
+      row.addEventListener("click", e => {
+        e.stopPropagation();
+        closeSpkMenu();
+        if (n !== cur) switchSegSpeaker(idx, n);
+      });
+      menu.appendChild(row);
+    });
+    const sep = document.createElement("div"); sep.className = "sep"; menu.appendChild(sep);
+
+    const newRow = document.createElement("button");
+    newRow.type = "button"; newRow.className = "add";
+    newRow.textContent = T("file.spkNew", "＋ 新说话者");
+    newRow.addEventListener("click", e => {
+      e.stopPropagation();
+      closeSpkMenu();
+      switchSegSpeaker(idx, (nums[nums.length - 1] || 0) + 1);
+    });
+    menu.appendChild(newRow);
+
+    const renRow = document.createElement("button");
+    renRow.type = "button"; renRow.className = "ren";
+    renRow.textContent = T("file.spkRenameMenu", "重命名说话者…");
+    renRow.addEventListener("click", e => {
+      e.stopPropagation();
+      closeSpkMenu();
+      beginSpkRename(cur, chipEl);                   // 旧入口保留：改名仍一步直达
+    });
+    menu.appendChild(renRow);
+
+    // 定位：chip 屏幕坐标（fixed），右侧越界时向左收
+    document.body.appendChild(menu);
+    const r = chipEl.getBoundingClientRect();
+    const mw = menu.offsetWidth, mh = menu.offsetHeight;
+    let x = Math.min(r.left, window.innerWidth - mw - 8);
+    let y = r.bottom + 6;
+    if (y + mh > window.innerHeight - 8) y = Math.max(8, r.top - mh - 6);
+    menu.style.left = x + "px"; menu.style.top = y + "px";
+
+    document.addEventListener("pointerdown", onSpkMenuAway, true);
+    document.addEventListener("keydown", onSpkMenuKey, true);
+    window.addEventListener("scroll", closeSpkMenu, true);
+  }
+
+  function onSpkMenuAway(e) { if (!e.target.closest(".spk-menu")) closeSpkMenu(); }
+  function onSpkMenuKey(e) { if (e.key === "Escape") closeSpkMenu(); }
+
+  function closeSpkMenu() {
+    document.querySelectorAll(".spk-menu").forEach(m => m.remove());
+    document.removeEventListener("pointerdown", onSpkMenuAway, true);
+    document.removeEventListener("keydown", onSpkMenuKey, true);
+    window.removeEventListener("scroll", closeSpkMenu, true);
+  }
+
+  function switchSegSpeaker(idx, n) {
+    const old = spkDisplay(curSegs[idx].speaker);
+    curSegs[idx].speaker = n;
+    _playingIdx = -1;                                 // 重渲染后高亮状态重建
+    renderSpeakerBar();
+    renderSegStrip(curSegs, waveDur);
+    renderSubs(curSegs);
+    logLine("✓ " + T("file.spkSwitched", "第 {i} 行说话者：{old} → {new}（导出与合并判定同步）",
+                     { i: idx + 1, old, new: spkDisplay(n) }));
+  }
+
   // ── 拆分：编辑态光标处一分为二 ──────────────────────────────────────
   // contentEditable 内的光标字符偏移（以元素纯文本为坐标系）。
   // anchor="start" 且选中了一段文字时取选区起点（「高亮到哪就切到哪」）。
@@ -497,7 +582,7 @@
     el.className = "sub-card" + (s.speaker ? " spkc-" + (((s.speaker - 1) % 3) + 1) : "")
       + (_mergeSel.has(idx) ? " msel" : "");
     el.dataset.seg = idx;
-    const spk = s.speaker ? `<span class="chip spk-${((s.speaker - 1) % 3) + 1}" title="${T("file.spkRenameHint", "点击标签可重命名")}">${escapeHtml(spkDisplay(s.speaker))}</span>` : "";
+    const spk = s.speaker ? `<span class="chip spk-${((s.speaker - 1) % 3) + 1}" title="${T("file.spkSwitchHint", "点击切换此行的说话者")}">${escapeHtml(spkDisplay(s.speaker))}</span>` : "";
     el.innerHTML = `<span class="tc">${fmtClock(s.start)} → ${fmtClock(s.end)}</span>
       <div class="body"><div class="spk">${spk}</div><div class="txt">${escapeHtml(s.text)}</div></div>
       <button class="sub-edit" title="${T("edit.line", "编辑此行")}" aria-label="编辑此行">
@@ -512,8 +597,8 @@
       if (_mergeMode) { toggleMergeSel(idx, el); return; }   // 合并模式：点卡片＝选择
       if (el.classList.contains("editing")) return;          // 任一编辑模式中：卡片不响应跳播
       const chipEl = e.target.closest(".chip");
-      if (chipEl && s.speaker) {          // 点说话者 chip → 就地改名（不触发跳播）
-        beginSpkRename(s.speaker, chipEl);
+      if (chipEl && s.speaker) {          // 点说话者 chip → 弹切换菜单（不触发跳播）
+        spkSwitchMenu(idx, chipEl);
         return;
       }
       if (e.target.closest(".sub-edit") || el.classList.contains("editing")) return;

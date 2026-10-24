@@ -765,6 +765,28 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 }
 .save-menu button:hover { background: var(--accent-tint); color: var(--accent-strong); }
 
+/* ── 单行说话者切换菜单（字幕卡 chip 点击弹出）────────────────────── */
+.spk-menu {
+  position: fixed; z-index: 60; min-width: 190px; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r-btn); box-shadow: var(--shadow);
+  display: flex; flex-direction: column;
+}
+.spk-menu button {
+  appearance: none; border: 0; background: none; text-align: left;
+  padding: 7px 10px; border-radius: 6px; cursor: pointer;
+  font: inherit; font-size: 13px; color: var(--ink-2);
+  display: flex; align-items: center; gap: 8px;
+}
+.spk-menu button:hover { background: var(--accent-tint); color: var(--accent-strong); }
+.spk-menu .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.spk-menu .dot.spk-1 { background: var(--accent-strong); }
+.spk-menu .dot.spk-2 { background: #5B4B9A; }
+.spk-menu .dot.spk-3 { background: #8A6312; }
+.spk-menu .tick { margin-left: auto; padding-left: 12px; opacity: .8; font-size: 12px; }
+.spk-menu .sep { height: 1px; background: var(--line); margin: 5px 4px; }
+.spk-menu button.cur .nm { font-weight: 600; }
+
 /* ── 最近转录（subtitles/ 产出回填列表）──────────────────────────── */
 .history-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .history-list[hidden] { display: none; }
