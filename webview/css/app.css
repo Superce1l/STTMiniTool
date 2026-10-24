@@ -161,7 +161,10 @@ button { font-family: inherit; }
 .status-dot {
   display: flex; align-items: center; gap: 7px; justify-content: center;
   font-size: 11px; color: var(--muted);
+  cursor: pointer;                 /* 点击直达「模型」页 */
+  transition: color .12s;
 }
+.status-dot:hover { color: var(--ink-2); }
 .status-dot .dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft);

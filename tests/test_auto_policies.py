@@ -115,5 +115,45 @@ class TestVadAutoSegment(unittest.TestCase):
         self.assertIn("未检测到人声", diag)
 
 
+class TestStatusModelFields(_BackendCase):
+    """左下角状态点契约：实际加载 vs 当前选择（热切换「待切换」判定）"""
+
+    def test_fresh_backend_no_active(self):
+        st = self.be.get_status()
+        self.assertIsNone(st["activeModel"])
+        self.assertFalse(st["selectionDiffers"])
+        self.assertEqual(st["selectedModel"], "OpenVINO · Qwen3-ASR-0.6B")
+
+    def test_loaded_then_switch_selection_differs(self):
+        import app as core
+        self.be.engine = core.ASREngine()            # ready 标志之外仅需 _remember_active
+        self.be.engine.ready = True
+        self.be._remember_active("openvino")
+        st = self.be.get_status()
+        self.assertEqual(st["activeModel"], "OpenVINO · Qwen3-ASR-0.6B")
+        self.assertFalse(st["selectionDiffers"])     # 加载的就是所选
+
+        # 换选择（不加载）→ 待切换；activeModel 不变（跑的仍是旧模型）
+        self.be.set_model("CrispASR", "Whisper Small")
+        st = self.be.get_status()
+        self.assertEqual(st["selectedModel"], "CrispASR · Whisper Small")
+        self.assertEqual(st["activeModel"], "OpenVINO · Qwen3-ASR-0.6B")
+        self.assertTrue(st["selectionDiffers"])
+
+        # 加载完成（身份同步）→ 差异消除
+        self.be._remember_active("crispasr")
+        self.assertFalse(self.be.get_status()["selectionDiffers"])
+
+    def test_accel_variant_counts_as_differs(self):
+        # 加速版本纳入身份（vulkan→cuda 等同换核心）
+        import app as core
+        self.be.engine = core.ASREngine()
+        self.be.engine.ready = True
+        self.be._remember_active("crispasr")
+        self.be.settings.update({"crisp_variant": "cpu"})
+        st = self.be.get_status()
+        self.assertTrue(st["selectionDiffers"])
+
+
 if __name__ == "__main__":
     unittest.main()

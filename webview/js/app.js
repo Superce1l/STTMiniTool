@@ -36,16 +36,53 @@
     const btn = e.target.closest(".nav-item");
     if (btn) switchView(btn.dataset.view);
   });
+  // 左下角状态点 → 直达「模型」页（状态与模型下载/热切换直接相关）
+  $("#model-status").addEventListener("click", () => switchView("model"));
 
   // ── 状态栏 ──────────────────────────────────────────────
+  // 状态点状态机（与「模型页按需下载 / 热切换」语义对齐）：
+  //   loading           加载／下载中（琥珀）
+  //   未就绪 + 未下载   模型未下载（灰）—— 引导到模型页
+  //   未就绪 + 已下载   尚未加载模型（灰）
+  //   就绪 + 选择不同   待切换（琥珀）—— 此刻转录跑的仍是旧模型
+  //   就绪 + 有 error   已回退旧引擎（琥珀）—— tooltip 带原因
+  //   就绪              模型已就绪（绿）—— tooltip 显示实际加载的模型
+  // 点击状态点 → 直达「模型」页。
   async function refreshStatus() {
     const s = await API.getStatus();
     const el = $("#model-status");
-    el.classList.toggle("loading", !s.modelReady);
-    $(".t", el).textContent = s.modelReady ? T("status.ready", "模型已就绪")
-      : (s.loading ? T("status.loading", "加载模型中…") : T("status.needModel", "尚未加载模型"));
+    let key = "status.ready", def = "模型已就绪", cls = "";
+    if (s.loading) {
+      key = "status.loading"; def = "加载模型中…"; cls = "loading";
+    } else if (!s.modelReady) {
+      cls = "off";
+      if (s.selectedReady === false) { key = "status.notDownloaded"; def = "模型未下载"; }
+      else { key = "status.needModel"; def = "尚未加载模型"; }
+    } else if (s.selectionDiffers) {
+      key = "status.switchPending"; def = "待切换"; cls = "loading";
+    } else if (s.error) {
+      cls = "loading";    // 加载失败已回退旧引擎：仍可用，但以琥珀色提醒
+    }
+    el.classList.remove("loading", "off");
+    if (cls) el.classList.add(cls);
+    $(".t", el).textContent = T(key, def);
+    el.title = statusTip(s);
     // 版本徽章：纯数字版本前缀 v（如 v1.0.9）；已含文字者（如 webview 0.1）原样显示
     if (s.version) $("#app-version").textContent = /^\d/.test(s.version) ? "v" + s.version : s.version;
+  }
+  function statusTip(s) {
+    if (s.loading) return T("status.tipLoading", "正在下载／加载模型…");
+    if (!s.modelReady) {
+      return s.selectedReady === false
+        ? T("status.tipNotDownloaded", "所选模型尚未下载——到「模型」页点「下载并加载模型」")
+        : T("status.tipNotLoaded", "模型文件已备——到「模型」页点「下载并加载模型」");
+    }
+    if (s.selectionDiffers) {
+      return T("status.tipSwitch", "已加载：{loaded}\n已选择：{sel}\n到「模型」页点「下载并加载模型」完成切换",
+               { loaded: s.activeModel || "—", sel: s.selectedModel || "—" });
+    }
+    if (s.error) return T("status.tipFallback", "本次加载失败，已回退旧模型继续使用：{e}", { e: s.error });
+    return T("status.tipReady", "当前模型：{m}", { m: s.activeModel || "—" });
   }
 
   // ════════════════════════════════════════════════════════

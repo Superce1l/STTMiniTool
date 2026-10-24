@@ -173,6 +173,7 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 | 🧱 **结构化转录结果** | 引擎 `process_file` 返回 `TranscribeResult`（output/segments_rich/diag/cancelled/degenerate），取代实例属性侧通道，消除「残留清理」类时序 bug 根源 |
 | ✅ **测试套件** | 新增 `tests/`（unittest 66 例）：字幕分行、切片合并、SRT 解析、SettingsStore、流式 multipart、跨片说话者映射、VAD 批量等价性、引擎取消契约 |
 | 🎛️ **设置精简** | 「语音检测灵敏度」「每段最长秒数」移出设置页改自动判断——VAD 未检出人声且最高概率达可信下限时自动降阈值重试（真静音不浪费重试）；段长依任务自适应（开字级对齐→10s 抗漂移，关闭→模型上限吞吐优先）；settings.json 旧键忽略不读 |
+| 🚦 **状态点五态** | 左下角状态点对齐模型下载/热切换语义——「已选≠已加载」显示琥珀「待切换」（此前仍绿灯「已就绪」，转录实际跑旧模型）、「模型未下载」与「尚未加载」区分、加载失败回退琥珀提醒；tooltip 显示实际加载/已选模型，点击直达「模型」页 |
 | 🏷️ **杂项修复** | 「说话者」判断条件重复（补回繁体分支）；fallback 断句剥 `</asr_text>` 闭合标签 |
 
 ### 2.2.5

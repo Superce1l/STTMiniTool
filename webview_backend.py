@@ -644,6 +644,14 @@ class WebBackend:
     # ── 状态 ────────────────────────────────────────────────
     def get_status(self) -> dict:
         active = getattr(self, "_active_backend", "openvino")
+        loaded = getattr(self, "_active_label", None)
+        # 热切换语义：实际加载的引擎身份 vs 当前持久化选择的身份。
+        # 不一致 → 左下角状态点显示「待切换」（此刻转录跑的仍是旧模型）。
+        active_identity = getattr(self, "_active_identity", None)
+        selection_differs = bool(
+            active_identity is not None
+            and active_identity != self._identity_for(self._persisted_backend(),
+                                                      self._settings_raw()))
         return {
             "modelReady": bool(getattr(self.engine, "ready", False)),
             "loading": self._loading,
@@ -659,6 +667,10 @@ class WebBackend:
             "hasAnyModel": self._has_any_model(),
             # 目前选择的模型是否已就绪 → 前端决定开始页（就绪=语音转文字／否=模型页等下载）
             "selectedReady": self.selected_model_present(),
+            # 左下角状态点用：实际加载的模型 vs 当前选择的模型
+            "activeModel": f"{loaded[0]} · {loaded[1]}" if loaded else None,
+            "selectedModel": " · ".join(self._current_selection()),
+            "selectionDiffers": selection_differs,
         }
 
     def selected_model_present(self) -> bool:
