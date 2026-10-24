@@ -70,11 +70,43 @@ CENTROID_MERGE_DIST = 0.30  # 群中心 cosine 距离低于此值 → 两群视�
 
 
 def _subwindows(t0: float, t1: float,
-                win: float = EMB_WIN_SEC) -> list[tuple[float, float]]:
-    """把 [t0, t1] 均分成每窗约 win 秒的子窗（尾窗并入均分，不产生残段）。"""
-    n = max(1, int(round((t1 - t0) / win)))
-    edges = np.linspace(t0, t1, n + 1)
-    return list(zip(edges[:-1].tolist(), edges[1:].tolist()))
+                win: float = EMB_WIN_SEC, hop: float | None = None) -> list[tuple[float, float]]:
+    """把 [t0, t1] 切成 win 秒、相邻 50% 重叠的子窗（默认 hop=win/2）。
+
+    重叠窗让声纹样本密度翻倍——人数估计（特征值间隙）与聚类稳定性都受益。
+    短段（≤1.5×win）退回等分（不产生碎窗）；尾部不足一个 hop 时并入贴尾窗。
+    """
+    hop = (win / 2.0) if hop is None else float(hop)
+    dur = t1 - t0
+    if dur <= win * 1.5:                      # 短段：等分 1~2 窗
+        n = max(1, int(round(dur / win)))
+        edges = np.linspace(t0, t1, n + 1)
+        return list(zip(edges[:-1].tolist(), edges[1:].tolist()))
+    starts = np.arange(t0, t1 - win + 1e-6, hop).tolist()
+    if not starts:
+        starts = [t0]
+    if starts[-1] + win < t1 - 1e-6:          # 贴尾补一窗，覆盖段尾
+        starts.append(t1 - win)
+    dedup = [starts[0]]
+    for s in starts[1:]:
+        if s - dedup[-1] > hop * 0.4:         # 贴尾窗与前一窗过近时只留一个
+            dedup.append(s)
+    return [(s, s + win) for s in dedup]
+
+
+def _eigengap_k(emb: np.ndarray, kmax: int = MAX_AUTO_SPEAKERS) -> int:
+    """谱特征值间隙估计说话者人数：相似度矩阵前若干个大特征值 ≈ 人数。
+
+    取代「argmax silhouette」选人数——silhouette 有经典病态：把一个紧致的
+    大簇继续切开分数反而升高（实测双人对话被切成 3 人）；特征值结构对
+    「几个紧致簇」这一信号更直接：k 个说话者 → 恰好 k 个显著特征值，
+    其后的间隙（eigengap）在真实人数处最大。
+    """
+    sim = np.clip(emb @ emb.T, 0.0, 1.0)
+    w = np.maximum(np.sort(np.linalg.eigvalsh(sim))[::-1], 0.0)
+    gaps = [float(w[k - 1] - (w[k] if k < len(w) else 0.0))
+            for k in range(1, min(kmax, len(w)) + 1)]
+    return int(np.argmax(gaps)) + 1
 
 
 def _silhouette_from_dist(dist: np.ndarray, labels) -> float:
@@ -427,14 +459,14 @@ class DiarizationEngine:
         self, embeddings: list[np.ndarray]
     ) -> list[int]:
         """
-        自动模式（2026-08 改版）：对 2..MAX_AUTO_SPEAKERS 人各切一次
-        层次聚类树，以 silhouette 分数挑分离度最佳的人数；整体分数
-        低于 SIL_SINGLE_THRESH（群间根本分不开）→ 判定仅一位说话者。
+        自动模式（2026-10 改版）：人数由「谱特征值间隙」估计（_eigengap_k），
+        silhouette 降级为结构校验（切出的聚类分离度过低 → 判定仅一人）。
 
-        取代旧版固定距离阈值（AUTO_DIST_THRESH）切割：固定阈值对
-        「同性别相近音色」会把两人并成一人、对「录音环境变化大」
-        会把同一人拆成多人——正是实际使用回报的两大症状。
-        固定阈值仅保留给样本数 < 4 的极短音频当 fallback。
+        取代旧版「argmax silhouette 选人数」：silhouette 有经典病态——把一个
+        紧致的大簇继续切开分数反而升高（实测双人 TTS 对话被切成 3 人：
+        k=3 时 sil 0.864 > 正确 k=2 的 0.776，且同一人的子簇心距 0.34 恰好
+        躲过 0.30 的合并线）。特征值间隙对「几个紧致簇」直接计数，单人/
+        双人实测均正确。固定阈值仅保留给样本数 < 4 的极短音频。
 
         返回 1-indexed 标签列表。
         """
@@ -451,23 +483,21 @@ class DiarizationEngine:
         np.fill_diagonal(dist, 0.0)
         Z = linkage(squareform(dist, checks=False), method="average")
 
-        if M < 4:   # 样本太少 silhouette 不可靠 → 退回固定阈值
+        if M < 4:   # 样本太少特征值不可靠 → 退回固定阈值
             return fcluster(Z, t=AUTO_DIST_THRESH,
                             criterion="distance").tolist()
 
-        best_sil, best_labels = -1.0, None
-        for k in range(2, min(MAX_AUTO_SPEAKERS, M - 1) + 1):
-            labels = fcluster(Z, t=k, criterion="maxclust")
-            sil = _silhouette_from_dist(dist, labels)
-            if sil > best_sil:
-                best_sil, best_labels = sil, labels.tolist()
+        k_est = _eigengap_k(emb_mat)
+        if k_est <= 1:
+            return [1] * M      # 单一显著特征值 → 整档视为一位说话者
+        labels = np.asarray(fcluster(Z, t=k_est, criterion="maxclust"))
 
-        if best_labels is None or best_sil < SIL_SINGLE_THRESH:
-            return [1] * M      # 群间分不开 → 整档视为一位说话者
+        # 结构校验：切出的聚类分离度过低（噪声性碎裂）→ 退回一人
+        if _silhouette_from_dist(dist, labels) < SIL_SINGLE_THRESH:
+            return [1] * M
 
         # 第二重防护：群中心距离过近（同一人被拆）→ 反复合并最近的两群。
-        # 实测同一人的子群中心距 ≤0.25、不同人 ≥0.39，0.30 落在空隙中间。
-        labels = np.asarray(best_labels)
+        labels = labels.copy()
         while True:
             uniq = np.unique(labels)
             if len(uniq) < 2:
