@@ -394,14 +394,11 @@
   function mergeSelectedSegments() {
     const idxs = [..._mergeSel].sort((a, b) => a - b);
     if (idxs.length < 2) { logLine("⚠ " + T("merge.needTwo", "请至少选择 2 段")); return; }
-    // 仅允许「相邻 + 同一说话者」的多段合并：跨说话者的对白合并会归到
-    // 同一行，标签无从归属；跨段合并会让时间轴与中间未选段重叠。
-    for (let i = 1; i < idxs.length; i++) {
-      if (idxs[i] !== idxs[i - 1] + 1) { logLine("⚠ " + T("merge.notAdjacent", "所选段落必须相邻")); return; }
-    }
+    // 任意多段合并（不限相邻、不限说话者）：按原顺序拼接所选段；说话者
+    // 不一致 → 合并行不带说话者标签（混合对白归某一人属误导）；不相邻 →
+    // 时间轴取首末包络，中间未选段原样保留（时间重叠由使用者按内容取舍）。
     const segs = idxs.map(i => curSegs[i]);
-    const spk0 = segs[0].speaker;
-    if (segs.some(s => s.speaker !== spk0)) { logLine("⚠ " + T("merge.diffSpeaker", "所选段落说话者不一致")); return; }
+    const spkSet = new Set(segs.map(s => s.speaker ?? null));
     const join = (a, b) => {
       const lat = s => /[A-Za-z]/.test(s);
       return a + (lat(a.slice(-1)) || lat(b[0]) ? " " : "") + b;
@@ -409,11 +406,14 @@
     const merged = {
       start: segs[0].start,
       end: segs[segs.length - 1].end,
-      speaker: spk0,
+      speaker: spkSet.size === 1 ? segs[0].speaker : null,
       text: segs.map(s => s.text).reduce(join),
       words: segs.flatMap(s => s.words || []),
     };
-    curSegs.splice(idxs[0], idxs.length, merged);
+    const sel = new Set(idxs);
+    const kept = curSegs.filter((_s, i) => !sel.has(i));
+    kept.splice(idxs[0], 0, merged);
+    curSegs = kept;
     setMergeMode(false);
     rerenderAfterEdit();
     logLine("✓ " + T("merge.done", "已合并 {n} 段", { n: idxs.length }));
