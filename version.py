@@ -9,12 +9,37 @@
 """
 from __future__ import annotations
 
-__version__ = "2.2.7"
+__version__ = "2.2.8"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.2.8 更新汇总（OCR 代码审查修复：14/15 项采纳）────────────────────────
+#   OCR（OpenCodeReview）审查 v2.2.7 全部提交，15 条意见采纳 14 条：
+#   分离：high——重叠声纹子窗原样流入输出段界：同段相邻不同人窗重叠 1.5s，
+#         app.py 逐段切片转录把重叠区转两遍（字幕重复）。重叠只用于提声纹，
+#         输出前每窗终点收敛到段内下一窗起点；端到端实测对唱 32 段 0 重叠。
+#   分离：贴尾窗与前一窗过近时被丢弃（覆盖最多差 0.6s）→ 改平移上一窗贴尾；
+#         全碎群切割未被跳过（absorb 原样返回时调用端 <2 群检查永不触发）
+#         → 增加 counts.max() 门槛并修正 docstring。
+#   状态：模型加载完成时重读 settings 会把「加载期间改选的模型」误报为
+#         「已加载」→ _load_worker 开始时快照 (identity, labels) 传入
+#         _remember_active，状态字段反映真正加载的模型。
+#   编辑：拆分成功不调 finish()（卡片带焦点被移除不触发 blur）→ 泄漏
+#         document 级 selectionchange 监听与 MutationObserver，成功即显式
+#         finish；拆分文字切点与字界脱节（卡拉OK/ASS \k 串行）→ words 顺序
+#         对齐原文后文字切点跟到同一字边界、按边界精确分派 words（对不齐
+#         退回旧逻辑）；过短段吸附退化时拒绝拆分。
+#   编辑：合并选择模式点笔/剪刀仍进编辑（stopPropagation 挡住卡片分支），
+#         应用合并会以过期索引写坏别的行 → 两入口补 _mergeMode 守卫；
+#         改名中的 chip 点开重新弹切换菜单、选中即销毁改名 → editing 守卫。
+#   界面：clearSel 摘除遮罩（border-box 下 0 宽仍画 2px 残线）；setMergeMode
+#         状态未变早退 + 合并应用路径单次重绘（长字幕 DOM 减半）；历史删除键
+#         补 Enter/Space 键盘激活与 aria-label；.sub-split 补 :focus-visible
+#         显形；i18n.js/bridge.js 缓存版本同步；bridge 历史删除/加载失败
+#         透传真实错误（不再误报「mock 模式」）。
 
 # ── 2.2.7 更新汇总（说话者工作台：自动人数 + 逐行编辑 + 校对播放）────────────
 #   分离：说话者「自动」人数判定二次修复——上一版特征值间隙在真实音频上失效：
