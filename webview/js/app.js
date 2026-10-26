@@ -422,32 +422,72 @@
     return pre.toString().length;
   }
 
-  // 拆分一段；成功返回 true，拆分点无效（null/首/尾）提示后返回 false
+  // 拆分一段；成功返回 true，拆分点无效（null/首/尾/太短）提示后返回 false
   function splitSegment(idx, full, pos) {
     if (pos == null) { logLine("⚠ " + T("edit.splitNeedCaret", "请先点击文本放置光标，再拆分")); return false; }
     const seg = curSegs[idx];
     if (!seg) return false;
-    const L = full.slice(0, pos).trim(), R = full.slice(pos).trim();
-    if (!L || !R) { logLine("⚠ " + T("edit.splitEmpty", "拆分点两侧都需要有文字")); return false; }
     // 切点时间：无字级 → 按字符比例；有字级 → 比例值吸附到最近的字边界
     let t = seg.start + (seg.end - seg.start) * (pos / Math.max(1, full.length));
+    let charCut = pos;                     // 文字切点（full 的字符偏移）
+    let wordsL = null, wordsR = null;      // 有字级且对齐成功时按边界精确分派
     const words = seg.words || [];
     if (words.length) {
-      let best = t, bestD = Infinity;
+      let best = t, bestD = Infinity, bestB = null, bestW = null;
       for (const w of words) for (const b of [w.start, w.end]) {
         const d = Math.abs(b - t);
-        if (d < bestD) { bestD = d; best = b; }
+        if (d < bestD) { bestD = d; best = b; bestB = b; bestW = w; }
       }
       t = Math.max(seg.start + 0.05, Math.min(seg.end - 0.05, best));
+      if (t <= seg.start || t >= seg.end) {   // 过短段落吸附后退化 → 拒绝拆分
+        logLine("⚠ " + T("edit.splitTooShort", "此段太短，无法拆分"));
+        return false;
+      }
+      // 文字切点跟到同一个字边界（words 文本在 full 里顺序对齐），两段的
+      // text 与 words 完全一致 → 卡拉OK/ASS \k 不串行；对不齐则退回
+      // 「比例切点 + 字中点分派」的旧逻辑。
+      const offs = _alignWordOffsets(full, words);
+      if (offs && offs.has(bestW)) {
+        const o = offs.get(bestW);
+        const wi = words.indexOf(bestW);
+        const cut = (bestB === bestW.start) ? wi : wi + 1;   // 边界前的词归左
+        charCut = (bestB === bestW.start) ? o.a : o.b;
+        wordsL = words.slice(0, cut);
+        wordsR = words.slice(cut);
+      }
     }
-    curSegs.splice(idx, 1,
-      { start: seg.start, end: t, speaker: seg.speaker, text: L,
-        words: words.filter(w => (w.start + w.end) / 2 < t) },
-      { start: t, end: seg.end, speaker: seg.speaker, text: R,
-        words: words.filter(w => (w.start + w.end) / 2 >= t) });
+    const L = full.slice(0, charCut).trim(), R = full.slice(charCut).trim();
+    if (!L || !R) { logLine("⚠ " + T("edit.splitEmpty", "拆分点两侧都需要有文字")); return false; }
+    if (wordsL) {
+      curSegs.splice(idx, 1,
+        { start: seg.start, end: t, speaker: seg.speaker, text: L, words: wordsL },
+        { start: t, end: seg.end, speaker: seg.speaker, text: R, words: wordsR });
+    } else {
+      curSegs.splice(idx, 1,
+        { start: seg.start, end: t, speaker: seg.speaker, text: L,
+          words: words.filter(w => (w.start + w.end) / 2 < t) },
+        { start: t, end: seg.end, speaker: seg.speaker, text: R,
+          words: words.filter(w => (w.start + w.end) / 2 >= t) });
+    }
     rerenderAfterEdit();
     logLine("✓ " + T("edit.splitDone", "已拆分为 2 段"));
     return true;
+  }
+
+  // words 文本在 full 里的顺序对齐：逐词 indexOf（扫描位置只前进）。
+  // full 常含 words 没有的标点/空白；任一词对不上 → 返回 null（放弃对齐）。
+  function _alignWordOffsets(full, words) {
+    const map = new Map();
+    let scan = 0;
+    for (const w of words) {
+      const wt = String(w.text || "");
+      if (!wt) continue;
+      const i = full.indexOf(wt, scan);
+      if (i < 0) return null;
+      map.set(w, { a: i, b: i + wt.length });
+      scan = i + wt.length;
+    }
+    return map;
   }
 
   // ── 合并：相邻同说话者的多段 ────────────────────────────────────────
@@ -465,13 +505,15 @@
     $("#merge-ok").disabled = n < 2;
   }
 
-  function setMergeMode(on) {
+  function setMergeMode(on, render = true) {
+    if (_mergeMode === on) return;   // 状态未变 → 免去重复的全量重绘
     _mergeMode = on;
     _mergeSel = new Set();
     const bar = $("#merge-bar"), btn = $("#btn-merge-mode");
     if (btn) { btn.classList.toggle("btn-primary", on); btn.classList.toggle("btn-ghost", !on); }
     if (bar) bar.hidden = !on;
     if (on) updateMergeBar();
+    if (!render) { syncStickyOffset(); return; }   // 稍后由调用方统一重绘
     // 卡片重绘以清除/应用选择态，并让点卡片行为切换
     renderSubs(curSegs);
     _playingIdx = -1;
@@ -501,7 +543,7 @@
       words: segs.flatMap(s => s.words || []),
     };
     curSegs.splice(idxs[0], idxs.length, merged);
-    setMergeMode(false);
+    setMergeMode(false, false);        // 只复位状态与操作栏；重绘交给下面一次完成
     rerenderAfterEdit();
     logLine("✓ " + T("merge.done", "已合并 {n} 段", { n: idxs.length }));
   }
@@ -602,8 +644,8 @@
       if (_mergeMode) { toggleMergeSel(idx, el); return; }   // 合并模式：点卡片＝选择
       if (el.classList.contains("editing")) return;          // 任一编辑模式中：卡片不响应跳播
       const chipEl = e.target.closest(".chip");
-      if (chipEl && s.speaker) {          // 点说话者 chip → 弹切换菜单（不触发跳播）
-        spkSwitchMenu(idx, chipEl);
+      if (chipEl && s.speaker && !chipEl.classList.contains("editing")) {
+        spkSwitchMenu(idx, chipEl);       // 点说话者 chip → 弹切换菜单；改名中的 chip 不响应
         return;
       }
       if (e.target.closest(".sub-edit") || el.classList.contains("editing")) return;
@@ -614,11 +656,16 @@
     // 不让 blur 提前收起模式。
     const editBtn = el.querySelector(".sub-edit");
     editBtn.addEventListener("mousedown", e => e.preventDefault());
-    editBtn.addEventListener("click", e => { e.stopPropagation(); beginEdit(el, idx); });
+    editBtn.addEventListener("click", e => {
+      e.stopPropagation();
+      if (_mergeMode) return;   // 合并选择模式：编辑/拆分入口不可用（stopPropagation
+      beginEdit(el, idx);       // 挡住了卡片的合并分支，须在此自行挡下）
+    });
     const splitBtn = el.querySelector(".sub-split");
     splitBtn.addEventListener("mousedown", e => e.preventDefault());
     splitBtn.addEventListener("click", e => {
       e.stopPropagation();
+      if (_mergeMode) return;
       if (el.classList.contains("editing")) return;   // 拆分模式中的点击由该模式自理
       beginSplitEdit(el, idx);
       logLine("ℹ " + T("edit.splitHow", "点击文本中要拆分的位置，再点亮的 √ 或按 Ctrl+Enter"));
@@ -729,7 +776,10 @@
       txt.blur();
     }
     function doSplit() {
-      if (splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) return;
+      // 成功 → splitSegment 内部的重渲染已把本卡移除（移除聚焦元素不触发
+      // blur），必须显式 finish() 解挂 selectionchange 监听与 MutationObserver，
+      // 否则每次拆分泄漏一套挂在 document 上的闭包（钉住已脱离的卡片 DOM）。
+      if (splitSegment(idx, txt.textContent || "", caretOffsetIn(txt, "start"))) { finish(); return; }
       txt.classList.remove("split-hint");   // 失败 → 闪红提示，留在拆分模式
       void txt.offsetWidth;
       txt.classList.add("split-hint");
@@ -838,8 +888,8 @@
 
   function clearSel() {
     selRange = null;
-    const ov = $("#wave-sel"); if (ov) ov.style.width = "0%";
-    _subEls.forEach(el => el.classList.remove("sel"));
+    const ov = $("#wave-sel"); if (ov) ov.remove();   // 摘除而非缩为 0 宽：
+    _subEls.forEach(el => el.classList.remove("sel")); // border-box 下 0 宽仍画 2px 边框残线
     _blockEls.forEach(el => el.classList.remove("sel"));
   }
   function cleanupAudio() {
@@ -1454,9 +1504,15 @@
       const when = new Date(it.mtime * 1000).toLocaleString();
       el.innerHTML = `<span class="hn">${escapeHtml(it.name)}</span>
         <span class="hm">${when} · ${Math.max(1, Math.round(it.size / 1024))} KB</span>
-        <span class="hx" role="button" tabindex="0" title="${T("file.historyDel", "删除（到回收站）")}">
+        <span class="hx" role="button" tabindex="0" aria-label="${T("file.historyDel", "删除（到回收站）")}" title="${T("file.historyDel", "删除（到回收站）")}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
         </span>`;
+      // span[role=button] 无默认激活行为：补 Enter/Space 键盘删除
+      el.addEventListener("keydown", e => {
+        if (e.target.closest(".hx") && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault(); e.stopPropagation(); deleteHistoryItem(it, el);
+        }
+      });
       el.addEventListener("click", async e => {
         if (e.target.closest(".hx")) { deleteHistoryItem(it, el); return; }
         try {

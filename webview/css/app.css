@@ -480,7 +480,8 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
   color: var(--faint); cursor: pointer; display: grid; place-items: center;
   opacity: 0; transition: opacity .12s, background .12s, color .12s, border-color .12s;
 }
-.sub-card:hover .sub-split, .sub-card.editing .sub-split { opacity: 1; }
+.sub-card:hover .sub-split, .sub-card.editing .sub-split,
+.sub-card .sub-split:focus-visible { opacity: 1; }
 .sub-split:hover { background: var(--accent-tint); color: var(--accent-strong); border-color: var(--accent-soft); }
 .sub-split svg { width: 14px; height: 14px; }
 /* 图标随编辑态切换：未编辑＝剪刀（入口）；编辑中＝√（点亮可切） */

@@ -70,6 +70,7 @@
     "edit.splitHow": ["点击文本中要拆分的位置，再点亮的 √ 或按 Ctrl+Enter", "Click where to split in the text, then the lit ✓ (or Ctrl+Enter)"],
     "edit.splitNeedCaret": ["请先点击文本放置光标，再拆分", "Click in the text to place the caret first"],
     "edit.splitEmpty": ["拆分点两侧都需要有文字", "Both sides of the split need text"],
+    "edit.splitTooShort": ["此段太短，无法拆分", "This line is too short to split"],
     "edit.splitDone": ["已拆分为 2 段", "Split into 2 segments"],
     "merge.mode": ["合并段落", "Merge segments"],
     "merge.selCount": ["已选 {n} 段 · 需相邻且同一说话者", "{n} selected · must be adjacent, same speaker"],

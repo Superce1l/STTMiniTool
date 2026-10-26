@@ -472,6 +472,9 @@ class WebBackend:
         from applog import log_model, log_error
         backend = self._persisted_backend()           # openvino / crispasr
         eng_label, model_label = self._current_selection()
+        # 快照本次加载的选择：加载（含下载）期间 set_model 仍可写入 settings
+        # （「选择本身仍被记住」），完成时若重读会把「已选」误当「已加载」。
+        load_identity = self._identity_for(backend, self._settings_raw())
         log_model(f"开始加载：{eng_label} · {model_label}（backend={backend}）")
         old_engine = getattr(self, "engine", None) if self._loaded else None
         try:
@@ -485,7 +488,8 @@ class WebBackend:
                         self._load_openvino()
                     self._loaded = True
                     self._active_backend = backend
-                    self._remember_active(backend)
+                    self._remember_active(backend, load_identity,
+                                          (eng_label, model_label))
                     self._load_err = None                 # 成功加载后清掉上次失败的错误残留
                     self._release_engine(old_engine)      # 新引擎就绪，此时才释放旧的
                     old_engine = None
@@ -1361,11 +1365,17 @@ class WebBackend:
 
     # ── 模型下拉（核心 + 模型）＋ 识别语言 ─────────────────────────────
     #   持久化后走「切换=重启」(同 set_backend 的理由：避免就地切核心死机)。
-    def _remember_active(self, backend: str):
-        """记住「实际加载」的选择识别码与标签（字幕文件名/日志标注用）。"""
+    def _remember_active(self, backend: str, identity=None, labels=None):
+        """记住「实际加载」的选择识别码与标签（字幕文件名/日志标注用）。
+
+        identity/labels 缺省时读当下 settings——仅适用于加载中不存在选择
+        漂移的路径（如加载失败退回 OpenVINO：退回动作本身就用的当前设置）。
+        正常加载请传 _load_worker 开始时拍下的快照。
+        """
         self._active_backend = backend
-        self._active_identity = self._identity_for(backend, self._settings_raw())
-        self._active_label = self._current_selection()
+        self._active_identity = (identity if identity is not None
+                                 else self._identity_for(backend, self._settings_raw()))
+        self._active_label = labels if labels is not None else self._current_selection()
 
     def _identity_for(self, backend: str, s: dict):
         """把 (backend + 相关 settings) 化为可比较的识别码（决定要不要重启）。"""

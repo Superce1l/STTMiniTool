@@ -142,12 +142,18 @@
       return { items: [] };
     },
     async loadHistory(name) {
-      if (MODE === "web") { try { return await apiPost("/api/history-load", { name }); } catch {} }
+      if (MODE === "web") {
+        try { return await apiPost("/api/history-load", { name }); }
+        catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+      }
       return { ok: false, error: "history unavailable in mock mode" };
     },
     // 删除一个历史字幕文件（Windows 到回收站）；返回 {ok, recycled}
     async deleteHistory(name) {
-      if (MODE === "web") { try { return await apiPost("/api/history-delete", { name }); } catch {} }
+      if (MODE === "web") {
+        try { return await apiPost("/api/history-delete", { name }); }
+        catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+      }
       return { ok: false, error: "history unavailable in mock mode" };
     },
 

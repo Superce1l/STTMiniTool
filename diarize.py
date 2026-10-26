@@ -95,8 +95,10 @@ def _subwindows(t0: float, t1: float,
         starts.append(t1 - win)
     dedup = [starts[0]]
     for s in starts[1:]:
-        if s - dedup[-1] > hop * 0.4:         # 贴尾窗与前一窗过近时只留一个
-            dedup.append(s)
+        if s - dedup[-1] > hop * 0.4:         # 贴尾窗与前一窗过近时不再另起一窗，
+            dedup.append(s)                   # 改为把上一窗平移贴尾，保证覆盖到 t1
+        elif s == t1 - win:
+            dedup[-1] = s
     return [(s, s + win) for s in dedup]
 
 
@@ -106,7 +108,7 @@ def _absorb_tiny(labels: np.ndarray, emb: np.ndarray,
 
     间奏、换气、伴奏残留等杂讯窗在深切割下会自成一群，把「群心两两
     够远」的判定干扰成假说话者；先吸收再判定。一个够大群都没有时
-    原样返回（交由调用端的 <2 群分支跳过该切割）。
+    原样返回——调用端须以 counts.max() 检查拒绝该切割。
     """
     labels = labels.copy()
     uniq, counts = np.unique(labels, return_counts=True)
@@ -388,8 +390,15 @@ class DiarizationEngine:
             nrm = np.linalg.norm(c)
             centroids[lbl] = c / nrm if nrm > 1e-9 else c
 
+        # 输出段界：子窗的 50% 重叠仅用于提声纹，对外边界须互不重叠——
+        # 同段相邻窗原样输出会重叠 win-hop=1.5s，app.py 逐段切片转录会把
+        # 重叠区转两遍（字幕重复）。把每窗终点收敛到段内下一窗的起点。
+        spans = [(w0, w1) for (_, w0, w1, _) in units]
+        for j in range(len(spans) - 1):
+            if units[j + 1][0] == units[j][0]:    # 同一原始段落的相邻窗
+                spans[j] = (spans[j][0], min(spans[j][1], spans[j + 1][0]))
         placed: list[tuple[float, float, int]] = [
-            (w0, w1, lbl) for (_, w0, w1, _), lbl in zip(units, labels)
+            (a, b, lbl) for (a, b), lbl in zip(spans, labels)
         ]
         for t0, t1, emb in shorts:
             if emb is not None:                # ≥0.5 秒：最近群中心
@@ -499,8 +508,9 @@ class DiarizationEngine:
         for k in range(min(MAX_AUTO_SPEAKERS, M - 1), 1, -1):
             labels = _absorb_tiny(
                 np.asarray(fcluster(Z, t=k, criterion="maxclust")), emb_mat)
-            if len(np.unique(labels)) < 2:
-                continue
+            uniq, counts = np.unique(labels, return_counts=True)
+            if len(uniq) < 2 or counts.max() < TINY_CLUSTER_WINDOWS:
+                continue    # 不足两群，或全是碎群（无够大群）→ 切割不可信
             if _min_centroid_dist(emb_mat, labels) >= SPLIT_SURE_DIST:
                 return labels.tolist()
         return [1] * M
