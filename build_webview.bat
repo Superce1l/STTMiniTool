@@ -1,16 +1,25 @@
 @echo off
 REM =======================================================
-REM  Qwen3 ASR - WebView edition build (PyInstaller, ONEFILE)
+REM  Qwen3 ASR - WebView edition build (PyInstaller, ONEDIR)
 REM
-REM  Builds app_webview.py into a single-file exe:
-REM    dist2\STTMiniTool\STTMiniTool.exe   (one .exe, no _internal)
+REM  Builds app_webview.py into a directory-based exe:
+REM    dist2\STTMiniTool\STTMiniTool.exe  +  dist2\STTMiniTool\_internal\
 REM
-REM  WHY ONEFILE (not onedir): with onedir, the many loose DLLs inherit
-REM  Mark-of-the-Web (MOTW) when the distributed zip is extracted (7zip /
-REM  Explorer). .NET then refuses to load MOTW-tagged assemblies, so
-REM  pythonnet/clr fails and pywebview silently falls back to Edge. Onefile
-REM  extracts its DLLs to a temp dir at runtime WITHOUT MOTW, and the user
-REM  only has to Unblock one .exe. See memory motw-onefile-packaging.
+REM  WHY ONEDIR (switched back from onefile in 2.2.9): onefile extracted
+REM  the whole runtime (several hundred MB) into C:\ %TEMP%\_MEIxxxx at
+REM  EVERY launch - users with small C: drives saw their disk fill up
+REM  (issue #3). onedir keeps files next to the exe: zero extraction,
+REM  faster startup, no temp litter.
+REM
+REM  WHY IT WAS ONEFILE BEFORE (MOTW): loose DLLs from a downloaded zip
+REM  inherit Mark-of-the-Web (Zone.Identifier). .NET refuses to load
+REM  MOTW-tagged assemblies, so pythonnet/clr fails and pywebview silently
+REM  falls back to Edge. FIX (motw_unblock.py): at startup - BEFORE any
+REM  clr load - the app deletes the Zone.Identifier ADS from every file in
+REM  its own directory (user-writable, no admin needed). One downside
+REM  remains: SmartScreen shows "Run anyway" on first launch of the MOTW-
+REM  tagged exe (same as onefile did); the self-unblock clears the exe's
+REM  own MOTW too, so later launches start clean.
 REM
 REM  The WebView UI = local stdlib HTTP server (webview_server.py) that
 REM  serves the webview\ folder + /api, opened in a native WebView2 window
@@ -52,15 +61,15 @@ IF NOT EXIST "%SRC%\ov_models\silero_vad_v4.onnx" (
 )
 
 echo.
-echo === Step 3: Build WebView edition (onefile) ===
-REM Clean the whole output folder so a stale onedir _internal\ never lingers.
+echo === Step 3: Build WebView edition (onedir) ===
+REM Clean the whole output folder so stale exe/_internal never lingers.
 IF EXIST "%SRC%\dist2\STTMiniTool" rmdir /S /Q "%SRC%\dist2\STTMiniTool"
+IF EXIST "%SRC%\dist2\STTMiniTool-v*.zip" del /Q "%SRC%\dist2\STTMiniTool-v*.zip"
 
 %PYTHON% -m PyInstaller ^
-    --onefile ^
     --windowed ^
     --name "STTMiniTool" ^
-    --distpath "%SRC%\dist2\STTMiniTool" ^
+    --distpath "%SRC%\dist2" ^
     --icon "%SRC%\assets\icon.ico" ^
     --add-data "%SRC%\assets\icon.ico;." ^
     --add-data "%OV_PKG%;openvino" ^
@@ -86,6 +95,7 @@ IF EXIST "%SRC%\dist2\STTMiniTool" rmdir /S /Q "%SRC%\dist2\STTMiniTool"
     --add-data "%SRC%\processor_numpy.py;." ^
     --add-data "%SRC%\proc_guard.py;." ^
     --add-data "%SRC%\applog.py;." ^
+    --add-data "%SRC%\motw_unblock.py;." ^
     --runtime-hook "%SRC%\runtime_hook_utf8.py" ^
     --collect-all webview ^
     --collect-all pythonnet ^
@@ -123,6 +133,7 @@ IF EXIST "%SRC%\dist2\STTMiniTool" rmdir /S /Q "%SRC%\dist2\STTMiniTool"
     --hidden-import fa_aligner ^
     --hidden-import proc_guard ^
     --hidden-import applog ^
+    --hidden-import motw_unblock ^
     --hidden-import diarize ^
     --hidden-import audio_io ^
     --exclude-module torch ^
@@ -171,8 +182,27 @@ REM https://huggingface.co/dseditor/Collection/resolve/main/ffmpeg.zip
 REM (downloader.download_ffmpeg), so no ffmpeg.exe is copied here.
 
 echo.
+echo === Step 4: Package release zip (STTMiniTool-vVERSION-windows.zip) ===
+REM Zip the app folder itself (top-level STTMiniTool\ inside the zip) with
+REM PowerShell Compress-Archive. Users extract -\> STTMiniTool\ and run
+REM STTMiniTool.exe inside; first launch self-unblocks MOTW (motw_unblock.py).
+FOR /F "usebackq delims=" %%v IN (`%PYTHON% -c "import version; print(version.__version__)"`) DO SET VER=%%v
+IF "%VER%"=="" GOTO :zip_failed
+echo  version: %VER%
+IF EXIST "%SRC%\dist2\STTMiniTool-v%VER%-windows.zip" del /Q "%SRC%\dist2\STTMiniTool-v%VER%-windows.zip"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Compress-Archive -Path '%SRC%\dist2\STTMiniTool' -DestinationPath '%SRC%\dist2\STTMiniTool-v%VER%-windows.zip' -CompressionLevel Optimal"
+IF ERRORLEVEL 1 GOTO :zip_failed
+
+echo.
 echo  Done: dist2\STTMiniTool\STTMiniTool.exe
+echo        dist2\STTMiniTool-v%VER%-windows.zip
 GOTO :eof
+
+:zip_failed
+echo.
+echo  ERROR: release zip packaging FAILED.
+EXIT /B 1
 
 :dep_failed
 echo.

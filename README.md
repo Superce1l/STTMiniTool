@@ -307,7 +307,8 @@ ffmpeg_utils.py         # ffmpeg 检测与音轨提取
 cli_mode.py             # 无头 CLI（transcribe / apply / status / profiles）
 proc_guard.py           # Windows Job Object：主进程退出连带终止子进程
 version.py              # 版本单一事实来源
-build_webview.bat       # PyInstaller onefile 打包（WebView EXE）
+build_webview.bat       # PyInstaller onedir 打包（WebView EXE + 发行 zip）
+motw_unblock.py         # 启动自清 Mark-of-the-Web（onedir 发行版必需）
 assets/make_icon.py     # 图标生成（SVG → PNG/ICO，语音转文字图标）
 ```
 
@@ -329,10 +330,13 @@ python app_webview.py          # 启动 WebView 界面
 ### 打包 EXE
 
 ```bash
-build_webview.bat              # 产出 dist2\STTMiniTool\STTMiniTool.exe
+build_webview.bat              # 产出 dist2\STTMiniTool\（EXE + _internal\）
+                               # 与发行包 dist2\STTMiniTool-v版本-windows.zip
 ```
 
 > ⚠️ 安装路径请使用**全英文**（例如 `C:\STTMiniTool`），含中文字符可能无法正常运行。
+>
+> 📦 发行包为**目录版**（EXE + `_internal\` 同层，不写 C 盘临时目录）。首次运行若 SmartScreen 提示，点「更多信息 → 仍要运行」即可——程序启动时会自动解除锁定（清掉解压带来的 MOTW 标记），之后直接双击运行。
 
 ---
 

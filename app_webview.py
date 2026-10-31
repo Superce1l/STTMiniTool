@@ -433,6 +433,18 @@ def _cli_argv() -> list[str] | None:
 
 
 def main():
+    # ── MOTW 自清（onedir 发行版必需，必须最先执行）─────────────────────
+    #   发行 zip 解压时 Zone.Identifier 落到 _internal 的每个 DLL，.NET 拒载
+    #   带 MOTW 的程序集 → pythonnet/clr 失败、pywebview 静默回退 Edge。
+    #   onefile 时代 DLL 运行时解压到 %TEMP% 无 MOTW 天然免疫；onedir 改为
+    #   启动自清（详见 motw_unblock）。要在 clr 载入前 → 放 main() 第一行，
+    #   CLI 分支之前（顺带让 CLI 也能清）。
+    try:
+        from motw_unblock import unblock_app_files
+        unblock_app_files()
+    except Exception:
+        pass
+
     # ── 无头 CLI 模式（给外部 Agent／脚本）──────────────────────────────
     #   带子命令就完全不开窗口、不起 server，执行完即退出并返回退出码。
     cli = _cli_argv()
