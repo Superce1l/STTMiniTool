@@ -609,6 +609,17 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
   .hc-item .hi-detail { max-width: 100%; white-space: normal; margin-left: 26px; text-align: left; }
 }
 
+/* 检查明细（「模型未下载」的判定依据：实际检查的目录 + 缺哪些文件） */
+.model-check {
+  margin-top: 10px; padding: 9px 12px;
+  background: var(--panel); border: 1px solid var(--warn-line);
+  border-radius: var(--r-card); box-shadow: var(--shadow-sm);
+  font-size: 12px; line-height: 1.8; color: var(--ink-2);
+  overflow-wrap: anywhere; min-width: 0;
+}
+.model-check .mc-line code { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); }
+.model-check .mc-warn { color: var(--warn-fg); }
+
 /* QR + 网址并排 */
 .qr-row { display: flex; gap: 14px; align-items: center; }
 .qr-side { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 7px; }

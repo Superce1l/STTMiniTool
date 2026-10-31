@@ -476,6 +476,11 @@ class WebBackend:
         # （「选择本身仍被记住」），完成时若重读会把「已选」误当「已加载」。
         load_identity = self._identity_for(backend, self._settings_raw())
         log_model(f"开始加载：{eng_label} · {model_label}（backend={backend}）")
+        # 解析后的实际目录留痕：「明明有模型却说未下载」类反馈的第一排查点
+        # （settings 残留 model_dir／crispasr_dir 指向别处时，此处一眼可见）。
+        log_model(f"模型目录：{self._model_dir()}")
+        if backend == "crispasr":
+            log_model(f"CrispASR 目录：{self._crispasr_dir()}")
         old_engine = getattr(self, "engine", None) if self._loaded else None
         try:
             with self._lock:
@@ -564,21 +569,31 @@ class WebBackend:
     def _st(self, m):
         self._emit("progress", {"pct": 0, "status": m})
 
+    @staticmethod
+    def _log_missing(label: str, root, missing: list):
+        """触发补下载时的缺失清单留痕（logs/ 供远程排查；截前 4 个防刷屏）。"""
+        from applog import log_model
+        head = ", ".join(str(m) for m in missing[:4])
+        more = f" 等 {len(missing)} 个" if len(missing) > 4 else ""
+        log_model(f"{label}缺 {len(missing)} 个文件（{root}）：{head}{more}")
+
     def _load_openvino(self):
         s = self._settings_raw()
         model_dir = Path(s.get("model_dir", str(core._DEFAULT_MODEL_DIR)))
         use_17b = "1.7B" in s.get("cpu_model_size", "0.6B")
         cpu_threads = int(s.get("cpu_threads", 0) or 0)
         if use_17b:
-            from downloader import quick_check_1p7b, download_1p7b
+            from downloader import quick_check_1p7b, download_1p7b, missing_files_1p7b
             if not quick_check_1p7b(model_dir):
+                self._log_missing("1.7B 模型", model_dir, missing_files_1p7b(model_dir))
                 self._st("下载 1.7B 模型（约 4.3 GB）…")
                 download_1p7b(model_dir, progress_cb=self._dl_progress)
         else:
             # 0.6B：文件缺失时按需补齐（含 VAD onnx）。此前只靠开发环境手工放置，
             # 干净机器上选 0.6B 会直接在 eng.load 崩溃（找不到 audio_encoder_model.xml）。
-            from downloader import quick_check, download_all
+            from downloader import quick_check, download_all, missing_files
             if not quick_check(model_dir):
+                self._log_missing("0.6B 模型", model_dir, missing_files(model_dir))
                 self._st("下载 0.6B 模型（约 1.2 GB）…")
                 download_all(model_dir, progress_cb=self._dl_progress)
         eng = core.ASREngine1p7B() if use_17b else core.ASREngine()
@@ -591,7 +606,8 @@ class WebBackend:
                                 quick_check_whisper_ggml, download_whisper_ggml,
                                 whisper_ggml_filename,
                                 quick_check_aligner_gguf, download_aligner_gguf,
-                                aligner_gguf_filename, crispasr_gpu_backend)
+                                aligner_gguf_filename, crispasr_gpu_backend,
+                                crispasr_core_issue)
         s = self._settings_raw()
         crispasr_dir = self._crispasr_dir()
         crisp_model = s.get("crisp_model", "whisper")    # whisper / qwen3 / qwen3-ja
@@ -604,6 +620,9 @@ class WebBackend:
         # 一律需要。带 variant 检查 → 版本升级或使用者改选加速版本时都会判定为
         # 「不就绪」而重新下载对应的 zip——即「下载并加载模型」时一并取得加速器。
         if not quick_check_crispasr(crispasr_dir, variant):
+            from applog import log_model
+            issue = crispasr_core_issue(crispasr_dir, variant) or "缺 crispasr.exe"
+            log_model(f"CrispASR 加速器不就绪（{crispasr_dir}）：{issue} → 重新下载 zip")
             self._st(f"下载 CrispASR 加速器（{variant}）…")
             download_crispasr_core(crispasr_dir, progress_cb=self._dl_progress,
                                    variant=variant)
@@ -619,6 +638,8 @@ class WebBackend:
             model_path = model_dir / fname_fn(qquant)
             if not check_fn(model_dir, qquant):
                 _note = _QWEN_CASR_NOTE.get(crisp_model, "")
+                self._log_missing(f"Qwen3-ASR-1.7B{_note} {qquant.upper()} GGUF",
+                                  model_dir, [fname_fn(qquant)])
                 self._st(f"下载 Qwen3-ASR-1.7B{_note} {qquant.upper()} GGUF…")
                 download_fn(model_dir, qquant, progress_cb=self._dl_progress)
         else:
@@ -627,6 +648,8 @@ class WebBackend:
             size = s.get("whisper_size", "base")
             model_path = crispasr_dir / whisper_ggml_filename(size)
             if not quick_check_whisper_ggml(crispasr_dir, size):
+                self._log_missing(f"Whisper（{size}）GGML", crispasr_dir,
+                                  [whisper_ggml_filename(size)])
                 self._st(f"下载 OpenAI Whisper（{size}）模型…")
                 download_whisper_ggml(crispasr_dir, size, progress_cb=self._dl_progress)
         aligner_path = None
@@ -657,6 +680,7 @@ class WebBackend:
             active_identity is not None
             and active_identity != self._identity_for(self._persisted_backend(),
                                                       self._settings_raw()))
+        selected_ready = self.selected_model_present()
         return {
             "modelReady": bool(getattr(self.engine, "ready", False)),
             "loading": self._loading,
@@ -671,7 +695,9 @@ class WebBackend:
             # 是否已有「任一组」模型下载完成（信息用）
             "hasAnyModel": self._has_any_model(),
             # 目前选择的模型是否已就绪 → 前端决定开始页（就绪=语音转文字／否=模型页等下载）
-            "selectedReady": self.selected_model_present(),
+            "selectedReady": selected_ready,
+            # 未就绪时的判定依据（检查了哪个目录、缺哪些文件）；就绪时为 None
+            "selectedDetail": None if selected_ready else self._selected_model_detail(),
             # 左下角状态点用：实际加载的模型 vs 当前选择的模型
             "activeModel": f"{loaded[0]} · {loaded[1]}" if loaded else None,
             "selectedModel": " · ".join(self._current_selection()),
@@ -733,6 +759,50 @@ class WebBackend:
         except Exception:
             traceback.print_exc()
         return False
+
+    def _selected_model_detail(self) -> dict:
+        """目前所选模型的检查明细：判定的目录 + 缺了哪些文件。
+
+        「模型未下载」提示的判定依据展示：quick_check 家族只回真假，使用者
+        看到「未下载」却无法核对程序到底查了哪个目录、缺什么（用户反馈实录：
+        ov_models 明明有模型，重启后仍提示重新下载——多为 settings 残留
+        model_dir 指向别处、或所选模型与目录里的文件不是同一套）。只在
+        selected_model_present() 为 False 时由 get_status() 调用，正常就绪
+        零开销。missing 相对 model_dir，missingCrispasr 相对 crispasr_dir。
+        """
+        from downloader import (quick_check, quick_check_1p7b, quick_check_crispasr,
+                                quick_check_whisper_ggml, missing_files,
+                                missing_files_1p7b, missing_files_whisper_ggml,
+                                missing_files_qwen3_asr_gguf,
+                                missing_files_qwen3_asr_ja_gguf, crispasr_core_issue)
+        s = self._settings_raw()
+        be = s.get("backend", "openvino")
+        model_dir = self._model_dir()
+        detail = {"backend": be, "modelDir": str(model_dir),
+                  "crispasrDir": None, "missing": [],
+                  "missingCrispasr": [], "coreIssue": ""}
+        if be == "openvino":
+            if "1.7B" in s.get("cpu_model_size", "0.6B"):
+                if not quick_check_1p7b(model_dir):
+                    detail["missing"] = missing_files_1p7b(model_dir)
+            elif not quick_check(model_dir):
+                detail["missing"] = missing_files(model_dir)
+            return detail
+        cd = self._crispasr_dir()
+        detail["crispasrDir"] = str(cd)
+        if not quick_check_crispasr(cd):        # 与 selected_model_present 同口径：不带 variant
+            detail["coreIssue"] = crispasr_core_issue(cd)
+        cm = s.get("crisp_model", "whisper")
+        if cm in _QWEN_CASR_MODELS:
+            quant = s.get("crisp_qwen_quant", "q8")
+            miss = (missing_files_qwen3_asr_ja_gguf(model_dir, quant)
+                    if cm == "qwen3-ja"
+                    else missing_files_qwen3_asr_gguf(model_dir, quant))
+            detail["missing"] = miss
+        else:
+            detail["missingCrispasr"] = missing_files_whisper_ggml(
+                cd, s.get("whisper_size", "base"))
+        return detail
 
     def _has_any_model(self) -> bool:
         """机器上是否已有任一可用模型（任一核心任一量化）。供首启页面决策。"""

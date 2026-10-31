@@ -1107,6 +1107,74 @@ def full_verify(model_dir: Path, progress_cb=None) -> tuple[bool, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 缺失文件清单（诊断用）
+#   quick_check 只回真假；「明明有模型却说未下载」这类反馈需要看得见
+#   判定依据：程序查的是哪个目录、具体缺了哪些文件（用户反馈实录：
+#   ov_models 有模型仍提示重新下载）。清单与各 quick_check 完全同一套
+#   必要文件口径，路径相对各自根目录，空清单 = 对应 quick_check 通过。
+# ══════════════════════════════════════════════════════════════════════
+
+def missing_files(model_dir: Path) -> list[str]:
+    """0.6B 必要文件缺了哪些（相对 model_dir；VAD onnx 在根层）。"""
+    ov_dir, vad_path = _get_paths(model_dir)
+    reqs = [(vad_path.name, vad_path)]
+    reqs += [(f"{ov_dir.name}/{n}", ov_dir / n) for n in REQUIRED_BIN]
+    reqs += [(f"{ov_dir.name}/{n}", ov_dir / n) for n in REQUIRED_OTHER]
+    return [rel for rel, p in reqs if not _file_is_real(p)]
+
+
+def missing_files_1p7b(model_dir: Path) -> list[str]:
+    """1.7B KV-cache 必要文件缺了哪些（相对 model_dir）。"""
+    kv_dir = model_dir / "qwen3_asr_1p7b_kv_int8"
+    names = _1P7B_REQUIRED_BIN + _1P7B_REQUIRED_OTHER
+    return [f"{kv_dir.name}/{n}" for n in names if not _file_is_real(kv_dir / n)]
+
+
+def missing_files_whisper_ggml(crispasr_dir: Path,
+                               size: str = _WHISPER_DEFAULT_SIZE) -> list[str]:
+    """指定尺寸的 Whisper GGML 缺了哪些（相对 crispasr_dir）。"""
+    fname = whisper_ggml_filename(size)
+    d = Path(crispasr_dir)
+    return [] if _file_is_real(d / fname) else [fname]
+
+
+def missing_files_qwen3_asr_gguf(model_dir: Path,
+                                 quant: str = _QWEN3_ASR_GGUF_DEFAULT) -> list[str]:
+    """指定量化的 Qwen3-ASR-1.7B GGUF 缺了哪些（相对 model_dir）。"""
+    fname = qwen3_asr_gguf_filename(quant)
+    return [] if _gguf_is_real(Path(model_dir) / fname) else [fname]
+
+
+def missing_files_qwen3_asr_ja_gguf(model_dir: Path,
+                                    quant: str = _QWEN3_ASR_JA_GGUF_DEFAULT) -> list[str]:
+    """指定量化的 ja-anime GGUF 缺了哪些（相对 model_dir）。"""
+    fname = qwen3_asr_ja_gguf_filename(quant)
+    return [] if _gguf_is_real(Path(model_dir) / fname) else [fname]
+
+
+def crispasr_core_issue(crispasr_dir: Path, variant: str | None = None) -> str:
+    """CrispASR 核心不就绪的原因（就绪回空串）。
+
+    quick_check_crispasr 只回真假；诊断展示要区分「缺 exe」与「版本／
+    加速版本不符」——后者正是「重启后提示重新下载」的常见来源（上游发了
+    新 release）。判定口径与 quick_check_crispasr 一致。
+    """
+    crispasr_dir = Path(crispasr_dir)
+    if not ((crispasr_dir / "crispasr.exe").exists()
+            or any(crispasr_dir.glob("**/crispasr.exe"))):
+        return "缺 crispasr.exe"
+    if variant is None:
+        return ""
+    info = installed_crispasr_info(crispasr_dir)
+    if info["version"] != crispasr_version():
+        return (f"版本不符：已装 {info['version'] or '未知'}，"
+                f"需 {crispasr_version()}")
+    if info["variant"] != variant:
+        return f"加速版本不符：已装 {info['variant'] or '未知'}，当前选 {variant}"
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 直接 HTTP 下载（断点续传）
 # ══════════════════════════════════════════════════════════════════════
 

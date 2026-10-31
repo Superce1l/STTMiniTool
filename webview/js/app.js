@@ -73,9 +73,23 @@
   function statusTip(s) {
     if (s.loading) return T("status.tipLoading", "正在下载／加载模型…");
     if (!s.modelReady) {
-      return s.selectedReady === false
-        ? T("status.tipNotDownloaded", "所选模型尚未下载——到「模型」页点「下载并加载模型」")
-        : T("status.tipNotLoaded", "模型文件已备——到「模型」页点「下载并加载模型」");
+      if (s.selectedReady === false) {
+        // 带判定依据：程序检查的目录 + 缺哪些文件（「明明有模型却说未下载」自查）
+        const d = s.selectedDetail;
+        if (d) {
+          let tip = T("status.tipNotDownloadedDir",
+                      "所选模型尚未下载——程序检查的目录：\n{dir}", { dir: d.modelDir });
+          if (d.coreIssue)
+            tip += "\n" + T("status.tipCoreIssue", "加速器：{issue}", { issue: d.coreIssue });
+          const miss = (d.missing || []).concat(d.missingCrispasr || []);
+          if (miss.length)
+            tip += "\n" + T("status.tipMissing", "缺少：{files}", { files:
+              miss.slice(0, 3).join("、") + (miss.length > 3 ? "…" : "") });
+          return tip;
+        }
+        return T("status.tipNotDownloaded", "所选模型尚未下载——到「模型」页点「下载并加载模型」");
+      }
+      return T("status.tipNotLoaded", "模型文件已备——到「模型」页点「下载并加载模型」");
     }
     if (s.selectionDiffers) {
       return T("status.tipSwitch", "已加载：{loaded}\n已选择：{sel}\n到「模型」页点「下载并加载模型」完成切换",
@@ -1164,8 +1178,36 @@
   }
   $("#btn-health-recheck") && $("#btn-health-recheck").addEventListener("click", renderHealth);
 
+  // ── 检查明细：「模型未下载」的判定依据 ────────────────────────────
+  //   后端 selectedDetail 只在所选模型不就绪时返回（就绪时 null → 整块隐藏）。
+  //   显示程序实际检查的目录与缺失文件——settings 残留 model_dir 指向别处、
+  //   目录里放的不是所选模型这类问题，一眼看出（用户反馈实录：ov_models
+  //   明明有模型，重启后仍提示重新下载）。
+  async function renderModelCheck() {
+    const el = $("#model-check");
+    if (!el) return;
+    try {
+      const st = await API.getStatus();
+      const d = st && st.selectedDetail;
+      if (!d) { el.hidden = true; el.innerHTML = ""; return; }
+      let html = `<div class="mc-line">${escapeHtml(T("model.checkDir", "程序检查的模型目录："))}<code>${escapeHtml(d.modelDir)}</code></div>`;
+      if (d.crispasrDir)
+        html += `<div class="mc-line">${escapeHtml(T("model.checkCoreDir", "CrispASR 核心目录："))}<code>${escapeHtml(d.crispasrDir)}</code></div>`;
+      if (d.coreIssue)
+        html += `<div class="mc-line mc-warn">${escapeHtml(T("model.checkCoreIssue", "加速器：{issue}", { issue: d.coreIssue }))}</div>`;
+      const miss = d.missing || [], missC = d.missingCrispasr || [];
+      if (miss.length)
+        html += `<div class="mc-line">${escapeHtml(T("model.checkMissing", "缺少 {n} 个文件：", { n: miss.length }))}<code>${escapeHtml(miss.slice(0, 4).join("、"))}${miss.length > 4 ? "…" : ""}</code></div>`;
+      if (missC.length)
+        html += `<div class="mc-line">${escapeHtml(T("model.checkMissingCore", "核心目录缺少 {n} 个文件：", { n: missC.length }))}<code>${escapeHtml(missC.join("、"))}</code></div>`;
+      el.innerHTML = html;
+      el.hidden = false;
+    } catch (e) { el.hidden = true; }
+  }
+
   async function renderModel() {
     renderHealth();
+    await renderModelCheck();
     // 核心卡 + 模型下拉
     try {
       _modelOpt = await API.getModelOptions();
