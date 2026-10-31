@@ -9,12 +9,32 @@
 """
 from __future__ import annotations
 
-__version__ = "2.2.8"
+__version__ = "2.2.9"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.2.9 更新汇总（发行版改 onedir + 「模型未下载」判定依据可见）────────────
+#   发行：onefile → onedir。onefile 每次启动把整个运行时（数百 MB）解压到
+#         C 盘 %TEMP%\_MEIxxxx（用户反馈实录 #3：C 盘被占、以为模型下到了
+#         C 盘），onedir 的文件直接躺在程序目录——零解压、启动更快、不留
+#         临时垃圾。当初选 onefile 的理由（zip 解压的 MOTW 让 .NET 拒载
+#         pythonnet/WebView2 程序集 → pywebview 静默回退 Edge）以启动自清
+#         解决：motw_unblock.unblock_app_files() 在任何 clr 载入前遍历程序
+#         目录删每个文件的 Zone.Identifier ADS（用户目录可写，无需管理员；
+#         顺带清 exe 本体 → 第二次启动不再弹 SmartScreen）。清不动时维持
+#         既有 Edge fallback，功能不劣化。
+#   诊断：「模型未下载」提示附判定依据——状态点 tooltip 与模型页明细卡显示
+#         程序实际检查的模型目录（／CrispASR 核心目录）与缺失文件逐个点名；
+#         快速检查家族配套 missing_files* 清单函数与 crispasr_core_issue
+#         （区分「缺 exe」与「版本不符：已装 X，需 Y」——上游发新版后重启
+#         触发重下加速器正是后者）。针对 #3「ov_models 明明有模型却提示
+#         重新下载」：settings 残留 model_dir 指向别处、目录里放的不是所选
+#         模型，一眼可辨。
+#   日志：每次模型加载把解析后的模型目录（／CrispASR 目录）写入 logs/；
+#         触发补下载时先记缺失清单／不就绪原因再动手，远程排查不再靠猜。
 
 # ── 2.2.8 更新汇总（OCR 代码审查修复：14/15 项采纳）────────────────────────
 #   OCR（OpenCodeReview）审查 v2.2.7 全部提交，15 条意见采纳 14 条：
