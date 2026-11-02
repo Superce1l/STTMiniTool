@@ -9,12 +9,32 @@
 """
 from __future__ import annotations
 
-__version__ = "2.2.9"
+__version__ = "2.2.10"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.2.10 更新汇总（Whisper 字级对齐生效 + 字幕标点／长词／数字格式 + CPU 多线程）
+#   对齐：whisper 模型挂 FA 时显式 --backend whisper。省略 --backend 时 crispasr
+#         走 legacy 主路径，-am/-falign 被静默忽略（0.8.44/0.8.48/0.8.49 实测输出
+#         逐字节相同）——字级对齐从未生效。不挂 FA 维持原路径（统一 dispatch
+#         不出 -pp 进度行）；挂 FA 的进度改走与 qwen3 同款的行活跃度模拟。
+#   字幕：crispasr 各后端统一 OpenVINO 的契约「标点只作切点、不进字幕行」
+#         （英文／中文一致）。修 whisper 英文行首逗号（", ask not…"）与标点前
+#         空格（"country ."）；出厂默认 qwen3+FA 中文末字被甩成单独一行
+#         （「開放時間：早上九點至下午五」+「點。」——粘连标点让分行器游标多吞
+#         一字、切点整体错位）；whisper+FA 中文逐字乱切。被 -ml 1 拆开的数字
+#         并回（3.5／1,250／$1,250）；whisper 加 -sow 按词切段，长词不再拆成
+#         "incom preh ensible"（FA 路径一律加，legacy 仅限明确选择的空白分词
+#         语言——中文挂 -sow 会整句并段）。
+#   性能：crispasr -t 默认取逻辑核心数（上限 16，可由 settings.cpu_threads
+#         覆盖），原先只用 4 线程。CPU 推理 230s 音频：8 线程笔记本
+#         20.9s→16.2s；128 线程服务器 turbo 107s→33s（64 线程反退 70s）。
+#   加速：Linux 硬件检测（nvidia-smi／lspci）；CUDA 推荐限定 Windows（安装包
+#         只出 Windows 版）；CUDA 包体积标注对齐 v0.8.49（750／543 MB）；
+#         设备后端标签依设备名推导（CUDA 设备不再标成 VULKAN）。
 
 # ── 2.2.9 更新汇总（发行版改 onedir + 「模型未下载」判定依据可见）────────────
 #   发行：onefile → onedir。onefile 每次启动把整个运行时（数百 MB）解压到
