@@ -666,7 +666,8 @@ class WebBackend:
         eng = CrispWhisperEngine()
         eng.load(model_path=model_path, crispasr_dir=crispasr_dir,
                  device_id=self._vk_device_id(s), cb=self._st, aligner_path=aligner_path,
-                 gpu_backend=crispasr_gpu_backend(variant))
+                 gpu_backend=crispasr_gpu_backend(variant),
+                 cpu_threads=int(s.get("cpu_threads", 0) or 0))
         self.engine = eng
 
     # ── 状态 ────────────────────────────────────────────────

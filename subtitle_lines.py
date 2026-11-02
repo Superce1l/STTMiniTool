@@ -355,9 +355,11 @@ def _ts_chatllm_to_subtitle_lines(
         seg_idx.append(wi)
         seg_words.append(word)
 
-        # 跳过 word 在 raw_text 中占用的字符（依长度计数，忽略标点/空格）
+        # 跳过 word 在 raw_text 中占用的字符（只计内容字符，忽略标点/空格）。
+        # word 本身可能含标点（数字 3.5、或粘连标点的 token）：若以 len(word)
+        # 计数，会多吞下一个词的字符，让其后的切点整体错位一格。
         consumed = 0
-        word_len = len(word)
+        word_len = sum(1 for ch in word if ch not in _all_punct and ch != " ")
         while ri < len(raw_text) and consumed < word_len:
             c = raw_text[ri]
             if c in _all_punct or c == " ":

@@ -117,6 +117,22 @@ SUPPORTED_LANGUAGES = [
     "Arabic", "Thai", "Vietnamese", "Indonesian", "Malay",
 ]
 
+# 以空白分词、且分行器能以空格拼回词界（拉丁字母）的语言：whisper 挂 -sow
+# 按词切段才安全（见 _build_cmd）。中文／粤语／日文／泰文不以空白分词，不在此列。
+_SPACE_DELIMITED = frozenset({"en", "fr", "de", "es", "pt", "id", "ms", "vi"})
+
+
+def _default_threads() -> int:
+    """crispasr `-t` 的预设值。
+
+    不给 -t 时 crispasr 只用 min(4, 核心数) 个线程，CPU 推理（CPU 版，或 GPU 后端
+    载入失败而静默退回 CPU）明显吃亏；GPU 推理几乎不受线程数影响。实测（CPU
+    推理 230s 音频）：4 核 8 线程笔记本 4→8 线程 20.9s→16.2s（超线程有益）；
+    双路 128 线程服务器 16 线程最快，32／64 线程反而退回（同步开销）。故取逻辑
+    核心数、上限 16。
+    """
+    return max(1, min(16, os.cpu_count() or 4))
+
 
 def _find_exe(crispasr_dir: Path) -> Path | None:
     """在 crispasr 目录（含一层子文件夹）查找 crispasr.exe。"""
@@ -176,11 +192,14 @@ def probe_crispasr_devices(crispasr_dir: str | Path) -> dict:
                 continue
             kind = m.group(2).lower()            # gpu / cpu
             is_cpu = kind == "cpu"
+            # 后端标签依设备名（name=CUDA0 → CUDA、Vulkan0 → VULKAN）推导，
+            # 不再硬编码 VULKAN——CUDA 构建的 GPU 也曾被误标。
+            tag = re.sub(r"[^A-Za-z]", "", m.group(3)).upper()
             pending.append({
                 "id":        int(m.group(1)),
                 "name":      m.group(4).strip(),                 # 人类可读名称
                 "vram_free": int(m.group(5)) * 1024 * 1024,      # MiB → bytes
-                "backend":   "CPU" if is_cpu else "VULKAN",
+                "backend":   tag or ("CPU" if is_cpu else "GPU"),
                 "is_cpu":    is_cpu,
             })
 
@@ -281,12 +300,14 @@ class CrispWhisperEngine:
         self._backend    = "whisper"  # crispasr 后端：whisper / qwen3 / qwen3-1.7b …
         self._device_id  = 0       # GPU device id
         self._gpu_backend = "vulkan"  # --gpu-backend；None＝纯 CPU（挂 -ng）
+        self._threads    = _default_threads()  # crispasr -t
 
     # ══ 加载 ══════════════════════════════════════════════════════════
 
     def load(self, model_path: Path = None, crispasr_dir: Path = None,
              device_id: int = 0, cb=None, aligner_path: Path = None,
-             backend: str | None = None, gpu_backend: str | None = "vulkan"):
+             backend: str | None = None, gpu_backend: str | None = "vulkan",
+             cpu_threads: int = 0):
         """验证 crispasr.exe 与模型存在即可（子程序模式无常驻加载）。
 
         aligner_path：qwen3 ForcedAligner GGUF；None 时自动在 crispasr_dir 内查找。
@@ -299,6 +320,9 @@ class CrispWhisperEngine:
         gpu_backend：crispasr.exe 的 `--gpu-backend`（vulkan / cuda）。传 None
         代表这份核心是 CPU 版或使用者选了纯 CPU 推理 → 改挂 `-ng`。调用端应
         依「实际安装的加速版本」给值（downloader.crispasr_gpu_backend）。
+
+        cpu_threads：crispasr 的 `-t`；0＝自动（_default_threads），>0＝指定。
+        与 OpenVINO 引擎共用 settings 的 cpu_threads 键。
         """
         def _s(msg):
             if cb:
@@ -323,6 +347,8 @@ class CrispWhisperEngine:
         self._model_path = model_path
         self._device_id  = int(device_id)
         self._gpu_backend = gpu_backend or None
+        self._threads    = int(cpu_threads) if cpu_threads and cpu_threads > 0 \
+            else _default_threads()
         # 后端：显式指定优先，否则依模型文件名自动推断
         self._backend    = backend or _infer_backend(model_path)
 
@@ -350,7 +376,8 @@ class CrispWhisperEngine:
 
         self.ready = True
         _fa_tag = "  + FA" if self._aligner_path else ""
-        _s(f"就绪（CrispASR / Vulkan / {self._backend}  {model_path.name}{_fa_tag}）")
+        _gpu_tag = (self._gpu_backend or "cpu").upper()
+        _s(f"就绪（CrispASR / {_gpu_tag} / {self._backend}  {model_path.name}{_fa_tag}）")
 
     # ══ 子程序命令建构（★ 由你定夺：speed/quality 取舍）═════════════════
 
@@ -385,15 +412,25 @@ class CrispWhisperEngine:
             str(self._exe),
             "-m", str(self._model_path),
         ]
-        # 非 whisper 架构（Qwen3-ASR 等）需显式指定后端，crispasr 才用对解码路径
-        if self._backend and self._backend != "whisper":
-            cmd += ["--backend", self._backend]
-            # qwen3 后端默认要用 ggml-tiny.bin 做 LID（语言识别）；找不到时
-            # crispasr 会自己联网下载，网络不通就干等 ~44 秒才继续（0.8.38/0.8.42
-            # 实测）。这里显式指到本地的 whisper ggml（base 已随包），彻底免下载。
-            lid = _lid_model_path(self._exe.parent) if self._exe else None
-            if lid:
-                cmd += ["--lid-model", str(lid)]
+        # 非 whisper 架构（Qwen3-ASR 等）需显式指定后端，crispasr 才用对解码路径。
+        # whisper 平时**不传**：省略 --backend 时 crispasr 走 legacy whisper 主路径，
+        # 功能最全且 -pp 有真实进度行。但该路径没接线 CTC 对齐器——-am/-falign 被
+        # 静默忽略（0.8.44/0.8.48/0.8.49 实测输出逐字节相同）；因此仅在挂 FA 时才
+        # 显式 --backend whisper 路由进统一 dispatch，对齐器才会生效（代价：统一
+        # 路径不出 progress 行，进度改由 _run_streaming 走行活跃度模拟，与 qwen3
+        # 同款；实测 0.8.44 起统一路径支持 --backend whisper）。
+        unified_whisper = (self._backend == "whisper" and word_level
+                           and self.use_aligner and bool(self._aligner_path))
+        if self._backend:
+            if self._backend != "whisper" or unified_whisper:
+                cmd += ["--backend", self._backend]
+            if self._backend != "whisper":
+                # qwen3 后端默认要用 ggml-tiny.bin 做 LID（语言识别）；找不到时
+                # crispasr 会自己联网下载，网络不通就干等 ~44 秒才继续（0.8.38/0.8.42
+                # 实测）。这里显式指到本地的 whisper ggml（base 已随包），彻底免下载。
+                lid = _lid_model_path(self._exe.parent) if self._exe else None
+                if lid:
+                    cmd += ["--lid-model", str(lid)]
         # 加速版本：Vulkan／CUDA 走 --gpu-backend + 设备 id；CPU 版挂 -ng
         # （CPU 版核心没有 ggml-vulkan/cuda DLL，硬给 --gpu-backend 会启动失败）
         if self._gpu_backend:
@@ -401,18 +438,29 @@ class CrispWhisperEngine:
                     "-dev", str(self._device_id)]
         else:
             cmd += ["-ng"]
+        # CPU 线程数：不给 -t 时 crispasr 只用 min(4, 核心数)，见 _default_threads
+        cmd += ["-t", str(self._threads)]
         cmd += [
             "-of", str(out_base),         # 输出文件名（不含副文件名）
             "-np",                        # 不印多余消息
         ]
+        lang_code = _LANG_MAP.get(language, None) if language else None
         if word_level:
             # -ml 1 → 每段一字（字符级时间轴），等价于 FA 的字级输出
             # -pp → 打印「progress = NN% (x/N slices)」，供流式解析驱动进度条
             cmd += ["-osrt", "-ml", "1", "-pp"]
+            # -sow：whisper 按「词」而非 BPE token 切段。-ml 1 原本按 token 切，长词
+            # 会被拆成 "incom" "preh" "ensible"，且段文字被裁掉词首空白，分行器无从
+            # 还原词界（拼成 "incom preh ensible"）。但 legacy 主路径对不以空白分词
+            # 的语言（中文等）挂 -sow 会把整句并成一段、丢掉字级时间轴，故只在语言
+            # 明确为空白分词语言时挂；FA（统一 dispatch）路径的切段由对齐器决定，
+            # 中英文实测都安全，一律挂（顺带消除对齐器在中文 token 前补的空白）。
+            if self._backend == "whisper" and (unified_whisper
+                                               or lang_code in _SPACE_DELIMITED):
+                cmd += ["-sow"]
         else:
             cmd += ["-otxt"]
 
-        lang_code = _LANG_MAP.get(language, None) if language else None
         if lang_code:
             cmd += ["-l", lang_code]
 
@@ -470,6 +518,10 @@ class CrispWhisperEngine:
         tail: list[str] = []      # 末尾输出（崩溃原因诊断用）
         cancel_event = getattr(self, "cancel_event", None)
         is_qwen = (self._backend or "").startswith("qwen3")
+        # 统一 dispatch 的 whisper（挂 FA 时才走，见 _build_cmd）同样不出 progress
+        # 行 → 与 qwen3 共用行活跃度模拟进度。
+        whisper_fa = (self._backend == "whisper" and self.use_aligner
+                      and bool(self._aligner_path))
         # qwen3 活跃度进度：输出行数 → 模拟百分比（对数逼近 90）
         sim_base = 0
 
@@ -516,8 +568,9 @@ class CrispWhisperEngine:
                     p = int(m.group(1))
                     # 上限 99：留「完成」给写档后的最终回报，避免 100% 却还在写字幕
                     progress_cb(min(99, p), 100, f"CrispASR 转录中… {p}%")
-                elif progress_cb and is_qwen:
-                    # qwen3 无真实进度 → 行活跃度近似（每行 +ε，对数逼近 90%）
+                elif progress_cb and (is_qwen or whisper_fa):
+                    # qwen3／统一 whisper（FA）无真实进度 → 行活跃度近似
+                    # （每行 +ε，对数逼近 90%）
                     sim_base += 1
                     p = int(90 * (1 - 2.718281828 ** (-sim_base / 40)))
                     if p > 0:
@@ -617,14 +670,25 @@ class CrispWhisperEngine:
                 shutil.rmtree(ascii_dir, ignore_errors=True)
 
         # ── 依后端选对「断句契约」（使用者要求：Qwen 要走 Qwen 逻辑，非 Whisper）──
-        #   Qwen3-ASR：模型自带中文标点 → 标点剔出 items、只留 raw_text 当切点，
-        #              break_on_space=False → 与 OpenVINO **完全相同**的标点切行。
+        #   标点（各后端统一，与 OpenVINO 路径 _split_to_lines 相同、中英文一致）：
+        #     标点只当切行点、不进字幕行。whisper 的标点是独立 token
+        #     （"Americans" "," "ask"）、qwen3／对齐器则粘在词尾（"so," "間："），
+        #     两种都剔出 items、只留 raw_text 当切点——否则独立标点会沦为下一行
+        #     开头（", ask not"）、被空格拼成 "country ."；粘连标点则让分行器错过
+        #     切点（「開放時間：早上…五」+「點。」）。
         #   Whisper(Breeze)：无标点 → 保留空白语句边界、break_on_space=True 逼近 Qwen。
+        #     挂 FA 时例外：统一 dispatch 路径 token 前的空白只是分词残留（中文实测
+        #     「开| 放| 时|间」），当切点会逐字乱切；该路径改以对齐器的真实停顿切行。
+        #   _fa_blocked 的内插路径维持原契约（标点随字内插、行首标点移回前行）。
         is_qwen = (self._backend or "").startswith("qwen3")
-        ts_items, raw_text = _parse_srt_words(raw, drop_punct=is_qwen)
+        fa_blocked = getattr(self, "_fa_blocked", False)
+        whisper_fa = (self._backend == "whisper" and self.use_aligner
+                      and bool(self._aligner_path))
+        ts_items, raw_text = _parse_srt_words(raw, drop_punct=(is_qwen or not fa_blocked),
+                                              strip_attached=not fa_blocked)
         if not ts_items:
             return TranscribeResult()
-        if getattr(self, "_fa_blocked", False):
+        if fa_blocked:
             # 没有对齐器时 `-ml 1` 对 qwen3 后端无效，每个 item 会是一整段长文字，
             # 共享分行器便无从断句（实测整段可达 60 秒）。这里把长 item 依字符
             # **等时内插**摊成字符级，让分行器照常做标点切行／MAX_CHARS 保护。
@@ -635,11 +699,11 @@ class CrispWhisperEngine:
         self._last_segments_rich = None   # 旧侧通道属性：仅供外部兼容读取，本引擎不再依赖
         lines5 = _ts_chatllm_to_subtitle_lines(
             ts_items, raw_text, 0.0, None,
-            break_on_space=(not is_qwen), with_words=True,
+            break_on_space=(not is_qwen and not whisper_fa), with_words=True,
         )
         if not lines5:
             return TranscribeResult()
-        if getattr(self, "_fa_blocked", False):
+        if fa_blocked:
             lines5 = _fix_leading_punct(lines5)
         lines = [(s, e, t, sp) for (s, e, t, sp, _w) in lines5]
 
@@ -764,7 +828,80 @@ def _interpolate_chars(items: list[tuple[str, float, float]]
     return out
 
 
-def _parse_srt_words(srt_text: str, drop_punct: bool = False
+# 数字内的连接符（3.5／1,250／9:30）不是句界。-ml 1 会把它们拆成独立 token
+# （"3" "." "5"），剔除标点、切行之前须先并回同一个数字——否则中文行会把
+# "增长了3" "." "5%" 拼成「增长了35%」，英文行则切成 "3" / "5"。
+_NUM_JOINERS = frozenset(".,:")
+# 依附在数字上的符号：货币在前（$1,250）、百分号在后（50%）。
+_CURRENCY = frozenset("$€£¥")
+
+
+def _merge_number_tokens(toks: list[list]) -> list[list]:
+    """把被 `-ml 1` 拆开的数字 token 并回一个。
+
+    toks：[[lead_ws, text, start, end], ...]（text 已去首尾空白；"" 为纯空白块）
+    规则：
+      • 「…3」「.」「5…」或「…3.」「5…」→ 3.5（小数点、时间冒号接任意位数）
+      • 千分位逗号只接「恰好 3 位数」→ 1,250；「3」「,」「5」视为列举，不并
+      • 「$」「1」→ $1；对齐器把货币符号粘在前词尾（"for$" "1"）→ 移到数字前
+      • 「50」「%」→ 50%
+    """
+    def _digits_ok(joiner: str, t: str) -> bool:
+        if not t[:1].isdigit():
+            return False
+        if joiner != ",":
+            return True
+        return len(t) >= 3 and t[:3].isdigit() and not t[3:4].isdigit()
+
+    toks = [list(t) for t in toks]
+    out: list[list] = []
+    i = 0
+    while i < len(toks):
+        cur = toks[i]
+        while i + 1 < len(toks):
+            t, nxt = cur[1], toks[i + 1]
+            nt = nxt[1]
+            if (t[-1:].isdigit() and len(nt) == 1 and nt in _NUM_JOINERS
+                    and i + 2 < len(toks) and _digits_ok(nt, toks[i + 2][1])):
+                cur[1] = t + nt + toks[i + 2][1]          # 「3」「.」「5」
+                cur[3] = toks[i + 2][3]
+                i += 2
+            elif (len(t) >= 2 and t[-1] in _NUM_JOINERS and t[-2].isdigit()
+                    and _digits_ok(t[-1], nt)):
+                cur[1] = t + nt                            # 「3.」「5」
+                cur[3] = nxt[3]
+                i += 1
+            elif t and all(c in _CURRENCY for c in t) and nt[:1].isdigit():
+                cur[1] = t + nt                            # 「$」「1」
+                cur[3] = nxt[3]
+                i += 1
+            elif t[-1:].isdigit() and nt == "%":
+                cur[1] = t + nt                            # 「50」「%」
+                cur[3] = nxt[3]
+                i += 1
+            elif len(t) >= 2 and t[-1] in _CURRENCY and nt[:1].isdigit():
+                toks[i + 1] = [nxt[0], t[-1] + nt, nxt[2], nxt[3]]
+                cur[1] = t[:-1]                            # 「for$」「1」→「for」「$1」
+                break
+            else:
+                break
+        out.append(cur)
+        i += 1
+    return out
+
+
+def _strip_edge_punct(t: str) -> str:
+    """去掉粘在词首尾的标点（so, → so、間： → 間）；数字内部的 . , : 保留（3.5）。"""
+    i, j = 0, len(t)
+    while i < j and t[i] in _PUNCT:
+        i += 1
+    while j > i and t[j - 1] in _PUNCT:
+        j -= 1
+    return t[i:j]
+
+
+def _parse_srt_words(srt_text: str, drop_punct: bool = False,
+                     strip_attached: bool = False
                      ) -> tuple[list[tuple[str, float, float]], str]:
     """解析 `-ml 1` 字符级 SRT。
 
@@ -773,13 +910,17 @@ def _parse_srt_words(srt_text: str, drop_punct: bool = False
         raw_text : 字符对接，并在 whisper 的「空白语句边界」处保留一个空白，
                    供分行器 break_on_space 在语句边界切行。
 
-    drop_punct=True（Qwen 模式）：标点字符只保留在 raw_text 当「切点」，**不**进
-    ts_items —— 这正是 OpenVINO Qwen 路径的契约（items=内容词、标点仅在
-    raw_text）。crispasr `-ml 1` 会把标点也输出成独立字符段，若放进 items 会让
-    断句器的 raw_text 指标双重前进、标点沦为下一行开头，故需在此剔除。
+    drop_punct=True：标点字符只保留在 raw_text 当「切点」，**不**进 ts_items ——
+    这正是 OpenVINO 路径的契约（items=内容词、标点仅在 raw_text；英文／中文
+    统一，见 app._split_to_lines）。crispasr `-ml 1` 会把标点也输出成独立字符段
+    （whisper："Americans" "," "ask"），若放进 items 会让断句器的 raw_text 指标
+    双重前进、标点沦为下一行开头（", ask not"），故需在此剔除。同时把被拆开的
+    数字并回（3 . 5 → 3.5，见 _merge_number_tokens），免得小数点被当切点。
+
+    strip_attached=True：标点粘在词尾的 token（qwen3／对齐器："so," "間："）也
+    剥掉词首尾标点再进 items；raw_text 仍保留完整 token，切点照常生效。
     """
-    items: list[tuple[str, float, float]] = []
-    raw_parts: list[str] = []
+    tokens: list[list] = []                 # [lead_ws, text, start, end]
     # 正规化换行（crispasr SRT 为 CRLF），再以空行切块
     blocks = srt_text.replace("\r\n", "\n").replace("\r", "\n").strip().split("\n\n")
     for block in blocks:
@@ -794,15 +935,23 @@ def _parse_srt_words(srt_text: str, drop_punct: bool = False
         except (ValueError, IndexError):
             continue
         raw = "".join(rows[tl_idx + 1:])    # 不 strip，保留前导空白
-        if raw.strip() == "":
+        tokens.append([raw[:1].isspace(), raw.strip(), s, e])
+    if drop_punct:
+        tokens = _merge_number_tokens(tokens)
+
+    items: list[tuple[str, float, float]] = []
+    raw_parts: list[str] = []
+    for lead, token, s, e in tokens:
+        if token == "":
             raw_parts.append(" ")           # 纯空白块 = 语句边界
             continue
-        if raw[:1].isspace():               # 字符前带空白 = 边界 + 字符
+        if lead:                            # 字符前带空白 = 边界 + 字符
             raw_parts.append(" ")
-        token = raw.strip()
         raw_parts.append(token)             # 标点一律进 raw_text（供切点检测）
-        if drop_punct and token and all(ch in _PUNCT for ch in token):
-            continue                        # Qwen：标点不进 items
+        if drop_punct and all(ch in _PUNCT for ch in token):
+            continue                        # 纯标点：只当切点，不进 items
+        if strip_attached:
+            token = _strip_edge_punct(token)
         items.append((token, s, e))
     return items, "".join(raw_parts)
 
