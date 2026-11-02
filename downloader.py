@@ -445,7 +445,7 @@ _CRISPASR_VARIANTS: dict[str, dict] = {
         "zip":         "crispasr-windows-x86_64-cuda.zip",
         "label":       "CUDA 12（NVIDIA 专用）",
         "short":       "CUDA 12",
-        "size_mb":     692,
+        "size_mb":     750,
         "gpu_backend": "cuda",
         "desc":        "同 CUDA 13 但用较旧的 runtime，给 580 以下驱动的"
                        " NVIDIA 显卡；自带 CUDA 12 runtime。",
@@ -454,7 +454,7 @@ _CRISPASR_VARIANTS: dict[str, dict] = {
         "zip":         "crispasr-windows-x86_64-cuda13.zip",
         "label":       "CUDA 13（NVIDIA 新驱动）",
         "short":       "CUDA 13",
-        "size_mb":     486,
+        "size_mb":     543,
         "gpu_backend": "cuda",
         "desc":        "NVIDIA 用户首选：原生 CUDA 加速，自带 CUDA 13 runtime"
                        "（无需另装 Toolkit）；需要 580 以上的 NVIDIA 驱动。",
@@ -463,7 +463,7 @@ _CRISPASR_VARIANTS: dict[str, dict] = {
         "zip":         "crispasr-windows-x86_64-cpu.zip",
         "label":       "CPU（纯处理器）",
         "short":       "CPU",
-        "size_mb":     8,
+        "size_mb":     9,
         "gpu_backend": None,
         "desc":        "完全不碰显卡。速度最慢，但在显卡驱动有问题时最不会出事。",
     },
@@ -535,8 +535,67 @@ def _vendor_of(name: str, compat: str) -> str:
     return "other"
 
 
+def _hw_finalize(info: dict) -> dict:
+    """补全 vendors / has_discrete（Windows 与 Linux 枚举共用）。"""
+    info["vendors"] = sorted({g["vendor"] for g in info["gpus"]})
+    # Intel/AMD 的核显也会出现在清单里；「有独立显卡」以 NVIDIA 或 AMD 独显字样判断
+    info["has_discrete"] = any(
+        g["vendor"] == "nvidia" or
+        (g["vendor"] == "amd" and "radeon" in g["name"].lower()
+         and "graphics" not in g["name"].lower())
+        for g in info["gpus"])
+    return info
+
+
+def _parse_nvidia_driver(ver: str) -> float | None:
+    """'595.71.05' → 595.71（前两段）；解析失败回 None。"""
+    parts = (ver or "").strip().split(".")
+    try:
+        return float(f"{parts[0]}.{parts[1]}" if len(parts) > 1 else parts[0])
+    except Exception:
+        return None
+
+
+def _detect_hardware_linux(info: dict) -> dict:
+    """Linux 分支：NVIDIA 走 nvidia-smi（跨平台同款管道），其余厂商走 lspci。"""
+    # ① NVIDIA：一次取回名称／驱动／显存
+    out = _run_hidden(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+                       "--format=csv,noheader,nounits"])
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3 or not parts[0]:
+            continue
+        try:
+            vram = int(float(parts[2]))
+        except Exception:
+            vram = 0
+        info["gpus"].append({"vendor": "nvidia", "name": parts[0],
+                             "vram_mb": vram, "driver": parts[1]})
+        if info["nvidia_driver"] is None:
+            info["nvidia_driver"] = _parse_nvidia_driver(parts[1])
+
+    # ② AMD/Intel 核显／独显：lspci 的显示类控制器（VGA / 3D / Display）。
+    #    nvidia 行已由 nvidia-smi 报过（信息更全），跳过避免重复。无 lspci 时
+    #    只有 NVIDIA。行格式「[域:]总线:槽.功能 类别: 厂商 型号」——地址含冒号但
+    #    不含「冒号＋空白」，故以第一个 ": " 切出类别与描述。
+    out = _run_hidden(["lspci"])
+    for line in out.splitlines():
+        head, sep, desc = line.partition(": ")
+        if not sep or not any(k in head for k in ("VGA compatible controller",
+                                                  "3D controller",
+                                                  "Display controller")):
+            continue
+        desc = desc.strip()
+        vendor = _vendor_of(desc, desc)
+        if vendor in ("nvidia", "virtual") or not desc:
+            continue
+        info["gpus"].append({"vendor": vendor, "name": desc,
+                             "vram_mb": 0, "driver": ""})
+    return _hw_finalize(info)
+
+
 def detect_hardware() -> dict:
-    """检测显卡与 NVIDIA 驱动版本（Windows）。
+    """检测显卡与 NVIDIA 驱动版本（Windows / Linux）。
 
     返回：
       {"gpus": [{"vendor","name","vram_mb","driver"}...],   # 已排除虚拟显卡
@@ -547,8 +606,10 @@ def detect_hardware() -> dict:
     """
     info = {"gpus": [], "vendors": [], "nvidia_driver": None,
             "has_discrete": False, "error": None}
+    if _sys.platform == "linux":
+        return _detect_hardware_linux(info)
     if _sys.platform != "win32":
-        info["error"] = "目前仅支持 Windows 的硬件检测"
+        info["error"] = "目前仅支持 Windows / Linux 的硬件检测"
         return info
 
     # ① 显卡清单（CIM/WMI）。AdapterRAM 对 4GB 以上的卡会溢位，仅供参考。
@@ -577,13 +638,7 @@ def detect_hardware() -> dict:
     except Exception as e:
         info["error"] = f"显卡列举失败：{e}"
 
-    info["vendors"] = sorted({g["vendor"] for g in info["gpus"]})
-    # Intel/AMD 的核显也会出现在清单里；「有独立显卡」以 NVIDIA 或 AMD 独显字样判断
-    info["has_discrete"] = any(
-        g["vendor"] == "nvidia" or
-        (g["vendor"] == "amd" and "radeon" in g["name"].lower()
-         and "graphics" not in g["name"].lower())
-        for g in info["gpus"])
+    _hw_finalize(info)
 
     # ② NVIDIA 驱动版本（决定 CUDA 12 还是 13）
     if "nvidia" in info["vendors"]:
@@ -594,12 +649,7 @@ def detect_hardware() -> dict:
             line = line.strip()
             if not line:
                 continue
-            try:
-                parts = line.split(".")
-                info["nvidia_driver"] = float(f"{parts[0]}.{parts[1]}"
-                                              if len(parts) > 1 else parts[0])
-            except Exception:
-                pass
+            info["nvidia_driver"] = _parse_nvidia_driver(line)
             break
     return info
 
@@ -616,32 +666,41 @@ def recommend_crispasr_variant(hw: dict | None = None) -> dict:
                        "suitable":bool,"note":str}, …]}
 
     推荐政策：
-      • 有 NVIDIA   → 默认 CUDA（依驱动版本选 CUDA 13 / CUDA 12）：NVIDIA 用户的
-                      原生加速路线，Flash Attention／GEMM 走原生核心，大模型
-                      （Whisper Large／Turbo、Qwen3-1.7B）推理速度普遍优于 Vulkan。
+      • 有 NVIDIA（Windows）→ 默认 CUDA（依驱动版本选 CUDA 13 / CUDA 12）：
+                      NVIDIA 用户原生加速路线，Flash Attention／GEMM 走原生核心，
+                      大模型（Whisper Large／Turbo、Qwen3-1.7B）推理速度普遍优于
+                      Vulkan。
       • 没有 NVIDIA → 一律 Vulkan（Windows 没有 ROCm/SYCL 版，Vulkan 就是最佳解）
+      • 非 Windows  → 不推荐 CUDA：安装包（crispasr-windows-*.zip）目前仅出
+                      Windows 版，推荐了也下载不到可用核心；硬件检测仍照常回报。
     """
     hw = hw or detect_hardware()
     vendors = hw.get("vendors", [])
     drv     = hw.get("nvidia_driver")
     has_nv  = "nvidia" in vendors
+    on_win  = _sys.platform == "win32"
 
-    # NVIDIA 使用者可选的 CUDA 版本：驱动够新才给 13，否则 12。
+    # NVIDIA 使用者可选的 CUDA 版本：驱动够新才给 13，否则 12（仅 Windows）。
     cuda_key = None
-    if has_nv:
+    if has_nv and on_win:
         cuda_key = "cuda13" if (drv is None or drv >= _CUDA13_MIN_DRIVER) else "cuda12"
 
-    # 推荐：NVIDIA → CUDA；其余 → Vulkan
+    # 推荐：NVIDIA（Windows）→ CUDA；其余 → Vulkan
     recommended = cuda_key if has_nv and cuda_key else _CRISPASR_DEFAULT_VARIANT
     if not hw.get("gpus"):
         reason = ("未检测到显卡信息，先以 Vulkan 版为默认——它在没有独立显卡时"
                   "会自动退回 CPU 推理，最不会出事。")
-    elif has_nv:
+    elif has_nv and cuda_key:
         names = "、".join(g["name"] for g in hw["gpus"] if g["vendor"] == "nvidia")
         reason = (f"检测到 NVIDIA 显卡（{names}）。已为你推荐原生 CUDA 加速"
                   f"（{_CRISPASR_VARIANTS[cuda_key]['label']}，自带 CUDA runtime，"
                   f"无需另装 CUDA Toolkit）；若下载量大或驱动兼容有顾虑，可改选 "
                   f"Vulkan（仅 35 MB）。")
+    elif has_nv:
+        names = "、".join(g["name"] for g in hw["gpus"] if g["vendor"] == "nvidia")
+        reason = (f"检测到 NVIDIA 显卡（{names}）。加速版安装包目前仅提供 "
+                  f"Windows 版；本平台请自行放置对应的 crispasr 核心"
+                  f"（上游 Linux 构建可从 GitHub release 取得）。")
     elif "amd" in vendors or "intel" in vendors:
         names = "、".join(g["name"] for g in hw["gpus"]
                           if g["vendor"] in ("amd", "intel"))
@@ -657,6 +716,8 @@ def recommend_crispasr_variant(hw: dict | None = None) -> dict:
         if key in ("cuda12", "cuda13"):
             if not has_nv:
                 suitable, note = False, "需要 NVIDIA 显卡"
+            elif not on_win:
+                suitable, note = False, "安装包目前仅提供 Windows 版"
             elif key == "cuda13" and drv is not None and drv < _CUDA13_MIN_DRIVER:
                 suitable, note = False, (f"需要 {_CUDA13_MIN_DRIVER:.0f} 以上的驱动"
                                          f"（目前 {drv:.2f}）")
@@ -664,7 +725,7 @@ def recommend_crispasr_variant(hw: dict | None = None) -> dict:
                 note = "驱动版本建议改用另一个 CUDA 版本"
         elif key == "cpu-legacy":
             note = "只有在一般 CPU 版闪退时才需要"
-        elif key == "vulkan" and has_nv:
+        elif key == "vulkan" and has_nv and on_win:
             note = "体积最小的通用备选；NVIDIA 用户建议优先 CUDA"
         options.append({"key": key, "label": meta["label"],
                         "size_mb": meta["size_mb"], "desc": meta["desc"],
