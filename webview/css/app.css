@@ -401,7 +401,7 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .seg-block.playing.spk-3 { background: #8A6312; border-color: #8A6312; color: #fff; }
 
 /* 播放控制 */
-.wave-ctrls { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.wave-ctrls { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
 .play-btn {
   width: 32px; height: 32px; border-radius: 50%; border: 0; cursor: pointer; flex: 0 0 auto;
   background: var(--accent); color: #fff; display: grid; place-items: center;
@@ -416,6 +416,13 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .wave-ctrls .sp { flex: 1; }   /* 把「合并段落」推到行尾 */
 
 .subs { margin-top: 14px; display: flex; flex-direction: column; gap: 7px; }
+/* ── 虚拟滚动模式（字幕段数 > 400）：#subs 转块级布局，上下 spacer 撑高度 ──
+   卡片间距改用 margin-bottom 表达（= .subs 的 gap 7px），使每张卡的流内
+   高度恒为 offsetHeight + 7，与 app.js 高度模型（实测 offsetHeight+SUB_GAP）
+   线性对应，估算累计高度才无累积误差。 */
+.subs.virtual { display: block; }
+.subs.virtual .sub-card { margin-bottom: 7px; }
+.subs.virtual .v-spacer { width: 100%; }
 .sub-card {
   display: flex; gap: 13px; align-items: flex-start;
   padding: 11px 14px; border-radius: 10px;
@@ -519,6 +526,24 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
   border-color: var(--accent); background: var(--accent-tint);
   box-shadow: 0 0 0 1px var(--accent) inset;
 }
+
+/* ── 转录取消按钮：hidden 属性显式还原 display（.btn 的 inline-flex 会覆盖 UA 规则）── */
+#btn-cancel-tx[hidden] { display: none; }
+
+/* ── 字幕搜索替换（钉顶工具条内；合并选择模式时整体隐藏）──────────── */
+.search-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.search-bar[hidden] { display: none; }
+.search-bar .input { width: auto; padding: 5px 9px; font-size: 12.5px; }
+.search-bar .btn-sm { padding: 5px 9px; }
+#search-q { width: 150px; max-width: 34vw; }
+#search-r { width: 120px; max-width: 28vw; }
+.search-count {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--muted);
+  min-width: 36px; text-align: center; white-space: nowrap;
+}
+/* 卡片内匹配高亮：普通匹配淡底，当前匹配实底（当前项随 ↑↓/替换跳转切换） */
+.sub-card .txt .search-hl { background: var(--accent-soft); border-radius: 3px; box-shadow: 0 0 0 1px var(--accent-soft); }
+.sub-card .txt .search-hl.cur { background: var(--accent); color: #fff; box-shadow: 0 0 0 1px var(--accent); }
 
 /* 记录 log */
 .log {
@@ -690,6 +715,13 @@ textarea.input { resize: vertical; min-height: 64px; font-size: 13px; line-heigh
 .banner svg { width: 17px; height: 17px; flex: 0 0 auto; margin-top: 2px; }
 .banner-warn { background: var(--warn-bg); border: 1px solid var(--warn-line); color: var(--warn-fg); }
 .banner-info { background: var(--accent-tint); border: 1px solid var(--accent-soft); color: var(--accent-strong); }
+.banner-x {
+  margin-left: auto; align-self: flex-start;
+  border: 0; background: transparent; color: inherit;
+  opacity: .55; font-size: 15px; line-height: 1; padding: 0 2px; cursor: pointer;
+}
+.banner-x:hover { opacity: 1; }
+.banner-x:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; }
 
 /* ============================================================
    设置视图

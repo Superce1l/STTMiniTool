@@ -16,6 +16,10 @@
   function off(ev, fn) { listeners[ev]?.delete(fn); }
   function emit(ev, payload) { listeners[ev]?.forEach(fn => { try { fn(payload); } catch (e) { console.error(e); } }); }
 
+  // 用户可见文案的 i18n 兜底：本文件先于 i18n.js 载入，但取文案的时机都在
+  // load 之后（SSE 事件 / fetch 失败），届时 window.I18N 已就绪；无字典回退简中。
+  function tr(key, fallback) { return (window.I18N && I18N.t(key)) || fallback; }
+
   let MODE = "mock";
   const KEY = new URLSearchParams(location.search).get("k") || "";
   const isHttp = () => location.protocol === "http:" || location.protocol === "https:";
@@ -50,7 +54,10 @@
         try { const m = JSON.parse(e.data); if (m && m.event) emit(m.event, m.payload); }
         catch { /* 心跳/注释行，略过 */ }
       };
-      es.onerror = () => { /* EventSource 会自动重连 */ };
+      // 断线提示：EventSource 自带自动重连（此处不自写重连逻辑）。pct<0 表示
+      // 非常规进度 → UI 只显示 status 文案；恢复（onopen）发空 status 撤掉提示。
+      es.onerror = () => emit("progress", { pct: -1, status: tr("sse.reconnecting", "连接断开，正在重连…") });
+      es.onopen = () => emit("progress", { pct: -1, status: "" });
     } catch (e) { console.warn("[QwenAPI] SSE 无法建立", e); }
   }
 
@@ -61,16 +68,42 @@
     return h;
   }
   function withKey(path) { return KEY ? path + (path.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(KEY) : path; }
-  async function apiGet(path) {
-    const r = await fetch(withKey(path), { headers: authHeaders() });
+
+  // ── 请求超时：挂起的请求不再让 UI 永远等待 ───────────────
+  //   默认 30s；apiGet/apiPost 可传 opts.timeoutMs 覆盖，0 = 不设超时。
+  //   放行长等待：/api/transcribe（上传+转录，分钟级）、/api/browse-folder、
+  //   /api/browse-file（阻塞在原生对话框，直到用户关闭）。
+  //   计时只罩到响应头：本地 server 响应体小、紧跟头到达；请求结束后才
+  //   触发的 abort 是无害 no-op。SSE（EventSource）不走此路径。
+  const DEFAULT_TIMEOUT_MS = 30000;
+  const TRANSCRIBE_TIMEOUT_MS = 30 * 60 * 1000;   // 上传 + 转录上限 30 分钟
+
+  async function apiFetch(path, init, timeoutMs) {
+    const ms = timeoutMs == null ? DEFAULT_TIMEOUT_MS : timeoutMs;
+    if (!(ms > 0)) return fetch(withKey(path), init);   // 0 → 不设超时
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    try {
+      return await fetch(withKey(path), Object.assign({}, init, { signal: ctrl.signal }));
+    } catch (e) {
+      if (e && (e.name === "AbortError" || e.name === "TimeoutError"))
+        throw new Error(tr("net.timeout", "请求超时"));   // 由调用方现有 catch 路径显示
+      throw e;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function apiGet(path, opts) {
+    const r = await apiFetch(path, { headers: authHeaders() }, opts && opts.timeoutMs);
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
   }
-  async function apiPost(path, body) {
-    const r = await fetch(withKey(path), {
+  async function apiPost(path, body, opts) {
+    const r = await apiFetch(path, {
       method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(body || {}),
-    });
+    }, opts && opts.timeoutMs);
     if (!r.ok) {
       let msg = "HTTP " + r.status;
       try { msg = (await r.json()).error?.message || msg; } catch {}
@@ -97,13 +130,14 @@
     async loadHintTxt() { return null; },
 
     // 原生「选择文件夹」对话框（后端 tkinter）；取消/不支持 → {ok:false}
+    // 对话框阻塞后端直到用户关闭 → 不设超时（用户在环）
     async browseFolder(start) {
-      if (MODE === "web") { try { return await apiPost("/api/browse-folder", { start }); } catch {} }
+      if (MODE === "web") { try { return await apiPost("/api/browse-folder", { start }, { timeoutMs: 0 }); } catch {} }
       return { ok: false, path: "" };
     },
-    // 原生「选择文件」对话框（FFmpeg 可执行文件等）
+    // 原生「选择文件」对话框（FFmpeg 可执行文件等）；同上不设超时
     async browseFile(start) {
-      if (MODE === "web") { try { return await apiPost("/api/browse-file", { start }); } catch {} }
+      if (MODE === "web") { try { return await apiPost("/api/browse-file", { start }, { timeoutMs: 0 }); } catch {} }
       return { ok: false, path: "" };
     },
 
@@ -223,7 +257,7 @@
 
   // ── web 转录：POST /api/transcribe（进度走 SSE）──────────
   async function webTranscribe(opts) {
-    if (!opts.file) throw new Error("请先选择文件");
+    if (!opts.file) throw new Error(tr("file.pickFirst", "请先选择文件"));
     const fd = new FormData();
     fd.append("file", opts.file, opts.file.name);
     if (opts.language) fd.append("language", opts.language);
@@ -231,8 +265,10 @@
     fd.append("diarize", opts.diarize ? "1" : "0");
     if (opts.nSpeakers && opts.nSpeakers !== "auto") fd.append("n_speakers", String(opts.nSpeakers));
     if (opts.hint) fd.append("hint", opts.hint);
-    emit("progress", { pct: 3, status: "上传中…" });
-    const r = await fetch(withKey("/api/transcribe"), { method: "POST", body: fd, headers: authHeaders() });
+    emit("progress", { pct: 3, status: tr("file.uploading", "上传中…") });
+    // 上传 + 转录是分钟级长任务：单独放行 30 分钟上限（实时进度经 SSE 推送）
+    const r = await apiFetch("/api/transcribe",
+      { method: "POST", body: fd, headers: authHeaders() }, TRANSCRIBE_TIMEOUT_MS);
     if (!r.ok) {
       let msg = "HTTP " + r.status;
       try { msg = (await r.json()).error?.message || msg; } catch {}

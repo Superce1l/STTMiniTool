@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/app.css?v=5">
+<link rel="stylesheet" href="css/app.css?v=10">
 </head>
 <body>
 <div class="app">
@@ -56,7 +56,7 @@
   <!-- ════════════ 主区 ════════════ -->
   <div class="main">
     <header class="topbar">
-      <h1 id="view-title">音频转字幕</h1>
+      <h1 id="view-title" data-i18n="view.file">音频转字幕</h1>
       <div class="ctx" id="view-ctx"></div>
     </header>
 
@@ -74,6 +74,7 @@
           <button class="btn btn-primary" id="btn-run" disabled>
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg><span data-i18n="file.run">开始转换</span>
           </button>
+          <button class="btn btn-ghost" id="btn-cancel-tx" hidden data-i18n="tx.cancel">取消转换</button>
           <button class="btn btn-ghost" id="btn-open-dir" disabled>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span data-i18n="file.openDir">打开输出文件夹</span>
           </button>
@@ -89,9 +90,9 @@
             </div>
           </div>
           <div class="sp"></div>
-          <select class="select" id="sel-lang" data-i18n-title="file.diar"><option value="" data-i18n="common.langAuto">语言 自动</option></select>
+          <select class="select" id="sel-lang" data-i18n-title="record.recLang"><option value="" data-i18n="common.langAuto">语言 自动</option></select>
           <label class="switch"><input type="checkbox" id="sw-diar" checked><span class="track"></span><span data-i18n="file.diar">说话者分离</span></label>
-          <select class="select" id="sel-spk" title="人数">
+          <select class="select" id="sel-spk" data-i18n-title="common.spkCount" title="人数">
             <option value="auto" data-i18n="common.spkAuto">人数 自动</option>
             <option>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
           </select>
@@ -131,11 +132,24 @@
               <button class="play-btn play-btn-ghost" id="wave-stop" aria-label="停止">
                 <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
               </button>
-              <button class="play-btn play-btn-ghost" id="btn-karaoke" aria-label="卡拉OK模式" title="卡拉OK模式（逐字高亮）">
+              <button class="play-btn play-btn-ghost" id="btn-karaoke" aria-label="卡拉OK模式" data-i18n-title="file.karaokeTip" title="卡拉OK模式（逐字高亮）">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M5 11a7 7 0 0 0 14 0M12 18v4"/></svg>
               </button>
               <span class="play-time"><span id="wave-cur">00:00</span> · <span data-i18n="file.waveHint">点字幕选中片段，播放键循环播放；点波形移动播放头</span></span>
               <div class="sp"></div>
+              <!-- 撤销/重做：禁用态跟随快照栈；快捷键 Ctrl+Z / Ctrl+Y、Ctrl+Shift+Z -->
+              <button class="btn btn-ghost btn-sm" id="btn-undo" disabled data-i18n-title="undo" title="撤销（Ctrl+Z）">↶</button>
+              <button class="btn btn-ghost btn-sm" id="btn-redo" disabled data-i18n-title="redo" title="重做（Ctrl+Y）">↷</button>
+              <!-- 字幕搜索替换：合并选择模式激活时整个搜索区隐藏（避免与多选冲突） -->
+              <div class="search-bar" id="search-bar">
+                <input class="input search-input" id="search-q" data-i18n-ph="search.placeholder" placeholder="搜索字幕…" autocomplete="off" spellcheck="false">
+                <span class="search-count" id="search-count"></span>
+                <button class="btn btn-ghost btn-sm" id="search-prev" data-i18n-title="search.prev" title="上一个匹配（Shift+Enter）">↑</button>
+                <button class="btn btn-ghost btn-sm" id="search-next" data-i18n-title="search.next" title="下一个匹配（Enter）">↓</button>
+                <input class="input search-input" id="search-r" data-i18n-ph="search.replacePh" placeholder="替换为…" autocomplete="off" spellcheck="false">
+                <button class="btn btn-ghost btn-sm" id="search-replace" disabled data-i18n="search.replaceCur">替换</button>
+                <button class="btn btn-ghost btn-sm" id="search-replace-all" disabled data-i18n="search.replaceAll">全部替换</button>
+              </div>
               <!-- 合并段落（含操作栏）挂在波形面板内 → 随面板一起钉顶 -->
               <button class="btn btn-ghost btn-sm" id="btn-merge-mode" data-i18n="merge.mode">合并段落</button>
             </div>
@@ -162,11 +176,11 @@
       <section class="view" data-view="record">
         <div class="controls">
           <span style="font-size:13px;color:var(--ink-2);min-width:48px" data-i18n="record.mic">麦克风</span>
-          <select class="select" id="rec-mic" style="min-width:240px;max-width:100%;flex:1 1 240px" title="录音输入设备"><option value="">默认麦克风</option></select>
+          <select class="select" id="rec-mic" style="min-width:240px;max-width:100%;flex:1 1 240px" data-i18n-title="record.micInput" title="录音输入设备"><option value="" data-i18n="record.defaultMic">默认麦克风</option></select>
           <button class="btn btn-ghost btn-sm" id="rec-mic-refresh" data-i18n="record.refresh">刷新</button>
           <span class="chip chip-muted" id="rec-perm" hidden></span>
           <div class="sp"></div>
-          <select class="select" id="rec-lang" title="识别语言"><option value="" data-i18n="common.langAuto">语言 自动</option></select>
+          <select class="select" id="rec-lang" data-i18n-title="record.recLang" title="识别语言"><option value="" data-i18n="common.langAuto">语言 自动</option></select>
         </div>
         <div class="banner banner-warn" id="rec-perm-help" hidden style="margin-bottom:10px">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
@@ -182,6 +196,11 @@
             <div class="rec-note" data-i18n="record.note">录制转换：检测到说话停顿时才识别，句中短暂停顿不会中断。按麦克风开始，再按一次结束并完成最后一段。</div>
           </div>
         </div>
+        <div class="banner banner-info rec-latency" id="rec-latency" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <div data-rec-latency-text>当前模型实时出字延迟约 2-3 秒/段（模型加载开销为主）；追求即时出字可换 Whisper Base 或切换 CPU (OpenVINO) 核心</div>
+          <button class="banner-x" id="rec-latency-close" type="button" aria-label="移除" data-i18n-title="common.remove">×</button>
+        </div>
         <div class="hint-head">
           <div class="l"><span class="t" data-i18n="record.liveTitle">实时字幕</span><span class="d" data-i18n="record.liveDesc">说完停顿自动识别；可清除或按输出格式保存</span></div>
           <label class="switch" id="rec-autosave-wrap" hidden style="margin-right:6px"><input type="checkbox" id="rec-autosave"><span class="track"></span><span data-i18n="record.autosave">实时保存</span></label>
@@ -195,7 +214,7 @@
       <section class="view" data-view="model">
         <div class="sec-title" style="display:flex;align-items:center;gap:10px">
           <span data-i18n="model.health">系统自检</span>
-          <span class="chip chip-muted" id="health-sum" style="font-weight:400">检查中…</span>
+          <span class="chip chip-muted" id="health-sum" style="font-weight:400" data-i18n="model.checking">检查中…</span>
           <button class="btn btn-ghost btn-sm" id="btn-health-recheck" style="margin-left:auto" data-i18n="model.recheck">重新检查</button>
         </div>
         <div id="health-panel" class="health-panel"></div>
@@ -203,8 +222,8 @@
         <!-- ── 检测到的设备（选择引擎前先看硬件）── -->
         <div class="sec-title" data-i18n="model.devices">检测到的设备</div>
         <div class="dev-list" id="dev-list">
-          <div class="dev"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></span><span class="nm">CPU · AMD Ryzen 5 9600X 6-Core</span><span class="vram">使用中</span></div>
-          <div class="dev"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 18v2M18 18v2"/></svg></span><span class="nm">GPU · NVIDIA GeForce RTX 4070</span><span class="vram">8.0 GB 可用</span></div>
+          <div class="dev"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></span><span class="nm">CPU · AMD Ryzen 5 9600X 6-Core</span><span class="vram" data-i18n="model.inUse">使用中</span></div>
+          <div class="dev"><span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 18v2M18 18v2"/></svg></span><span class="nm">GPU · NVIDIA GeForce RTX 4070</span><span class="vram" data-i18n="dev.sampleVram">8.0 GB 可用</span></div>
         </div>
 
         <!-- ── 推理引擎 + 模型（先选引擎，再选模型）── -->
@@ -218,7 +237,7 @@
         </div>
         <div id="model-note" class="banner banner-warn" hidden style="margin-top:10px"></div>
 
-        <!-- 「模型未下载」的判定依据：程序检查的目录 + 缺哪些文件（详见 app.js renderModel） -->
+        <!-- 「模型未下载」的判定依据：程序检查的目录 + 缺哪些文件（详见 js/views/modelView.js renderModelCheck） -->
         <div id="model-check" class="model-check" hidden></div>
 
         <div id="model-msg"></div>
@@ -234,7 +253,7 @@
         </div>
 
         <div class="model-load-row" style="display:flex;align-items:center;gap:12px;margin-top:12px">
-          <button class="btn btn-primary" id="btn-model-load">下载并加载模型</button>
+          <button class="btn btn-primary" id="btn-model-load" data-i18n="model.load">下载并加载模型</button>
           <div class="progress" id="model-progress" hidden style="flex:1;margin:0">
             <div class="meta"><span class="s" id="model-prog-status">准备中…</span><span class="p" id="model-prog-pct">0%</span></div>
             <div class="bar"><i id="model-prog-bar" style="width:0%"></i></div>
@@ -244,7 +263,7 @@
         <div class="sec-title" data-i18n="model.diag">诊断</div>
         <div class="banner banner-warn" id="gpu-diag">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-          <div>GPU 检测由 <code style="font-family:var(--font-mono)">crispasr.exe --diagnostics</code> 进行；若未列出独立显卡，请更新显卡 / CUDA / Vulkan 驱动后重试。</div>
+          <div data-i18n-html="model.gpuDiag">GPU 检测由 <code style="font-family:var(--font-mono)">crispasr.exe --diagnostics</code> 进行；若未列出独立显卡，请更新显卡 / CUDA / Vulkan 驱动后重试。</div>
         </div>
       </section>
 
@@ -256,11 +275,11 @@
           <div class="row"><div class="label"><div class="t" data-i18n="set.format">输出格式</div><div class="d" data-i18n="set.formatDesc">全局默认，影响单文件输出</div></div>
             <div class="seg" id="set-format"><button class="on" data-v="srt" data-i18n="set.fmtSrt">SRT 字幕</button><button data-v="txt" data-i18n="set.fmtTxt">纯文本</button></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.modelDir">模型下载位置</div><div class="d" data-i18n="set.modelDirDesc">Qwen / Whisper 模型的存储目录；留空＝程序目录下的 ov_models（重启后生效）</div></div>
-            <div class="with-browse"><input class="input mono" id="set-model-dir" placeholder="（留空＝默认位置）" style="width:260px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-model-dir-browse">浏览…</button></div></div>
+            <div class="with-browse"><input class="input mono" id="set-model-dir" data-i18n-ph="set.modelDirPh" placeholder="（留空＝默认位置）" style="width:260px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-model-dir-browse" data-i18n="common.browse">浏览…</button></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.mirror">HuggingFace 镜像站</div><div class="d" data-i18n="set.mirrorDesc">下载模型较慢时可改用镜像</div></div>
             <input class="input mono" id="set-mirror" placeholder="hf-mirror.com" style="width:200px;max-width:100%"></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.ffmpeg">FFmpeg 路径</div><div class="d" data-i18n="set.ffmpegDesc">处理视频音轨所需（留空则需要时自动下载）</div></div>
-            <div class="with-browse"><input class="input mono" id="set-ffmpeg" placeholder="（留空＝自动检测／需要时下载）" style="width:240px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-ffmpeg-browse">浏览…</button><span class="chip chip-muted" id="ff-detected" hidden>已检测</span></div></div>
+            <div class="with-browse"><input class="input mono" id="set-ffmpeg" data-i18n-ph="set.ffmpegPh" placeholder="（留空＝自动检测／需要时下载）" style="width:240px;max-width:100%"><button class="btn btn-ghost btn-sm" id="btn-ffmpeg-browse" data-i18n="common.browse">浏览…</button><span class="chip chip-muted" id="ff-detected" hidden data-i18n="set.detected">已检测</span></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.theme">外观主题</div></div>
             <div class="seg" id="set-theme"><button class="on" data-v="light" data-i18n="set.themeLight">浅色</button><button data-v="dark" data-i18n="set.themeDark">深色</button><button data-v="system" data-i18n="set.themeSystem">跟随系统</button></div></div>
           <div class="row"><div class="label"><div class="t" data-i18n="set.lang">界面语言</div></div>
@@ -278,8 +297,9 @@
 </div>
 
 <input id="hidden-file" type="file" accept="audio/*,video/*" style="display:none">
-<script src="js/bridge.js?v=5"></script>
-<script src="js/i18n.js?v=5"></script>
-<script src="js/app.js?v=5"></script>
+<script src="js/bridge.js?v=8"></script>   <!-- classic：全局 QwenAPI（未改，版本保持） -->
+<script src="js/i18n.js?v=9"></script>     <!-- classic：全局 I18N（data-i18n apply 消费面广，不迁移；未改，版本保持） -->
+<script type="module" src="js/main.js"></script>  <!-- ESM 入口：state → util → views/modelView → appCore；util.js 不再单独引入（改由 ESM import） -->
+
 </body>
 </html>
