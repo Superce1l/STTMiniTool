@@ -51,6 +51,22 @@ def resolve_web_dir() -> Path:
 
 WEB_DIR = resolve_web_dir()
 
+# ── 请求体上限 ────────────────────────────────────────────────────────
+# JSON 端点（settings/model/history…）的 patch 都是几 KB 级 → 1 MB 足够，
+# 超限即拒（防手滑/恶意巨包在 json.loads 全量进内存）。
+_MAX_JSON_BODY_BYTES = 1 * 1024 * 1024
+# 转录上传（multipart）是真实视频文件 → 上限放宽到 10 GB；超过即 413，
+# 不再无上限接受 Content-Length（此前的流式落盘只防内存膨胀，不防灌盘）。
+_MAX_UPLOAD_BYTES = 10 * 1024 ** 3
+
+
+class _BadBody(Exception):
+    """请求体不合法（JSON 解析失败 / 超上限）→ HTTP 400。
+
+    旧实现把解析失败静默回 {}，POST /api/settings 传坏 JSON 会被当成
+    空 patch「成功」——客户端永远不知道自己发错了什么。
+    """
+
 
 def _parse_multipart_stream(rfile, boundary: bytes, out_dir: Path,
                             content_length: int, chunk_size: int = 1 << 20):
@@ -204,6 +220,7 @@ class _EventHub:
     def __init__(self):
         self._subs: set[queue.Queue] = set()
         self._lock = threading.Lock()
+        self._dropped = 0        # 队列满被丢弃的事件计数（节流告警用）
 
     def subscribe(self) -> queue.Queue:
         q: queue.Queue = queue.Queue()
@@ -219,11 +236,21 @@ class _EventHub:
         msg = {"event": event, "payload": payload}
         with self._lock:
             subs = list(self._subs)
+        dropped = 0
         for q in subs:
             try:
                 q.put_nowait(msg)
             except Exception:
-                pass
+                dropped += 1     # 队列满：该订阅者收不到这条事件
+        if dropped:
+            self._dropped += dropped
+            # 不逐条刷日志（进度事件每秒多条）；首次丢弃与每累计 200 条留痕一次。
+            prev = self._dropped - dropped
+            if self._dropped == dropped or prev // 200 != self._dropped // 200:
+                from applog import log_warn
+                log_warn(f"SSE 订阅者队列已满丢弃事件（本次 {dropped} 条，"
+                         f"累计 {self._dropped} 条，订阅者 {len(subs)} 个，"
+                         f"事件 {event}）——前端可能错过进度，重连后自动补状态。")
 
 
 class WebViewServer:
@@ -265,10 +292,12 @@ class WebViewServer:
                 n = int(self.headers.get("Content-Length", 0))
                 if not n:
                     return {}
+                if n > _MAX_JSON_BODY_BYTES:
+                    raise _BadBody("json body too large")
                 try:
                     return json.loads(self.rfile.read(n).decode("utf-8"))
-                except Exception:
-                    return {}
+                except Exception as e:
+                    raise _BadBody(f"bad json: {type(e).__name__}") from None
 
             # ── DNS rebinding / CSRF 防护 ─────────────────────
             #   恶意网站可能用 DNS rebinding 把网域指向 127.0.0.1，或跨站
@@ -310,6 +339,8 @@ class WebViewServer:
                     return self._json(server.backend.health_check())
                 if path == "/api/history":
                     return self._json(server.backend.list_history())
+                if path == "/api/queue":          # 批量转录队列快照
+                    return self._json(server.backend.queue_status())
                 if path == "/api/events":
                     return self._sse()
                 if path.startswith("/api/"):
@@ -348,6 +379,10 @@ class WebViewServer:
                         return self._transcribe()
                     if path == "/api/cancel":
                         return self._json({"ok": server.backend.cancel()})
+                    if path == "/api/queue-cancel":   # 取消队列中的指定任务
+                        body = self._read_json_body()
+                        return self._json({"ok": server.backend.cancel_job(
+                            str(body.get("id", "")))})
                     if path == "/api/record-state":   # 录音开始/结束 → 后端同步（关窗确认用）
                         body = self._read_json_body()
                         server.backend.set_recording(bool(body.get("on")))
@@ -367,6 +402,8 @@ class WebViewServer:
                         return self._json(server.backend.delete_history(
                             body.get("name", "")))
                     return self._err(404, "unknown api")
+                except _BadBody as e:
+                    return self._err(400, f"bad request：{e}")
                 except Exception as e:
                     return self._err(500, str(e))
 
@@ -451,46 +488,47 @@ class WebViewServer:
                     return self._err(400, "缺少 Content-Length")
                 if n <= 0:
                     return self._err(400, "请求体为空")
+                if n > _MAX_UPLOAD_BYTES:
+                    return self._err(413, f"文件过大：上限 "
+                                          f"{_MAX_UPLOAD_BYTES // (1024 ** 3)} GB")
 
                 tmp_dir = Path(tempfile.mkdtemp(prefix="asr_web_"))
-                fields, files = _parse_multipart_stream(
-                    self.rfile, boundary, tmp_dir, n)
-                if "file" not in files:
-                    return self._err(400, "缺少 file 部件")
-                filename, in_path = files["file"]
                 try:
+                    # 此前「缺少 file 部件」/「内容为空」两个早退路径不清理
+                    # tmp_dir，异常/恶意请求会在 %TEMP% 留垃圾——统一由
+                    # 本 try/finally 兜底清理。
+                    fields, files = _parse_multipart_stream(
+                        self.rfile, boundary, tmp_dir, n)
+                    if "file" not in files:
+                        return self._err(400, "缺少 file 部件")
+                    filename, in_path = files["file"]
                     if not in_path.is_file() or in_path.stat().st_size == 0:
                         return self._err(400, "file 内容为空")
-                except OSError:
-                    return self._err(400, "file 保存失败")
 
-                opts = {
-                    "path": str(in_path),
-                    "name": filename,        # 原始上传文件名 → 输出字幕用它命名、落 subtitles/
-                    "language": (fields.get("language") or "").strip() or None,
-                    "diarize": (fields.get("diarize", "") or "").lower() in ("1", "true", "on", "yes"),
-                    "nSpeakers": fields.get("n_speakers", ""),
-                    "align": (fields.get("align", "1") or "").lower() in ("1", "true", "on", "yes"),
-                    "hint": fields.get("hint", ""),
-                }
-                try:
-                    result = server.backend.transcribe(
-                        opts, progress_cb=lambda pct, status:
-                        server.hub.publish("progress", {"pct": pct, "status": status}))
-                    return self._json(result)
-                except Exception as e:
-                    from applog import log_error
-                    log_error(f"转录失败：{filename}", exc=e)
-                    # 回结构化的 500 而非 raise（raise 会让 HTTP 层打印
-                    # traceback 并中断连接，前端只能看到网络错误）。
-                    head = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
-                    return self._err(500, head)
-                finally:
+                    opts = {
+                        "path": str(in_path),
+                        "name": filename,        # 原始上传文件名 → 输出字幕用它命名、落 subtitles/
+                        "language": (fields.get("language") or "").strip() or None,
+                        "diarize": (fields.get("diarize", "") or "").lower() in ("1", "true", "on", "yes"),
+                        "nSpeakers": fields.get("n_speakers", ""),
+                        "align": (fields.get("align", "1") or "").lower() in ("1", "true", "on", "yes"),
+                        "hint": fields.get("hint", ""),
+                    }
                     try:
-                        import shutil
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                        result = server.backend.transcribe(
+                            opts, progress_cb=lambda pct, status:
+                            server.hub.publish("progress", {"pct": pct, "status": status}))
+                        return self._json(result)
+                    except Exception as e:
+                        from applog import log_error
+                        log_error(f"转录失败：{filename}", exc=e)
+                        # 回结构化的 500 而非 raise（raise 会让 HTTP 层打印
+                        # traceback 并中断连接，前端只能看到网络错误）。
+                        head = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                        return self._err(500, head)
+                finally:
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
 
         self._httpd = ThreadingHTTPServer((self.host, self._want_port), _Handler)
         self.port = self._httpd.server_address[1]      # 取得实际绑定的端口（port=0 时）

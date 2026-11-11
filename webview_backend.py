@@ -21,381 +21,49 @@ from pathlib import Path
 import app as core          # 重用 ASREngine / 常数 / 诊断函数（__main__ guard 保护）
 from engine_types import TranscribeResult
 from settings_store import SettingsStore
+from transcription_service import TranscribeService
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# ── 模型目录：引擎 → 模型 → (backend, settings patch)。──────────────────
-#   引擎即推理核心（两组）：OpenVINO（纯 CPU 的 Qwen）与 CrispASR（GPU 加速，
-#   跑 Whisper GGML 与 Qwen3-ASR GGUF）。settings 键与 app.py 兼容：
-#     openvino → cpu_model_size("0.6B"/"1.7B")
-#     crispasr → crisp_model("whisper"/"qwen3") + whisper_size/qwen 量化键
-#   每个 entry：(引擎标签, 模型标签, backend, settings patch)
-_ENGINE_OV  = "OpenVINO"
-_ENGINE_CASR = "CrispASR"
-# OpenAI Whisper 模型标签映射（供目录 / _current_selection / 下拉等使用）
-_WHISPER_SIZES = ("base", "small", "medium", "large", "turbo")
-_WHISPER_LABEL_BY_SIZE = {
-    "base": "Whisper Base", "small": "Whisper Small", "medium": "Whisper Medium",
-    "large": "Whisper Large", "turbo": "Whisper Large Turbo",
-}
-_MODEL_CATALOG = [
-    (_ENGINE_OV, "Qwen3-ASR-0.6B",      "openvino", {"cpu_model_size": "0.6B"}),
-    (_ENGINE_OV, "Qwen3-ASR-1.7B INT8", "openvino", {"cpu_model_size": "1.7B"}),
-    (_ENGINE_CASR, "Qwen3-ASR-1.7B Q4 (CRISPASR)", "crispasr", {"crisp_model": "qwen3", "crisp_qwen_quant": "q4"}),
-    (_ENGINE_CASR, "Qwen3-ASR-1.7B Q8 (CRISPASR)", "crispasr", {"crisp_model": "qwen3", "crisp_qwen_quant": "q8"}),
-    # 日语动漫特化（cstr/qwen3-asr-1.7b-ja-anime）：同架构、针对日语微调，日文歌词/台词识别较佳。
-    (_ENGINE_CASR, "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)", "crispasr", {"crisp_model": "qwen3-ja", "crisp_qwen_quant": "q4"}),
-    (_ENGINE_CASR, "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)", "crispasr", {"crisp_model": "qwen3-ja", "crisp_qwen_quant": "q8"}),
-    # OpenAI Whisper 官方模型（ggerganov/whisper.cpp GGML）：CrispASR 的 whisper
-    # 后端直接兼容。5 档尺寸覆盖速度／精度需求。
-] + [
-    (_ENGINE_CASR, _WHISPER_LABEL_BY_SIZE[size], "crispasr",
-     {"crisp_model": "whisper", "whisper_size": size})
-    for size in _WHISPER_SIZES
-]
-_QWEN_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B Q4 (CRISPASR)",
-                          "q8": "Qwen3-ASR-1.7B Q8 (CRISPASR)"}
-_QWEN_JA_CASR_QUANT_LABEL = {"q4": "Qwen3-ASR-1.7B 日语动漫 Q4 (CRISPASR)",
-                             "q8": "Qwen3-ASR-1.7B 日语动漫 Q8 (CRISPASR)"}
-# Whisper 尺寸提示（模型标签 → 提醒文字）
-_WHISPER_MODEL_NOTES = {
-    "Whisper Large Turbo": ("Turbo（large-v3-turbo）：Large 级精度、解码速度快约 8 倍，"
-                            "显存占用约为 Large 的一半，推荐优先。"),
-    "Whisper Large":       "Large-v2：精度最高但速度最慢，适合追求极限准确度的离线场景。",
-}
-# 模型标签 → 提醒文字（Whisper 尺寸提示）
-_MODEL_NOTES = _WHISPER_MODEL_NOTES
+# ── 模型目录（拆分为 model_catalog.py；此处兼容再导出全部符号）────────
+# tests/ 与 cli_mode 仍从 webview_backend 导入 _MODEL_CATALOG 等。
+from model_catalog import (_ENGINE_OV, _ENGINE_CASR, _WHISPER_SIZES,
+                           _WHISPER_LABEL_BY_SIZE, _MODEL_CATALOG,
+                           _QWEN_CASR_QUANT_LABEL, _QWEN_JA_CASR_QUANT_LABEL,
+                           _WHISPER_MODEL_NOTES, _MODEL_NOTES, _sanitize_tag,
+                           _QWEN_CASR_MODELS, _QWEN_CASR_NOTE, _qwen_casr_dl,
+                           _COMMON_LANGS)
 
-
-def _sanitize_tag(tag: str) -> str:
-    """引擎/模型标签 → 文件名安全片段（供输出字幕文件名拼接）。
-
-    去除 Windows 文件名非法字符与路径分隔符、压掉多余空白；空串回 "model"。
-    """
-    for ch in '<>:"/\\|?*':
-        tag = tag.replace(ch, " ")
-    tag = " ".join(tag.split())
-    return tag or "model"
-
-# crispasr-Qwen 系列的 crisp_model 值（皆走 --backend qwen3-1.7b、同置 ov_models/、
-# 共享 crisp_qwen_quant，差别只在权重与下载来源）。"whisper" 不在此列。
-_QWEN_CASR_MODELS = ("qwen3", "qwen3-ja")
-# 各 crispasr-Qwen 模型在下载消息中的中文注记
-_QWEN_CASR_NOTE = {"qwen3-ja": "（日语动漫）"}
-
-
-def _qwen_casr_dl(crisp_model: str):
-    """依 crisp_model 返回对应的 (文件名, 存在检查, 下载) 三个下载器函数。
-
-    qwen3     → 标准 Qwen3-ASR-1.7B（cstr/qwen3-asr-1.7b-GGUF）
-    qwen3-ja  → 日语动漫特化（cstr/qwen3-asr-1.7b-ja-anime-GGUF）
-    让所有「crispasr-Qwen」路径共享一处分派，避免各模型分支散落各方法。
-    """
-    from downloader import (qwen3_asr_gguf_filename, quick_check_qwen3_asr_gguf,
-                            download_qwen3_asr_gguf, qwen3_asr_ja_gguf_filename,
-                            quick_check_qwen3_asr_ja_gguf, download_qwen3_asr_ja_gguf)
-    if crisp_model == "qwen3-ja":
-        return (qwen3_asr_ja_gguf_filename, quick_check_qwen3_asr_ja_gguf,
-                download_qwen3_asr_ja_gguf)
-    return (qwen3_asr_gguf_filename, quick_check_qwen3_asr_gguf,
-            download_qwen3_asr_gguf)
-
-# ── 长音频 FFmpeg 切片转录 ────────────────────────────────────────────
-#   超长音频一次性塞给引擎会造成：内存峰值高、OpenVINO 的 KV-Cache 线性
-#   膨胀、转录中途失败要整段重来。这里先用 ffmpeg 把音频按等长窗口切片（相邻
-#   片段重叠 SLICE_OVERLAP 秒，避免切点把一个字/一句话劈成两半造成漏识），
-#   逐片转录，再把各片 SRT 解析后按片起点平移、重叠区去重合并成整份结果。
-#   说话者分离只在单片内做（跨片依时间中点指派，与整段行为一致）。
-_SLICE_THRESHOLD_SECS = 2 * 3600     # 超过 2 小时启用切片
-_SLICE_WINDOW_SECS = 30 * 60         # 每片 30 分钟（内存充足时的上限）
-_SLICE_OVERLAP_SECS = 15             # 相邻片段重叠 15 秒
-
-# ── 切片时长自适应（依可用内存）────────────────────────────
-# 内存依据：切片解码进内存后是 16kHz float32 mono（64KB/s），VAD/引擎处理
-# 还会产生数份拷贝（按 ~5 倍估算）。默认 30 分钟片 ≈ 110MB 原始 ≈ 550MB
-# 实占，8GB 空闲内存的机器毫无压力；空闲内存只有几百 MB 的机器若仍切
-# 30 分钟，转录中易触发系统交换甚至 OOM。故按可用物理内存收缩片长：
-#   预算 = 可用内存 × 25%（给引擎/OS 留大头）→ 秒数 = 预算 ÷ 每秒实占
-# 夹紧 [5 分钟, 30 分钟]：下限保证重叠区（15s）不退化，上限即原行为。
-_SLICE_MEM_BUDGET_FRAC = 0.25
-_SLICE_MEM_PER_SEC = 65536 * 5       # 64KB/s 原始 × ~5 份处理拷贝
-_SLICE_WINDOW_MIN_SECS = 5 * 60
-
-
-def _avail_phys_bytes() -> int | None:
-    """可用物理内存（字节）；Windows GlobalMemoryStatusEx，失败回 None。"""
-    if sys.platform != "win32":
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", wintypes.DWORD),
-                ("dwMemoryLoad", wintypes.DWORD),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
-        st = _MEMORYSTATUSEX()
-        st.dwLength = ctypes.sizeof(st)
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
-            return None
-        return int(st.ullAvailPhys)
-    except Exception:
-        return None
-
-
-def _slice_window_secs() -> int:
-    """依可用物理内存智能决定切片时长（秒）。
-
-    内存充足 → 30 分钟（与原固定值一致，行为不变）；空闲内存紧张时按
-    预算公式收缩，最低 5 分钟。查询失败（非 Windows 等）回默认上限。
-    """
-    avail = _avail_phys_bytes()
-    if not avail:
-        return _SLICE_WINDOW_SECS
-    budget = avail * _SLICE_MEM_BUDGET_FRAC
-    secs = int(budget / _SLICE_MEM_PER_SEC)
-    return max(_SLICE_WINDOW_MIN_SECS, min(_SLICE_WINDOW_SECS, secs))
-
-
-def _ffprobe_duration(ff: Path, audio: Path) -> float | None:
-    """ffprobe 读取音频总时长（秒）；失败返回 None。"""
-    ffprobe = ff.parent / ("ffprobe.exe" if ff.suffix.lower() == ".exe"
-                           else "ffprobe")
-    if not ffprobe.exists():
-        ffprobe = ff.with_name("ffprobe" + ff.suffix)
-    try:
-        import subprocess
-        r = subprocess.run(
-            [str(ffprobe), "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(audio)],
-            capture_output=True, text=True, timeout=30,
-            creationflags=0x08000000 if sys.platform == "win32" else 0)
-        return float(r.stdout.strip())
-    except Exception:
-        return None
-
-
-def _slice_plan(duration: float, window_secs: int | None = None) -> list[tuple[float, float]]:
-    """总时长 → [(片起点, 片终点)]，相邻片重叠 _SLICE_OVERLAP_SECS。
-
-    window_secs 省略时依可用内存自适应（_slice_window_secs）。
-    """
-    window = window_secs if window_secs is not None else _slice_window_secs()
-    step = window - _SLICE_OVERLAP_SECS
-    spans = []
-    start = 0.0
-    while start < duration - 0.5:
-        end = min(start + window, duration)
-        spans.append((start, end))
-        if end >= duration:
-            break
-        start += step
-    return spans or [(0.0, duration)]
-
-
-def _merge_sliced_segments(all_parts: list[list[dict]]) -> list[dict]:
-    """各片 segments（已含绝对时间）→ 去重合并。
-
-    重叠区（相邻片 15 秒）里两片会识别出同一句；跨越片边界的句子必在其中
-    一侧被截断：跨片尾的句子在前一片是前半、后一片完整；跨片首的句子在
-    前一片完整、后一片只剩尾段。同一句只保留**更完整的版本**（文字更长者，
-    其次时长更长者；完全等同取后一片）——无条件取某一片都会丢字：取后一片
-    会丢掉「后一片自其起点截断的尾段」，取前一片则会丢掉「前一片自其终点
-    截断的前半」。
-    """
-    if not all_parts:
-        return []
-
-    def _dur(seg: dict) -> float:
-        return max(0.0, seg["end"] - seg["start"])
-
-    def _norm(t: str) -> str:
-        return "".join(str(t).split())
-
-    def _is_dup(a: dict, b: dict) -> bool:
-        ov = min(a["end"], b["end"]) - max(a["start"], b["start"])
-        if ov <= 0:
-            return False
-        ta, tb = _norm(a.get("text", "")), _norm(b.get("text", ""))
-        if ta and ta == tb:
-            return True
-        shorter = min(_dur(a), _dur(b))
-        return shorter > 0 and ov > 0.4 * shorter   # 重叠过半＝同一句（容时间抖动）
-
-    def _prefer(a: dict, b: dict) -> dict:
-        """同一句的两个版本 → 更完整者；平手取 b（后一片，时间戳距片缘较远）。"""
-        ta, tb = _norm(a.get("text", "")), _norm(b.get("text", ""))
-        if len(ta) != len(tb):
-            return a if len(ta) > len(tb) else b
-        da, db = _dur(a), _dur(b)
-        if abs(da - db) > 0.05:
-            return a if da > db else b
-        return b
-
-    merged = list(all_parts[0])
-    for part in all_parts[1:]:
-        if not part:
-            continue
-        out: list[dict] = []
-        i = 0                       # merged 中尚未确定归属的行指针
-        for seg in part:
-            while i < len(merged) and merged[i]["end"] <= seg["start"]:
-                out.append(merged[i])              # 早于 seg 结束 → 不可能再重复
-                i += 1
-            hit = False
-            j = i
-            while j < len(merged) and merged[j]["start"] < seg["end"]:
-                if _is_dup(merged[j], seg):
-                    merged[j] = _prefer(merged[j], seg)
-                    hit = True
-                    break
-                j += 1
-            if not hit:
-                out.append(seg)
-        out.extend(merged[i:])
-        out.sort(key=lambda s: (s["start"], s["end"]))
-        merged = out
-    return merged
-
-
-def _srt_ts_fmt(sec: float) -> str:
-    ms = max(0, int(round(sec * 1000)))
-    h, ms = divmod(ms, 3600000)
-    m, ms = divmod(ms, 60000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+# ── 长音频 FFmpeg 切片转录（纯函数层拆分为 slicing.py）────────────────
+# 切片计划、重叠区合并去重、SRT 解析、跨片说话者匹配等构件见 slicing.py；
+# 本模块保留调度层（_transcribe_sliced）并兼容再导出，tests/ 不受影响。
+#
+# 说话者分离是「与后端无关的外部 ONNX」(diarize.py / DiarizationEngine)：
+# OpenVINO 与 CRISPASR(whisper/qwen) 皆支持——前者 process_file 内置 use_diar 分支，
+# 后者由 crisp_engine._apply_diarization 依时间指派。diar_engine 由 _ensure_diarization 挂上。
+from slicing import (_SLICE_THRESHOLD_SECS, _SLICE_WINDOW_SECS,
+                     _SLICE_OVERLAP_SECS, _SLICE_MEM_BUDGET_FRAC,
+                     _SLICE_MEM_PER_SEC, _SLICE_WINDOW_MIN_SECS,
+                     _avail_phys_bytes, _slice_window_secs, _ffprobe_duration,
+                     _slice_plan, _merge_sliced_segments,
+                     _SPK_MATCH_SIM, _match_speaker, _srt_ts_to_sec,
+                     _parse_srt, parse_srt_to_segments, _rich_to_segments)
 
 
 # 说话者分离是「与后端无关的外部 ONNX」(diarize.py / DiarizationEngine)：
 # OpenVINO 与 CRISPASR(whisper/qwen) 皆支持——前者 process_file 内置 use_diar 分支，
 # 后者由 crisp_engine._apply_diarization 依时间指派。diar_engine 由 _ensure_diarization 挂上。
 
-# 跨片说话者匹配阈值：声纹中心 cosine 相似度 ≥ 此值视为同一人。
-# 跨片匹配同一人要比 diarize.SPLIT_SURE_DIST（0.38 → sim 0.62）宽松——
-# 同一人跨片的中心漂移大于片内子群，取 sim ≥ 0.70 折衷误并/误开两类错误。
-_SPK_MATCH_SIM = 0.70
+# 跨片说话者匹配阈值 _SPK_MATCH_SIM / _match_speaker：见 slicing.py（兼容再导出）。
 
 
-def _match_speaker(emb, global_spk: list) -> int:
-    """把一个片内声纹中心匹配到全局说话者；与谁都够不像则新开一人。
+class WebBackend(TranscribeService):
+    """桌面 WebView 的后端。HTTP 层（webview_server）持有一个实例。
 
-    global_spk: [{"label": int, "emb": ndarray, "n": 样本数}]（中心就地更新）
-    返回全局说话者编号（1 起）。跨片映射的关键：每片独立聚类产生的「说话者1」
-    编号互不相干，唯有声纹可比——匹配上同一全局中心才能保证整份字幕里
-    同一人始终是同一个编号。
+    转录编排（transcribe / _transcribe_sliced / ffmpeg 就绪）继承自
+    transcription_service.TranscribeService；本类持有全部共享状态并负责
+    模型加载、设置、历史与队列管理。
     """
-    import numpy as _np
-    best, best_sim = None, _SPK_MATCH_SIM
-    for g in global_spk:
-        sim = float(emb @ g["emb"])
-        if sim > best_sim:
-            best, best_sim = g, sim
-    if best is None:
-        label = (global_spk[-1]["label"] + 1) if global_spk else 1
-        global_spk.append({"label": label, "emb": emb, "n": 1})
-        return label
-    # 运行中心更新：同一个人跨片的声纹微差取滑动平均，后续片匹配更稳
-    n = best["n"] + 1
-    c = best["emb"] * best["n"] + emb
-    nrm = float(_np.linalg.norm(c))
-    best["emb"] = c / nrm if nrm > 1e-9 else c
-    best["n"] = n
-    return best["label"]
-
-# 识别语言：crispasr 使用的常用语言清单（OpenVINO 改用 processor 的）
-_COMMON_LANGS = [
-    "Chinese", "English", "Japanese", "Korean", "Cantonese", "French", "German",
-    "Spanish", "Portuguese", "Russian", "Arabic", "Thai", "Vietnamese",
-    "Indonesian", "Malay",
-]
-
-
-def _srt_ts_to_sec(ts: str) -> float:
-    """'00:00:01,560' → 1.56 秒。"""
-    ts = ts.strip().replace(".", ",")
-    hms, _, ms = ts.partition(",")
-    h, m, s = hms.split(":")
-    return int(h) * 3600 + int(m) * 60 + int(s) + (int(ms) / 1000.0 if ms else 0.0)
-
-
-def _parse_srt(srt_text: str) -> list[dict]:
-    """解析 SRT 文字为 [{"start","end","text"}]（原 api_server._parse_srt 的内联版，
-    端点服务移除后仅供本地 SRT 解析使用）。"""
-    blocks = srt_text.replace("\r\n", "\n").replace("\r", "\n").strip().split("\n\n")
-    out = []
-    for block in blocks:
-        rows = [r for r in block.split("\n") if r.strip()]
-        tl = next((i for i, r in enumerate(rows) if "-->" in r), None)
-        if tl is None:
-            continue
-        a, _, b = rows[tl].partition("-->")
-        try:
-            start = _srt_ts_to_sec(a)
-            end = _srt_ts_to_sec(b)
-        except (ValueError, IndexError):
-            continue
-        text = "\n".join(rows[tl + 1:]).strip()
-        if text:
-            out.append({"start": start, "end": end, "text": text})
-    return out
-
-
-def parse_srt_to_segments(srt_path) -> list[dict]:
-    """把 process_file 产出的 SRT 解析成前端要的 segments。
-
-    说话者分离时，SRT 文字以「说话者 N：…」开头 → 拆出 speaker 与 text。
-    """
-    if not srt_path or not Path(srt_path).exists():
-        return []
-    raw = _parse_srt(Path(srt_path).read_text(encoding="utf-8"))
-    out = []
-    for s in raw:
-        text, speaker = s["text"], None
-        if "：" in text[:8]:
-            head, _, rest = text.partition("：")
-            # 简体为主（引擎统一输出简体）；保留繁体判断以防上游标签未转换
-            if head.startswith("说话者") or head.startswith("說話者"):
-                digits = "".join(c for c in head if c.isdigit())
-                speaker = int(digits) if digits else None
-                text = rest
-        out.append({"start": s["start"], "end": s["end"], "speaker": speaker, "text": text})
-    return out
-
-
-def _rich_to_segments(rich) -> list[dict]:
-    """引擎返回的字级 segments（TranscribeResult.segments_rich）→ 前端格式。
-
-    引擎给的 speaker 是原始标签（"说话者N" 或 None/int）；此处正规化成整数，
-    与 parse_srt_to_segments 的前端契约一致。words 原样带出（[]=无对齐）。
-    """
-    out = []
-    for seg in (rich or []):
-        spk = seg.get("speaker")
-        speaker = None
-        if isinstance(spk, int):
-            speaker = spk
-        elif isinstance(spk, str):
-            digits = "".join(c for c in spk if c.isdigit())
-            speaker = int(digits) if digits else None
-        out.append({
-            "start": seg["start"], "end": seg["end"],
-            "speaker": speaker, "text": seg["text"],
-            "words": seg.get("words") or [],
-        })
-    return out
-
-
-class WebBackend:
-    """桌面 WebView 的后端。HTTP 层（webview_server）持有一个实例。"""
 
     def __init__(self, on_event=None):
         """on_event(event:str, payload:dict)：状态/进度推送回调（可选）。"""
@@ -416,6 +84,11 @@ class WebBackend:
         # 副本机制在构造本类前改 core.SETTINGS_FILE，故这里取到的已是生效路径。
         self.settings = SettingsStore(
             getattr(core, "SETTINGS_FILE", BASE_DIR / "settings.json"))
+        # ── 批量转录队列：并发第二请求不再直接报错而是排队（串行执行）────
+        # 事件经 _queue_event → SSE（event=queue）推送；/api/transcribe 的
+        # 同步语义不变（仍走 transcribe()），队列仅供批量入口使用。
+        from transcription_queue import TaskQueue
+        self._tx_queue = TaskQueue(on_event=self._queue_event)
         self._seed_defaults()            # 首次启动（无 backend）→ 种子默认模型
         self._apply_runtime_prefs()      # 启动即套用持久化偏好（VAD/简繁/镜像/格式）
 
@@ -838,365 +511,11 @@ class WebBackend:
         except Exception:
             return ""
 
-    # ── 转录 ────────────────────────────────────────────────
-    # opts: {path, language, diarize, nSpeakers, align, hint}
-    # progress_cb(pct:int, status:str)
-    def transcribe(self, opts: dict, progress_cb=None) -> dict:
-        import time as _time
-        from applog import log_transcribe
-        if not getattr(self.engine, "ready", False):
-            raise RuntimeError("模型尚未加载完成，请稍候再试。")
-        # 忙碌 check-and-set（独立小锁；self._lock 会在整个引擎调用期间被持有，
-        # 不能用来做这道 gate——否则两道门互相等死锁）。并发第二请求直接拒绝，
-        # 且只有置位者能在 finally 里清 flag，避免先结束者清掉后到者的忙碌状态。
-        if not self._transcribe_gate.acquire(blocking=False):
-            raise RuntimeError("已有识别任务进行中，请稍候再试。")
-        path = opts.get("path")
-        if not path or not Path(path).exists():
-            raise RuntimeError("找不到音频文件。")
-        self._cancel = False
-        # 引擎侧取消事件（两引擎同契约）：crispasr 据此杀子进程；OpenVINO 在
-        # process_file 段间检查。「单片/单段转录中」也能立即取消。
-        cancel_ev = getattr(self.engine, "cancel_event", None)
-        if cancel_ev is not None:
-            cancel_ev.clear()
-        self._transcribing = True
-        _t0 = _time.monotonic()
-        eng_label, model_label = getattr(self, "_active_label", None) or self._current_selection()
-        log_transcribe(f"开始转录：{Path(path).name}"
-                       f"（{eng_label} · {model_label}，"
-                       f"语言={opts.get('language') or '自动'}"
-                       f"{'，分离' if opts.get('diarize') else ''}）")
+    # ── 转录编排已拆分：transcription_service.TranscribeService（本类继承之）──
+    # transcribe / _transcribe_sliced / _resolve_ffmpeg / _ensure_ffmpeg 见该模块；
+    # self.* 状态（engine/_cancel/_emit/_dl_progress/settings…）仍归本类所有。
 
-        def _cb(i, total, msg):
-            if progress_cb:
-                pct = min(99, int((i / max(total, 1)) * 100))
-                progress_cb(pct, msg)
-
-        # 视频 → 先抽音轨
-        audio_path = Path(path)
-        tmp_extra = None
-        try:
-            ext = audio_path.suffix.lower()
-            from ffmpeg_utils import VIDEO_EXTS
-            if ext in VIDEO_EXTS:
-                from ffmpeg_utils import extract_audio_to_wav
-                ff = self._ensure_ffmpeg()
-                if not ff:
-                    raise RuntimeError("上传为视频但找不到 ffmpeg，且自动下载失败，无法抽音轨。")
-                wav = audio_path.with_suffix(".extracted.wav")
-                extract_audio_to_wav(audio_path, wav, ff)
-                audio_path, tmp_extra = wav, wav
-
-            want_align = bool(opts.get("align", True))
-            want_diar = bool(opts.get("diarize"))
-
-            # ── 时间轴对齐（FA）：缺模型则按需下载（移植自 app.py 的协调层）──
-            if want_align:
-                self._ensure_fa()
-            if hasattr(self.engine, "use_aligner") and getattr(self.engine, "_fa_bin", None):
-                self.engine.use_aligner = want_align
-
-            # ── 说话者分离：外部 ONNX，与后端无关。缺模型则下载 + 挂上 diar_engine ──
-            if want_diar:
-                if not (getattr(self.engine, "diar_engine", None)
-                        and getattr(self.engine.diar_engine, "ready", False)):
-                    try:
-                        self._ensure_diarization()
-                    except Exception as e:
-                        head = str(e).splitlines()[0][:100] if str(e) else type(e).__name__
-                        self._emit("progress", {"pct": 0, "status": f"说话者分离模型下载失败：{head}"})
-
-            n_spk = opts.get("nSpeakers")
-            n_speakers = int(n_spk) if str(n_spk).isdigit() else None
-
-            # 语言：空字符串 / 自动检测 / auto → None（让引擎自动检测）
-            _lang = (opts.get("language") or "").strip()
-            if _lang in ("", "自动检测", "auto"):
-                _lang = None
-
-            # 输出落点：subtitles/ 下、用「原始上传文件名」命名（可在「开启输出文件夹」找到）。
-            # 上传文件名为使用者可控（含 LAN/外网端点）→ 必须只取基名，杜绝路径穿越。
-            srt_dir = Path(getattr(core, "SRT_DIR", BASE_DIR / "subtitles"))
-            srt_dir.mkdir(parents=True, exist_ok=True)
-            raw_name = opts.get("name") or Path(path).name
-            out_name = Path(str(raw_name).replace("\\", "/")).name   # 去除任何目录成分
-            if not out_name or out_name.startswith("."):
-                out_name = "transcript"
-            # 文件名拼接「实际加载」的引擎与模型（非 settings 里记住的选择——
-            # 忙碌期间选择可被改而引擎未换，标签必须反映真正跑的引擎）：
-            # 唯一.flac → 唯一 [CrispASR · Whisper Base].flac
-            # （标签安全化：去路径非法字符、压空白；「.」换「·」——无扩展名文件的
-            # out_ref 以「…0.6B]」结尾时，write_transcript 的 ref.stem 与切片路径的
-            # with_suffix 会把它当扩展名剥掉，产生残缺文件名）
-            tag = _sanitize_tag(f"{eng_label} · {model_label}").replace(".", "·")
-            p = Path(out_name)
-            out_name = f"{p.stem} [{tag}]{p.suffix}" if p.suffix else f"{p.stem} [{tag}]"
-            out_ref = srt_dir / out_name
-            # 防呆：确认解析后仍在 subtitles/ 内
-            try:
-                if srt_dir.resolve() not in out_ref.resolve().parents:
-                    out_ref = srt_dir / "transcript"
-            except Exception:
-                out_ref = srt_dir / "transcript"
-
-            with self._lock:
-                self._apply_chunk_secs(want_align)   # 任务自适应的每段上限（对齐→短段抗漂移）
-
-                # ── 长音频切片：超过阈值先用 ffmpeg 切片再逐片转录 ──────────
-                ff = self._resolve_ffmpeg()
-                dur = _ffprobe_duration(ff, audio_path) if ff else None
-                if dur and dur > _SLICE_THRESHOLD_SECS:
-                    res = self._transcribe_sliced(
-                        audio_path, dur, out_ref, _cb, _lang, want_diar, n_speakers)
-                else:
-                    res = self.engine.process_file(
-                        audio_path,
-                        progress_cb=_cb,
-                        language=_lang,
-                        context=(opts.get("hint") or "").strip() or None,
-                        diarize=want_diar,
-                        n_speakers=n_speakers,
-                        original_path=out_ref,
-                        out_format="srt",
-                    )
-        finally:
-            self._transcribing = False
-            try:
-                self._transcribe_gate.release()   # 只有置位者会走到这里（acquire 失败早已抛出）
-            except RuntimeError:
-                pass
-            if tmp_extra:
-                try:
-                    Path(tmp_extra).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-        if self._cancel or (res is not None and res.cancelled):
-            log_transcribe(f"转录已取消：{Path(path).name}")
-            raise RuntimeError("已取消。")
-        if not res.output:
-            diag = res.diag
-            log_transcribe(f"转录未产生字幕：{Path(path).name}（{diag or '未检测到人声'}）")
-            raise RuntimeError(diag or "未产生字幕（未检测到人声）。")
-
-        # UI 永远以内存中的 segments 渲染波形/字幕卡（需时间轴），故引擎固定产 SRT。
-        # 但「输出格式」设置决定使用者实际取得的存档文件：选纯文字 → 另写 .txt、移除 .srt。
-        # 优先用引擎的字级结构（含 words，驱动卡拉OK）；无则退回解析 SRT（行级）。
-        rich = res.segments_rich
-        srt_path = res.output
-        segments = _rich_to_segments(rich) if rich else parse_srt_to_segments(srt_path)
-        saved = str(srt_path)
-        out_fmt = (self._settings_raw().get("output_format", "srt") or "srt").lower()
-        if out_fmt == "txt":
-            try:
-                from subtitle_lines import write_transcript
-                lines = [(seg["start"], seg["end"], seg["text"],
-                          (f'说话者{seg["speaker"]}' if seg.get("speaker") else None))
-                         for seg in segments]
-                txt = write_transcript(Path(srt_path), lines, out_format="txt")
-                try:
-                    Path(srt_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                saved = str(txt)
-            except Exception:
-                traceback.print_exc()          # 退回 SRT，不让转录整体失败
-
-        log_transcribe(
-            f"转录完成：{Path(path).name} → {Path(saved).name}"
-            f"（{len(segments)} 段，耗时 {_time.monotonic() - _t0:.1f}s，"
-            f"{eng_label} · {model_label}）")
-        if progress_cb:
-            progress_cb(100, "完成")
-        return {"segments": segments, "srtPath": saved}
-
-    def _resolve_ffmpeg(self):
-        """解析 ffmpeg：优先采用设置中手动指定的 ffmpeg_path，否则自动检测。
-
-        与 setting.py 的检测顺序一致（使用者手动指定 → 系统 PATH / App 目录）。
-        """
-        from ffmpeg_utils import find_ffmpeg
-        p = (self._settings_raw().get("ffmpeg_path", "") or "").strip()
-        if p and Path(p).exists():
-            return Path(p)
-        return find_ffmpeg()
-
-    # ── 长音频切片转录 ──────────────────────────────────────────────────
-    def _transcribe_sliced(self, audio_path: Path, duration: float,
-                           out_ref: Path, _cb, lang, want_diar, n_speakers):
-        """超过阈值的长音频：ffmpeg 切片 → 逐片转录 → 合并 SRT。
-
-        每片独立调 engine.process_file（重叠 15 秒防切点截字），产出各自 SRT
-        后解析成 segments，合并去重，最后一次性写出整份 SRT（经 write_transcript
-        以 out_ref 命名落盘）。任一片失败即中止（与整段转录的失败语义一致）。
-
-        说话者分离：不再交引擎逐片自做（每片独立聚类的标签编号互不相干，
-        同一人在片 1 是「说话者1」、片 2 可能变「说话者2」），改由本层统一
-        做——逐片聚类取声纹中心 → 跨片映射到全局编号（_match_speaker）→
-        合并去重后按时间中点统一指派，整份字幕的说话者编号保持一致。
-        返回 TranscribeResult（output=整份 SRT 路径；None=全片无声）。
-        """
-        import subprocess
-        import tempfile
-        from ffmpeg_utils import _NO_WINDOW
-        from subtitle_lines import write_transcript
-
-        ff = self._resolve_ffmpeg()
-        if not ff:
-            raise RuntimeError("长音频切片需要 ffmpeg，且自动下载失败。")
-
-        # 说话者分离引擎（want_diar 但未就绪 → 尝试补挂一次，与 transcribe 同语义）
-        diar = getattr(self.engine, "diar_engine", None) if want_diar else None
-        if want_diar and not (diar and getattr(diar, "ready", False)):
-            try:
-                self._ensure_diarization()
-            except Exception:
-                traceback.print_exc()
-            diar = getattr(self.engine, "diar_engine", None)
-        if not (diar and getattr(diar, "ready", False)):
-            diar = None
-
-        plan = _slice_plan(duration)
-        all_segments: list[list[dict]] = []
-        _silent_parts: list[bool] = []   # 逐片记录是否无声（全静音时给诊断用）
-        global_spk: list[dict] = []      # 全局说话者声纹中心（跨片映射目标）
-        slice_diar: list[list[tuple[float, float, int]]] = []   # 各片 (绝对起, 绝对止, 全局标签)
-
-        with tempfile.TemporaryDirectory(prefix="asr_slice_") as td:
-            tmp = Path(td)
-            for i, (start, end) in enumerate(plan, 1):
-                if self._cancel:
-                    return TranscribeResult(cancelled=True)
-                seg_wav = tmp / f"slice_{i:03d}.wav"
-                # -ss 放 -i 前（输入侧快速定位，大偏移时不解码整段前缀）。
-                # 此时输入时间戳被重置为 0，-to <全局终点> 会被误读成
-                # 「重置后时间轴的终点」→ 第 2 片起每片严重超长。故用
-                # -t <片长> 显式指定时长，语义不受 -ss 位置影响。
-                cmd = [str(ff), "-y", "-ss", f"{start:.3f}",
-                       "-t", f"{end - start:.3f}",
-                       "-i", str(audio_path), "-vn", "-ar", "16000", "-ac", "1",
-                       "-f", "wav", str(seg_wav)]
-                proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE,
-                                      creationflags=_NO_WINDOW)
-                if proc.returncode != 0 or not seg_wav.exists():
-                    err = proc.stderr.decode(errors="replace").splitlines()
-                    raise RuntimeError(
-                        f"ffmpeg 切片失败（片 {i}/{len(plan)}）："
-                        f"{err[-1] if err else '未知错误'}")
-
-                # 说话者分离：转录前对本片独立聚类 → 标签映射到全局编号
-                if diar is not None:
-                    try:
-                        from audio_io import load_audio_16k_mono
-                        seg_audio, _ = load_audio_16k_mono(seg_wav, core.SAMPLE_RATE)
-                        segs, cents = diar.diarize_detailed(
-                            seg_audio, n_speakers=n_speakers)
-                        mapped = []
-                        for (t0, t1, lbl) in segs:
-                            g = (_match_speaker(cents[lbl], global_spk)
-                                 if lbl in cents else 1)
-                            mapped.append((t0 + start, t1 + start, g))
-                        slice_diar.append(mapped)
-                    except Exception:
-                        traceback.print_exc()   # 分离失败 → 本片无标签，不挡转录
-
-                def _slice_cb(done, total, msg, _i=i, _n=len(plan)):
-                    # engine 的回调是 (i, total, msg) 三参；这里先把片内进度换算成
-                    # 「全局百分比」再以 (pct, 100, msg) 交给 _cb——直接转发 done/total
-                    # 会让进度条在每片边界从 0 重爬（N 片来回跳 N 次）。
-                    base = (_i - 1) / _n
-                    span = 1.0 / _n
-                    frac = (done / max(total, 1)) if total else 0
-                    _cb(min(99, int((base + span * frac) * 100)), 100,
-                        f"切片转录 {msg}（第 {_i}/{_n} 片）")
-
-                # diarize=False：分离已由本层统一处理（引擎逐片自做标签会跨片漂移）
-                part = self.engine.process_file(
-                    seg_wav,
-                    progress_cb=_slice_cb,
-                    language=lang,
-                    context=None,
-                    diarize=False,
-                    n_speakers=n_speakers,
-                    original_path=None,
-                    out_format="srt",
-                )
-                if part.cancelled:
-                    return TranscribeResult(cancelled=True)
-                if not part.output:
-                    _silent_parts.append(True)
-                    continue      # 该片无声 → 跳过（如纯音乐片段）
-                _silent_parts.append(False)
-                # 片内时间已是绝对时间（-ss 放在 -i 前 = 输入侧定位，
-                # 输出的 pts 从 0 起算，故把片起点平移回全局时间轴）
-                part_segs = _rich_to_segments(part.segments_rich) \
-                    if part.segments_rich else parse_srt_to_segments(part.output)
-                for seg in part_segs:
-                    seg["start"] += start
-                    seg["end"] += start
-                    seg.pop("speaker", None)   # 说话者稍后由全局分离结果统一指派
-                    for w in (seg.get("words") or []):
-                        w["start"] = w.get("start", 0) + start
-                        w["end"] = w.get("end", 0) + start
-                all_segments.append(part_segs)
-
-        merged = _merge_sliced_segments(all_segments)
-        if not merged:
-            # 所有片都无声（每片 process_file 回 None）→ 给出与整段路径
-            # 对等的诊断，而非笼统的「未检测到人声」。
-            return TranscribeResult(diag=(
-                f"⚠ 切片转录未产生字幕：{sum(_silent_parts)}/{len(plan)} 片"
-                f"未识别到内容（音频可能为纯音乐/静音，或音轨编码异常）。"))
-
-        # 说话者指派：行时间中点落在哪个全局说话者段落；无覆盖段时取最近段
-        flat = [seg for segs in slice_diar for seg in segs]
-        if flat:
-            for seg in merged:
-                mid = (seg["start"] + seg["end"]) / 2.0
-                cov = [g for g in flat if g[0] <= mid < g[1]]
-                if cov:
-                    seg["speaker"] = cov[0][2]
-                else:
-                    seg["speaker"] = min(flat, key=lambda g: abs(
-                        (g[0] + g[1]) / 2.0 - mid))[2]
-
-        lines = [(seg["start"], seg["end"], seg["text"],
-                  (f'说话者{seg["speaker"]}' if seg.get("speaker") else None))
-                 for seg in merged]
-        out = out_ref.with_suffix(".srt")
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, (s0, e0, text, spk) in enumerate(lines, 1):
-                prefix = f"{spk}：" if spk else ""
-                f.write(f"{idx}\n{_srt_ts_fmt(s0)} --> {_srt_ts_fmt(e0)}\n"
-                        f"{prefix}{text}\n\n")
-        rich = [{"start": seg["start"], "end": seg["end"], "text": seg["text"],
-                 "speaker": seg.get("speaker"), "words": seg.get("words") or []}
-                for seg in merged]
-        return TranscribeResult(output=out, segments_rich=rich)
-
-    def _ensure_ffmpeg(self):
-        """返回可用的 ffmpeg；找不到时自 HF 下载精简 zip 解压后再找。
-
-        ffmpeg 不随安装包附带 → 首次需要（转录视频）时自动下载到 <app>/ffmpeg/。
-        下载进度经 self._dl_progress → SSE 推给前端。失败回 None（由上层报错）。
-        """
-        ff = self._resolve_ffmpeg()
-        if ff:
-            return ff
-        try:
-            from ffmpeg_utils import get_default_ffmpeg_dest
-            from downloader import quick_check_ffmpeg, download_ffmpeg
-            dest = get_default_ffmpeg_dest()
-            if not quick_check_ffmpeg(dest):
-                self._st("下载 ffmpeg（视频音轨提取）…")
-                download_ffmpeg(dest, progress_cb=self._dl_progress)
-            return self._resolve_ffmpeg()
-        except Exception:
-            traceback.print_exc()
-            return None
+    # （_transcribe_sliced / _ensure_ffmpeg 亦在 transcription_service 内。）
 
     def _model_dir(self) -> Path:
         s = self._settings_raw()
@@ -1383,15 +702,28 @@ class WebBackend:
 
     @staticmethod
     def _ver_newer(a: str, b: str) -> bool:
-        """语义化版本比较 a > b（逐段数值比较，短的补 0；非数字段记 0）。"""
-        def nums(v: str) -> list[int]:
-            return [int(x) if x.isdigit() else 0
-                    for x in re.split(r"[.\-+]", v.strip()) if x != ""]
-        na, nb = nums(a), nums(b)
+        """语义化版本比较 a > b（逐段数值比较，短的补 0）。
+
+        预发布号（-rc.1 / -beta2…）按 semver 语义视为**低于**同数值正式版：
+        "2.3.0-rc.1" < "2.3.0"（旧实现把 "-rc.1" 拆成数值段记 0，会误判
+        预发布比正式版新）。构建元数据（+build.1）不参与比较。
+        """
+        def parse(v: str) -> tuple[list[int], bool]:
+            v = v.strip().lstrip("vV").split("+", 1)[0]
+            pre = "-" in v
+            main = re.split(r"[-.]", v.split("-", 1)[0])
+            nums = [int(x) if x.isdigit() else 0 for x in main if x != ""]
+            return nums, pre
+
+        na, a_pre = parse(a)
+        nb, b_pre = parse(b)
         n = max(len(na), len(nb))
         na += [0] * (n - len(na))
         nb += [0] * (n - len(nb))
-        return na > nb
+        if na != nb:
+            return na > nb
+        # 数值相同：正式版 > 预发布（a 已发布、b 仍是预发布才算更新）
+        return (not a_pre) and b_pre
 
     # ── 转录历史（subtitles/ 目录的产出回填）───────────────────────────
     def list_history(self) -> dict:
@@ -1977,6 +1309,35 @@ class WebBackend:
         self._apply_mirror(s.get("hf_mirror", ""))
         self._apply_output_format(s.get("output_format", "srt"))
 
-    # ── 批次（已移除批次识别功能，保留界面兼容空实现）────────
-    def get_batch(self) -> dict:
-        return {"summary": {"done": 0, "total": 0}, "items": []}
+    # ── 批量转录队列（transcription_queue.TaskQueue 的包装）───────────────
+    def _queue_event(self, kind: str, job: dict):
+        """队列事件 → SSE（event=queue）。job 已脱敏（无 fn），可直接序列化。"""
+        self._emit("queue", {"kind": kind, **job})
+
+    def enqueue_transcribe(self, opts: dict, progress_cb=None) -> str:
+        """把一个转录任务排入队列，立即返回 job_id。
+
+        执行体复用 transcribe()（含切片/取消/输出命名全部语义）；排队中取消
+        → 直接跳过，运行中取消 → cancel_job 会接通现有取消链（self._cancel +
+        引擎 cancel_event）。并发上限由 TaskQueue(maxsize) 控制，超出抛错。
+        """
+        label = Path(str(opts.get("path", ""))).name or "transcribe"
+
+        def _job(_cancel_event):
+            # 取消走 WebBackend.cancel()（cancel_job 接通），不走队内事件：
+            # 引擎子进程终止/切片段间检查两条既有链路都已挂在 self._cancel 上。
+            return self.transcribe(opts, progress_cb=progress_cb)
+
+        return self._tx_queue.submit(_job, label=label)
+
+    def queue_status(self) -> dict:
+        """队列快照（全部任务 + 当前运行 id）。"""
+        return {"jobs": self._tx_queue.status(),
+                "current": self._tx_queue.current_id()}
+
+    def cancel_job(self, jid: str) -> bool:
+        """取消指定任务（排队中→跳过；运行中→接通现有取消链）。"""
+        ok = self._tx_queue.cancel(jid)
+        if ok and self._tx_queue.current_id() == jid:
+            self.cancel()                # 运行中：复用 /api/cancel 的取消链
+        return ok

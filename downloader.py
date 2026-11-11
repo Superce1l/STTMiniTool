@@ -64,12 +64,12 @@ def _ssl_ctx_unverified() -> ssl.SSLContext:
     return _SSL_UNVERIFIED_CTX
 
 # ── 路径（PyInstaller 冻结时指向 EXE 旁边）────────────────────────────
+# base_dir / FA 文件名 / 隐藏窗口样板收敛于 engine_types.py
 import sys as _sys
-if getattr(_sys, "frozen", False):
-    BASE_DIR = Path(_sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).parent
+from engine_types import base_dir, FA_BIN_NAME as _FA_BIN_NAME, \
+    CREATE_NO_WINDOW as _CREATE_NO_WINDOW
 
+BASE_DIR = base_dir()
 _DEFAULT_MODEL_DIR = BASE_DIR / "ov_models"
 
 # ── HuggingFace 仓库 ───────────────────────────────────────────────────
@@ -157,6 +157,168 @@ REQUIRED_OTHER: list[str] = [
     "merges.txt",
 ]
 
+# ── SHA256 校验清单（下载时逐文件核对）────────────────────────────────
+# 哈希取自 HuggingFace 官方 LFS oid（sha256）。键为「<仓库>/<文件名>」的
+# 逻辑身份——镜像站改写只换域名，键不变，走镜像下载同样受校验保护。
+# dseditor 与 Echo9Zulu 两仓库的 0.6B 文件逐字节一致，两把键同值。
+# 校验时机是「下载完成后」而非存在性检查：上游曾更新过 FA .bin（旧本机
+# 副本与当前上游内容不同但均可用），拿当前哈希卡存量安装会把能用的旧
+# 模型判为损坏、白等 939MB 重下。GitHub Release（CrispASR 核心 zip）无
+# 官方哈希 → 首次成功下载记录 TOFU pin（_save_pin），同 URL 再次下载
+# 必须吻合 pin。
+# ⚠ 上游对同路径文件重新上传时此表必须同步更新，否则校验会拒绝新文件。
+_SHA256_MANIFEST: dict[str, str] = {
+    # 0.6B OpenVINO INT8（主 / 备来源文件一致）
+    "dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO/audio_encoder_model.bin":
+        "d892464d9b6986719dd6e5c3962b880a2708d874c2c9bdead8958581be2dacb9",
+    "dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO/decoder_model.bin":
+        "cc4363c401f5faf41e2bfcb4aea80c72144b8ea66d13ca5ca62cf49421a25778",
+    "dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO/thinker_embeddings_model.bin":
+        "a7818fcbd77240fb8705bc47c2a15da98498056cdd419742b7685719b5dc2a44",
+    "Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO/audio_encoder_model.bin":
+        "d892464d9b6986719dd6e5c3962b880a2708d874c2c9bdead8958581be2dacb9",
+    "Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO/decoder_model.bin":
+        "cc4363c401f5faf41e2bfcb4aea80c72144b8ea66d13ca5ca62cf49421a25778",
+    "Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO/thinker_embeddings_model.bin":
+        "a7818fcbd77240fb8705bc47c2a15da98498056cdd419742b7685719b5dc2a44",
+    # 1.7B INT8 KV-cache OpenVINO
+    "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO/audio_encoder_model.bin":
+        "f5698b1cb9461eb18099037edc9880c7df9fb54984955936a0a03f63a1d73969",
+    "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO/thinker_embeddings_model.bin":
+        "8b01e0fed57aeb1f28682541bf61100ec69e37043fe9dbc84307c39debfcd3db",
+    "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO/decoder_prefill_kv_model.bin":
+        "71aab69da4b909691d70e9d138308d0986d38b4bef28827f77b8b9cc1bbdb4ca",
+    "dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO/decoder_kv_model.bin":
+        "15cf86e032bcf552e3b78b3dbed37c3b1933cab3b0689c2b99c9fa4fe6aa294e",
+    # 说话者分离 ONNX
+    "altunenes/speaker-diarization-community-1-onnx/segmentation-community-1.onnx":
+        "62d59a487d8ba877d0bd1638c53aa06a810bdb104fb776a27ec2204521711006",
+    "altunenes/speaker-diarization-community-1-onnx/embedding_model.onnx":
+        "b62448ababb2ee9fc1ce51870553507893ea427fb1fd77e199af425ff1ed0677",
+    # OpenAI Whisper GGML（ggerganov/whisper.cpp）
+    "ggerganov/whisper.cpp/ggml-base.bin":
+        "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+    "ggerganov/whisper.cpp/ggml-small.bin":
+        "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+    "ggerganov/whisper.cpp/ggml-medium.bin":
+        "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+    "ggerganov/whisper.cpp/ggml-large-v2.bin":
+        "9a423fe4d40c82774b6af34115b8b935f34152246eb19e80e376071d3f999487",
+    "ggerganov/whisper.cpp/ggml-large-v3-turbo.bin":
+        "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    # qwen3 ForcedAligner GGUF（CrispASR -am）
+    "cstr/qwen3-forced-aligner-0.6b-GGUF/qwen3-forced-aligner-0.6b-q4_k.gguf":
+        "a7bb4cbeacc6414f11a5d23dc7661a51a941a71e6d559dc7b408b52473f2ae84",
+    "cstr/qwen3-forced-aligner-0.6b-GGUF/qwen3-forced-aligner-0.6b-q5_0.gguf":
+        "d76ce68f71a241356d74f9148ad0dc29a0a92c00647bc27f5d166fbae8f78bf4",
+    "cstr/qwen3-forced-aligner-0.6b-GGUF/qwen3-forced-aligner-0.6b-q8_0.gguf":
+        "539df5dd0fe1721e378ac13bfac9a26b1260dafb62d892c518c1f21244762636",
+    # Qwen3-ASR-1.7B GGUF（通用 / 日语动漫）
+    "cstr/qwen3-asr-1.7b-GGUF/qwen3-asr-1.7b-q4_k.gguf":
+        "ec197cef7ccc589fdcae1becc3f4a3de119d0a41e790b898b519b1a048dad8d4",
+    "cstr/qwen3-asr-1.7b-GGUF/qwen3-asr-1.7b-q8_0.gguf":
+        "9851ab996591a2d0cb0efb216002764b509c86bd40c95e613d7b65b8e69c8a6e",
+    "cstr/qwen3-asr-1.7b-ja-anime-GGUF/qwen3-asr-1.7b-ja-anime-q4_k.gguf":
+        "da00cec556885a60d47234b4def0dbdd08394df4d4df13866d7cd9726c23ccd9",
+    "cstr/qwen3-asr-1.7b-ja-anime-GGUF/qwen3-asr-1.7b-ja-anime-q8_0.gguf":
+        "f173ceddb15b59177575a101491862bd362cd85f2e7a6bac811fbc53411596a1",
+    # dseditor/Collection（FA .bin 与 ffmpeg.zip——ffmpeg.zip 是可执行压缩包）
+    "dseditor/Collection/qwen3-focedaligner-0.6b.bin":
+        "bfccb1316a7bc890660fc5d1c8bbcc6477b05fb0ca13417aa65a1443f85089d5",
+    "dseditor/Collection/ffmpeg.zip":
+        "3862d70180185f8c846670d924467fef701eade13c9366b89ae44878a8e24608",
+    # VAD ONNX（GitHub raw 固定 tag v4.0；哈希为随包同源文件实测固定）
+    "github/snakers4/silero-vad/v4.0/silero_vad.onnx":
+        "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
+}
+
+# GitHub raw 的 URL 不走 HF 仓库规则 → 显式别名映射到清单键
+_SHA256_URL_ALIASES: dict[str, str] = {
+    _VAD_URL: "github/snakers4/silero-vad/v4.0/silero_vad.onnx",
+}
+
+
+def _sha_key_for_url(url: str) -> str | None:
+    """下载 URL → 清单键（"<owner>/<name>/<fname>"）；无对应键返回 None。
+
+    只识别官方 HF 形态（<owner>/<name>/resolve/<branch>/<fname>，仓库固定
+    两段）；镜像改写在 _download_file 里后置，键始终从官方 URL 推导，
+    与实际域名无关。
+    """
+    key = _SHA256_URL_ALIASES.get(url)
+    if key:
+        return key
+    prefix = HF_OFFICIAL + "/"
+    if url.startswith(prefix):
+        parts = url[len(prefix):].split("/")
+        if len(parts) >= 5 and parts[2] == "resolve":
+            return "/".join(parts[:2] + parts[4:])
+    return None
+
+
+# ── TLS 降级防线 ────────────────────────────────────────────────────────
+# 企业代理重签 TLS 时降级为「不验证」只允许这些固定可信主机。使用者自设
+# 的其他镜像站不在名单内 → 保持强制验证，证书失败原样报错，绝不向未知
+# 主机静默放行。
+_TLS_FALLBACK_HOSTS = frozenset({
+    "huggingface.co",
+    "hf-mirror.com",
+    "github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "cdn-lfs.huggingface.co",
+    "cdn-lfs-us-1.huggingface.co",
+})
+
+
+def _url_host(url: str) -> str:
+    import urllib.parse
+    try:
+        return urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+
+
+# ── TOFU pin（无官方哈希的 GitHub Release 可执行件）────────────────────
+# 首次成功下载把 SHA256 记进 <scope>/download_sha256_pins.json；此后同
+# URL 再下载必须吻合，否则视为损坏/被替换，删档报错。pin 按原始 URL 键
+# 存（换版本=新 URL=重新 TOFU），随核心目录存放、卸载即随目录消失。
+
+def _pins_path(scope: Path) -> Path:
+    return Path(scope) / "download_sha256_pins.json"
+
+
+def _load_pin(scope: Path, url: str) -> str | None:
+    import json as _json
+    try:
+        d = _json.loads(_pins_path(scope).read_text(encoding="utf-8"))
+        v = d.get(url)
+        return v if isinstance(v, str) and len(v) == 64 else None
+    except Exception:
+        return None
+
+
+def _save_pin(scope: Path, url: str, digest: str) -> None:
+    import json as _json
+    import os as _os
+    try:
+        f = _pins_path(scope)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            d = _json.loads(f.read_text(encoding="utf-8"))
+            if not isinstance(d, dict):
+                d = {}
+        except Exception:
+            d = {}
+        d[url] = digest
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_text(_json.dumps(d, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        _os.replace(tmp, f)
+    except Exception:
+        pass   # pin 写不进不影响下载本身（下次重新 TOFU）
+
 
 def _get_paths(model_dir: Path) -> tuple[Path, Path]:
     """返回 (ov_dir, vad_path)。"""
@@ -206,7 +368,7 @@ def _gguf_is_real(path: Path) -> bool:
 
 # ── ForcedAligner（chatllm main.exe 用的 .bin，单文件，无需 torch）───────
 #   OpenVINO 核心的卡拉OK逐字模式：ChatLLMAligner 调 chatllm main.exe 做字级对齐。
-_FA_BIN_NAME = "qwen3-focedaligner-0.6b.bin"
+#   文件名 _FA_BIN_NAME 收敛于 engine_types.py（FA_BIN_NAME，沿上游拼字 foced）。
 _FA_BIN_URL  = (
     "https://huggingface.co/dseditor/Collection/resolve/main/"
     "qwen3-focedaligner-0.6b.bin"
@@ -501,7 +663,7 @@ def crispasr_gpu_backend(variant: str | None) -> str | None:
 #   得到的，但我们得在「还没下载核心」时就决定要抓哪个 zip → 先有鸡先有蛋。
 #   故这里改走 OS 自带的管道：Win32_VideoController(CIM) 认厂商、nvidia-smi
 #   认驱动版本。两者都不需要预先安装任何东西。
-_CREATE_NO_WINDOW = 0x08000000 if _sys.platform == "win32" else 0
+# _CREATE_NO_WINDOW 收敛于 common.py（import 于文件头部）
 
 
 def _run_hidden(cmd: list[str], timeout: int = 12) -> str:
@@ -867,7 +1029,9 @@ def download_crispasr_core(crispasr_dir: Path, progress_cb=None,
 
     with tempfile.TemporaryDirectory() as td:
         zpath = Path(td) / meta["zip"]
-        _download_file(url, zpath, progress_cb=_cb)
+        # GitHub Release 无官方哈希 → TOFU pin 存核心目录，同 URL 重下
+        # 必须吻合首次记录（防 zip 被静默替换）
+        _download_file(url, zpath, progress_cb=_cb, pin_scope=crispasr_dir)
         if progress_cb:
             progress_cb(0.92, "解压 CrispASR 核心…")
         with zipfile.ZipFile(zpath) as z:
@@ -1239,18 +1403,33 @@ def crispasr_core_issue(crispasr_dir: Path, variant: str | None = None) -> str:
 # 直接 HTTP 下载（断点续传）
 # ══════════════════════════════════════════════════════════════════════
 
-def _download_file(url: str, dest: Path, progress_cb=None):
+def _download_file(url: str, dest: Path, progress_cb=None,
+                   pin_scope: Path | None = None):
     """
     下载单一文件至 dest，支持断点续传（Resume）。
     progress_cb(done_bytes: int, total_bytes: int)
 
-    完整性校验：下载结束时对账 Content-Length——不匹配（连接中断导致静默
-    截断）则抛 RuntimeError 删除残档，绝不把残缺文件留给加载端当完整模型。
+    完整性校验（依序）：
+      1. Content-Length 对账——连接中断的静默截断 → 删残档抛错；
+      2. SHA256 对账——有清单哈希（HF 模型/可执行档）或 TOFU pin
+         （CrispASR 核心 zip，经 pin_scope 传入）时，下载后整档算哈希，
+         不符即删残档抛错；
+      3. TLS 降级为不验证只允许固定可信主机，且无哈希保护时在日志
+         显式警告来源身份未验证。
+
+    pin_scope: TOFU pin 存放目录（无清单哈希的可执行件用）；None 不启用。
     """
-    from applog import log_download, log_error
+    from applog import log_download, log_error, log_warn
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     existing = dest.stat().st_size if dest.exists() else 0
+
+    # 哈希键 / pin 键从原始 URL 推导（逻辑身份）；镜像改写只换域名不影响键
+    sha_key = _sha_key_for_url(url)
+    expected = _SHA256_MANIFEST.get(sha_key) if sha_key else None
+    if expected is None and pin_scope is not None:
+        expected = _load_pin(pin_scope, url)
+    pin_url = url   # pin 按原始 URL 键存（镜像改写后域名会变）
 
     url = _apply_mirror(url)   # 套用镜像站改写（若有设置）
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
@@ -1261,7 +1440,22 @@ def _download_file(url: str, dest: Path, progress_cb=None):
         resp = urllib.request.urlopen(req, timeout=30, context=_ssl_ctx())
     except urllib.error.HTTPError as e:
         if e.code == 416:
-            # 416 Range Not Satisfiable = 文件已完整，直接视为成功
+            # 416 Range Not Satisfiable = 服务器按 existing 判断文件已完整。
+            # 有清单哈希/pin 时顺手核对一次——历史中断留下的「恰好完整」
+            # 残档这里是最后防线；无哈希可比时维持原行为直接放行。
+            if expected is not None and dest.exists():
+                actual = _sha256(dest)
+                if actual != expected:
+                    try:
+                        dest.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    log_error(f"{dest.name} SHA256 校验不符（已删除残档）",
+                              exc=None)
+                    raise RuntimeError(
+                        f"{dest.name} 的 SHA256 与预期不符"
+                        f"（可能被篡改或此前下载损坏，残档已删除）。")
+                log_download(f"{dest.name}: SHA256 OK (already complete)")
             return
         raise
     except urllib.error.URLError as e:
@@ -1274,8 +1468,16 @@ def _download_file(url: str, dest: Path, progress_cb=None):
             "CERTIFICATE_VERIFY_FAILED" in str(reason)
         if not is_cert:
             raise
-        from applog import log_warn
-        log_warn(f"HTTPS 证书验证失败，降级为不验证下载：{url}")
+        # 降级为不验证只允许固定可信主机：其他主机（如自设镜像站不在
+        # 名单内）保持强制验证，证书失败原样抛错，绝不静默放行。
+        if _url_host(url) not in _TLS_FALLBACK_HOSTS:
+            raise
+        if expected:
+            log_warn(f"HTTPS 证书验证失败，降级为不验证下载：{url}"
+                     f"（完整性由下载后 SHA256 校验保证）")
+        else:
+            log_warn(f"HTTPS 证书验证失败，降级为不验证下载：{url}"
+                     f"（⚠ 无哈希清单/pin，本次无法验证来源身份）")
         resp = urllib.request.urlopen(req, timeout=30,
                                       context=_ssl_ctx_unverified())
 
@@ -1316,6 +1518,39 @@ def _download_file(url: str, dest: Path, progress_cb=None):
         raise RuntimeError(
             f"下载中断：{dest.name} 只收到 {done/1_048_576:.0f}/{total/1_048_576:.0f} MB"
             "（残档已删除，重试将重新下载）。")
+
+    # ── SHA256 校验 / TOFU pin ────────────────────────────────────
+    if expected:
+        log_download(f"{dest.name}: verifying SHA256…")
+        actual = _sha256(dest)
+        if actual != expected:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log_error(f"{dest.name} SHA256 校验不符（已删除残档）", exc=None)
+            raise RuntimeError(
+                f"{dest.name} 的 SHA256 与预期值不符"
+                f"（官方清单或首次下载记录；可能被篡改或下载损坏，"
+                f"残档已删除）。")
+        log_download(f"{dest.name}: SHA256 OK")
+    elif pin_scope is not None and done > 0:
+        # TOFU：无官方哈希的可执行件（CrispASR 核心 zip），首次成功下载
+        # 记录 pin；此后同 URL 再下载必须吻合，防止内容被静默替换。
+        actual = _sha256(dest)
+        prev = _load_pin(pin_scope, pin_url)
+        if prev and prev != actual:
+            try:
+                dest.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log_error(f"{dest.name} 与首次下载记录的 SHA256 不符（已删除残档）",
+                      exc=None)
+            raise RuntimeError(
+                f"{dest.name} 的 SHA256 与首次下载记录不符"
+                f"（来源内容已变化或下载损坏，残档已删除）。")
+        if not prev:
+            _save_pin(pin_scope, pin_url, actual)
     log_download(f"{dest.name}: download OK ({done/1_048_576:.1f} MB)")
 
 

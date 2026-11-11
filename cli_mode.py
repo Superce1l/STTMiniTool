@@ -110,7 +110,7 @@ def _profile_pick(be, key: str, hw: dict | None = None) -> dict | None:
     present 用目录项的 backend+patch 做真实文件检测（与 GUI 基础模式同源）。
     """
     from downloader import detect_hardware
-    from webview_backend import _MODEL_CATALOG
+    from model_catalog import _MODEL_CATALOG   # 模型目录的规范出处（webview_backend 兼容再导出）
     if hw is None:
         hw = detect_hardware()
     has_gpu = bool(hw.get("has_discrete")) and not hw.get("error")
@@ -155,28 +155,62 @@ def _segments_payload(res: dict) -> list[dict]:
                 "text": s.get("text", "")}
         if s.get("speaker"):
             item["speaker"] = s["speaker"]
+        if s.get("words"):
+            item["words"] = s["words"]     # 字级时间轴（ASS 卡拉OK导出用）
         out.append(item)
     return out
 
 
-def _srt_ts(sec: float) -> str:
-    sec = max(0.0, float(sec))
-    h, rem = divmod(int(sec), 3600)
-    m, s = divmod(rem, 60)
-    ms = int(round((sec - int(sec)) * 1000))
-    if ms == 1000:                      # 进位溢出
-        s, ms = s + 1, 0
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
 def _write_srt(segs: list[dict], dest: Path) -> Path:
+    """segments → SRT。与 GUI 同一构造来源（subtitle_lines.srt_text）：
+
+    • 时间戳不再自算（旧 _srt_ts 的进位处理与共享实现有细微差异）；
+    • **补回说话者前缀**——旧实现丢弃 speaker，`transcribe --diarize -o x.srt`
+      的 CLI 输出与 GUI 不一致（同一份字幕一个带「说话者N：」一个不带）；
+    • 原子写出（临时文件 + os.replace），进程中断不留半截文件。
+    """
+    from subtitle_lines import srt_text, atomic_write_text
     lines = []
-    for n, s in enumerate(segs, 1):
-        lines += [str(n),
-                  f"{_srt_ts(s['start'])} --> {_srt_ts(s['end'])}",
-                  s.get("text", ""), ""]
+    for s in segs:
+        spk = s.get("speaker")
+        spk_label = f"说话者{spk}" if spk else None
+        lines.append((float(s.get("start", 0.0)), float(s.get("end", 0.0)),
+                      s.get("text", ""), spk_label))
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write_text(dest, srt_text(lines))
+    return dest
+
+
+def _spk_label(s: dict) -> str | None:
+    """segments 的 speaker（整数）→ SRT/ASS 前缀用「说话者N」标签。"""
+    spk = s.get("speaker")
+    return f"说话者{spk}" if spk else None
+
+
+def _export_segments(segs: list[dict], dest: Path, fmt: str) -> Path:
+    """segments → srt/txt/ass/vtt 统一导出（json 由调用方自行处理）。
+
+    ASS：任一段带字级 words → 卡拉OK（\\k 逐字拍点，与前端「另存 ASS」同
+    算法）；全程无字级数据则退回普通 ASS。全部原子落盘。
+    """
+    from subtitle_lines import (vtt_text, ass_text, ass_karaoke_text,
+                                atomic_write_text)
+    if fmt == "srt":
+        return _write_srt(segs, dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    lines4 = [(float(s.get("start", 0.0)), float(s.get("end", 0.0)),
+               s.get("text", ""), _spk_label(s)) for s in segs]
+    if fmt == "txt":
+        atomic_write_text(dest, "\n".join(s.get("text", "") for s in segs))
+    elif fmt == "vtt":
+        atomic_write_text(dest, vtt_text(lines4))
+    elif fmt == "ass":
+        if any(s.get("words") for s in segs):
+            atomic_write_text(dest, ass_karaoke_text(segs))
+        else:
+            atomic_write_text(dest, ass_text(lines4))
+    else:
+        raise ValueError(f"未知输出格式：{fmt}")
     return dest
 
 
@@ -214,15 +248,12 @@ def cmd_transcribe(args) -> int:
             # -o 只在单文件时有意义；多文件一律用引擎的默认输出位置
             if args.output and len(args.audio) == 1:
                 dest = Path(args.output)
-                if args.format == "txt":
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_text("\n".join(s["text"] for s in segs), encoding="utf-8")
-                elif args.format == "json":
+                if args.format == "json":
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_text(json.dumps(segs, ensure_ascii=False, indent=2),
                                     encoding="utf-8")
                 else:
-                    _write_srt(segs, dest)
+                    _export_segments(segs, dest, args.format)
                 item["outPath"] = str(dest)
             results.append(item)
 
@@ -239,6 +270,24 @@ def cmd_transcribe(args) -> int:
 # ══════════════════════════════════════════════════════════════════════
 # apply —— 把校正过的 text 写回，时间轴原封不动
 # ══════════════════════════════════════════════════════════════════════
+def apply_merge_segments(segs: list[dict], base: list[dict] | None) -> list[dict]:
+    """--base 合并（纯函数，离线可单测）：时间轴/说话者以基准为准，text 采用校正稿。
+
+    校正端常把时间字段改坏，故时间轴绝不取校正稿；两者按 1-based 序号 i
+    对齐，校正稿缺某段时该段保留基准原文。
+    """
+    if not base:
+        return segs
+    by_i = {int(s.get("i", n)): s for n, s in enumerate(segs, 1)}
+    merged = []
+    for n, b in enumerate(base, 1):
+        i = int(b.get("i", n))
+        merged.append({"i": i, "start": b["start"], "end": b["end"],
+                       "text": (by_i.get(i) or b).get("text", ""),
+                       **({"speaker": b["speaker"]} if b.get("speaker") else {})})
+    return merged
+
+
 def cmd_apply(args) -> int:
     src = Path(args.edited)
     if not src.exists():
@@ -254,14 +303,7 @@ def cmd_apply(args) -> int:
     if args.base:                      # 有基准文件 → 只采用它的 text，时间轴以基准为准
         bdata = json.loads(Path(args.base).read_text(encoding="utf-8"))
         base = bdata.get("segments") if isinstance(bdata, dict) else bdata
-        by_i = {int(s.get("i", n)): s for n, s in enumerate(segs, 1)}
-        merged = []
-        for n, b in enumerate(base, 1):
-            i = int(b.get("i", n))
-            merged.append({"i": i, "start": b["start"], "end": b["end"],
-                           "text": (by_i.get(i) or b).get("text", ""),
-                           **({"speaker": b["speaker"]} if b.get("speaker") else {})})
-        segs = merged
+        segs = apply_merge_segments(segs, base)
     else:
         bad = [n for n, s in enumerate(segs, 1)
                if "start" not in s or "end" not in s]
@@ -283,11 +325,7 @@ def cmd_apply(args) -> int:
                    "让时间轴以原始文件为准。")
 
     dest = Path(args.output) if args.output else src.with_suffix(".srt")
-    if args.format == "txt":
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text("\n".join(s.get("text", "") for s in segs), encoding="utf-8")
-    else:
-        _write_srt(segs, dest)
+    _export_segments(segs, dest, args.format)
     if args.json:
         print(json.dumps({"ok": True, "outPath": str(dest), "count": len(segs)},
                          ensure_ascii=False))
@@ -413,8 +451,9 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("transcribe", parents=[common], help="转录音频／视频为字幕")
     t.add_argument("audio", nargs="+", help="音频或视频文件路径（可多个）")
     t.add_argument("-o", "--output", help="输出文件路径（仅单一输入时有效）")
-    t.add_argument("-f", "--format", choices=("srt", "txt", "json"), default="srt",
-                   help="-o 的输出格式（默认 srt）")
+    t.add_argument("-f", "--format", choices=("srt", "txt", "json", "ass", "vtt"),
+                   default="srt",
+                   help="-o 的输出格式（默认 srt；ass 有字级数据时带 \\k 卡拉OK）")
     t.add_argument("-l", "--language", default="",
                    help="语言，如 Chinese／English／Japanese；留空＝自动检测")
     t.add_argument("--hint", default="", help="识别提示（人名、术语、背景说明）")
@@ -428,7 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("apply", parents=[common], help="把校正过的 segments JSON 写回字幕（保留时间轴）")
     a.add_argument("edited", help="校正后的 JSON（segments 数组或含 segments 的对象）")
     a.add_argument("-o", "--output", help="输出路径（默认与输入同名的 .srt）")
-    a.add_argument("-f", "--format", choices=("srt", "txt"), default="srt")
+    a.add_argument("-f", "--format", choices=("srt", "txt", "ass", "vtt"), default="srt")
     a.add_argument("--base", help="原始 JSON；给了就以它的时间轴为准，"
                                   "只采用校正档的 text（最安全）")
     a.set_defaults(func=cmd_apply)

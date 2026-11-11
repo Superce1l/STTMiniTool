@@ -43,14 +43,22 @@ from chatllm_engine import (
 try:
     from crisp_engine import CrispWhisperEngine
     _CRISPASR_AVAILABLE = True
-except Exception:
+except Exception as _crisp_import_err:
     _CRISPASR_AVAILABLE = False
     CrispWhisperEngine  = None
+    # 不再完全静默：导入失败（依赖缺失/代码错误）会被误读成「没有显卡」，
+    # 留痕后日志里能看到真实原因。
+    try:
+        from applog import log_error
+        log_error("crisp_engine 导入失败，CrispASR（GPU）引擎不可用",
+                  exc=_crisp_import_err)
+    except Exception:
+        pass
 
 # ── 字幕分行（全引擎共享，与 CrispASR/Whisper 统一）────────────────────
 from subtitle_lines import MAX_CHARS, _ts_chatllm_to_subtitle_lines, write_transcript
 import subtitle_lines as _subs
-from engine_types import TranscribeResult
+from engine_types import TranscribeResult, SAMPLE_RATE, VAD_THRESHOLD, base_dir   # 跨引擎共享常数（原多处重复）
 
 def _resolve_backend(core: str, model_label: str):
     """(核心, 模型标签) → (backend, 量化/尺寸)。三层选择的中央映射。
@@ -87,11 +95,8 @@ def _ui_core_model(settings: dict):
     return "Qwen", ("Qwen3-ASR-1.7B INT8" if "1.7B" in sz else "Qwen3-ASR-0.6B")
 
 # ── 路径 ──────────────────────────────────────────────
-# PyInstaller 冻结时，模型应放在 EXE 旁边（非 _internal/）
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).parent
+# PyInstaller 冻结时，模型应放在 EXE 旁边（非 _internal/）；base_dir() 收敛于 engine_types.py
+BASE_DIR = base_dir()
 # PyInstaller onefile 解压的临时资源根（_MEIPASS）：--add-data 进来的文件在这里，
 # 不在 EXE 旁。随包附带的小档（如 silero_vad_v4.onnx）要从这里找得到，否则冻结后
 # 在 BASE_DIR（EXE 旁）找不到 → VAD 加载失败、模型永远停在「加载 VAD…」。
@@ -102,12 +107,11 @@ SRT_DIR            = BASE_DIR / "subtitles"
 SRT_DIR.mkdir(exist_ok=True)
 
 # ── 常数 ────────# 常数
-SAMPLE_RATE   = 16000
+# SAMPLE_RATE / VAD_THRESHOLD 收敛于 engine_types.py（原多处重复定义，import 于文件头部）
 VAD_CHUNK     = 512
 VAD_CONTEXT_SAMPLES = 64   # silero-vad v5（master onnx）：每窗需附带上窗末 64 样本 context
 # VAD 阈值不再开放设置：基准 0.50 起步，「说话轻/远场录音」未检出时自动
 # 降阈值重试（见 _vad_retry_thresholds）。真静音/纯音乐（全段概率极低）不重试。
-VAD_THRESHOLD = 0.5
 _VAD_RETRY_STEPS     = (0.35, 0.22)   # 自动重试采用的更低阈值（由高到低）
 _VAD_RETRY_MIN_PROB  = 0.18           # 全段最高人声概率低于此 → 判真静音，不重试
 MAX_GROUP_SEC = 20
@@ -195,7 +199,7 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_
                 break
             idx = np.array([ranges[j][0] + i for j in act])
             win = np.stack([audio[g * VAD_CHUNK:(g + 1) * VAD_CHUNK]
-                            for g in idx]).astype(np.float32)
+                            for g in idx]).astype(np.float32, copy=False)
             out, bhn, bcn = vad_sess.run(
                 None, {"input": win, "h": bh[:, act], "c": bc[:, act],
                        "sr": np.array(sr, dtype=np.int64)})
@@ -205,7 +209,8 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_
     else:
         # ── 顺序路径（v5 一律走这里；v4 短音频同旧版逐窗行为）─────────
         for i in range(n):
-            chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
+            # audio 已是 float32（load_audio_16k_mono 保证）→ copy=False 免逐窗拷贝
+            chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32, copy=False)[np.newaxis, :]
             if v5:
                 # silero-vad master（v5）是「外部 context」版：每窗输入 =
                 # [上一窗末 64 样本] + [512 新样本]，共 576 样本。
@@ -217,13 +222,14 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess, max_group_sec: int = MAX_
                 out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c,
                                                 "sr": np.array(sr, dtype=np.int64)})
             probs[i] = float(out[0, 0])
-    probs = probs.tolist()
+    # probs 保持 numpy：1 小时音频 ≈ 11 万窗，tolist() 会凭空造出十几 MB 的
+    # Python float 对象；统计与分段循环都能直接在数组上做。
     if stats is not None:
-        stats["n_chunks"]  = len(probs)
-        stats["max_prob"]  = max(probs) if probs else 0.0
-        stats["mean_prob"] = (sum(probs) / len(probs)) if probs else 0.0
+        stats["n_chunks"]  = int(probs.size)
+        stats["max_prob"]  = float(probs.max()) if probs.size else 0.0
+        stats["mean_prob"] = float(probs.mean()) if probs.size else 0.0
         stats["threshold"] = thr
-    if not probs:
+    if probs.size == 0:
         return [(0.0, len(audio) / SAMPLE_RATE, audio)]
 
     MIN_CH = 16; PAD = 5; MERGE = 16
@@ -400,8 +406,8 @@ class ASREngine:
     max_chunk_secs: int = 30   # 每段最长音频（秒），子类别可覆盖
     _OV_SUBDIR: str = "qwen3_asr_int8"   # model_dir 下的 OV 模型子目录，子类别可覆盖
     # 时间轴对齐用 chatllm 原生 FA（无需 torch）；OpenVINO 卡拉OK逐字模式依赖。
-    # 同一文件名与下载流程，让「时间轴对齐」UI 在 CPU/GPU 后端行为一致。
-    FA_BIN_NAME = "qwen3-focedaligner-0.6b.bin"
+    # FA .bin 文件名（FA_BIN_NAME）收敛于 engine_types.py，由 fa_aligner.ChatLLMAligner 持有；
+    # 本类经 self._fa_bin（ChatLLMAligner 回填）取路径，不再自持文件名。
 
     def __init__(self):
         self.ready       = False
@@ -426,8 +432,6 @@ class ASREngine:
         """从背景线程调用。cb(msg) 用于更新 UI 状态。
         cpu_threads: 0=OpenVINO 自动，>0=指定逻辑核心数（LATENCY hint）
         """
-        import onnxruntime as ort
-        import openvino as ov
         from processor_numpy import LightProcessor
 
         if model_dir is None:
@@ -453,33 +457,60 @@ class ASREngine:
         if vad_path is None:
             raise FileNotFoundError(
                 "找不到 silero_vad_v4.onnx（VAD 模型）。请确认已随安装包附带或放入 ov_models/。")
-        _s("加载 VAD 模型…")
-        self.vad_sess = ort.InferenceSession(
-            str(vad_path), providers=["CPUExecutionProvider"]
-        )
 
-        _s("加载说话者分离模型…")
-        try:
-            from diarize import DiarizationEngine
-            diar_dir = model_dir / "diarization"
-            eng = DiarizationEngine(diar_dir)
-            self.diar_engine = eng if eng.ready else None
-        except Exception:
-            self.diar_engine = None
+        # ── 四路并行加载 ─────────────────────────────────────────────
+        # 旧实现顺序执行：VAD → 说话者分离 → ASR 编译 → Processor → FA 验证
+        # （FA 还要起一次 chatllm main.exe --show，最长 30s）。四者互不共享
+        # 状态，并行后总耗时 = 最慢一路而非累加。异常语义不变：VAD 缺失
+        # 仍然首先抛 FileNotFoundError。
+        import concurrent.futures as _cf
 
-        _s(f"编译 ASR 模型（{device}）…")
-        core = ov.Core()
-        self.audio_enc = core.compile_model(str(ov_dir / "audio_encoder_model.xml"),      device, cpu_cfg)
-        self.embedder  = core.compile_model(str(ov_dir / "thinker_embeddings_model.xml"), device, cpu_cfg)
-        self._compile_decoder(core, ov_dir, device, cpu_cfg)   # 0.6B stateful / 1.7B KV-cache
+        def _load_vad():
+            import onnxruntime as _ort
+            return _ort.InferenceSession(str(vad_path), providers=["CPUExecutionProvider"])
+
+        def _load_diar():
+            try:
+                from diarize import DiarizationEngine
+                eng = DiarizationEngine(model_dir / "diarization")
+                if not eng.ready:
+                    try:
+                        from applog import log_warn
+                        log_warn("说话者分离模型缺失或未就绪，说话者分离不可用")
+                    except Exception:
+                        pass
+                    return None
+                return eng
+            except Exception as _diar_err:
+                try:
+                    from applog import log_warn
+                    log_warn(f"说话者分离模型加载失败（功能停用）："
+                             f"{type(_diar_err).__name__}: {_diar_err}")
+                except Exception:
+                    pass
+                return None
+
+        def _compile_asr():
+            import openvino as _ov
+            _core = _ov.Core()
+            self.audio_enc = _core.compile_model(str(ov_dir / "audio_encoder_model.xml"),      device, cpu_cfg)
+            self.embedder  = _core.compile_model(str(ov_dir / "thinker_embeddings_model.xml"), device, cpu_cfg)
+            self._compile_decoder(_core, ov_dir, device, cpu_cfg)   # 0.6B stateful / 1.7B KV-cache
+
+        _s("并行加载 VAD / 说话者分离 / ASR 编译 / 对齐器…")
+        with _cf.ThreadPoolExecutor(max_workers=4) as _pool:
+            vad_fut  = _pool.submit(_load_vad)
+            diar_fut = _pool.submit(_load_diar)
+            asr_fut  = _pool.submit(_compile_asr)
+            fa_fut   = _pool.submit(self._load_aligner, cb=_s)
+            self.vad_sess = vad_fut.result()        # VAD 缺失在此抛 FileNotFoundError
+            self.diar_engine = diar_fut.result()
+            asr_fut.result()
+            fa_fut.result()
 
         _s("加载 Processor（纯 numpy）…")
         self.processor = LightProcessor(ov_dir)
         self.pad_id    = self.processor.pad_id
-
-        # ── ForcedAligner（chatllm main.exe 子程序，CPU -ngl 0，无需 torch）──
-        #    缺 .bin 时静默退回比例估算；UI 会引导使用者按需下载。
-        self._load_aligner(cb=_s)
 
         # 抑制 "Setting pad_token_id to eos_token_id" 重复警告
         try:
@@ -564,6 +595,41 @@ class ASREngine:
             nxt = int(np.argmax(logits[0, -1, :])); cur += 1
         return gen
 
+    # ── 单段推理内核（transcribe 与 process_file 共用）────────────────────
+    def _infer_chunk(self, chunk: np.ndarray, max_tokens: int,
+                     language: str | None, context: str | None) -> str:
+        """一段音频 → 文本：前处理 → 音频编码 → embedding 拼接 → 生成 → 解码。
+
+        旧实现把这段内核在 transcribe() 与 process_file() 各抄一份（约 20 行
+        × 2），改一处漏一处即是行为分叉——现收敛于此。剥 <asr_text> 的第三
+        份内联（_strip 残留）也一并归入。
+
+        锁粒度：prepare/decode 是纯 numpy（不碰引擎共享状态）→ 留在锁外，
+        只有 encoder/embedder/自回归生成（dec_req / KV-cache 状态）持锁——
+        长段前处理与解码不再阻塞取消检查与其他持锁等待方。
+        """
+        mel, ids = self.processor.prepare(chunk, language=language, context=context)
+
+        with self._lock:
+            ae = self._encode_audio(mel)
+            te = list(self.embedder({"input_ids": ids}).values())[0]
+
+            combined = te.copy()
+            mask = ids[0] == self.pad_id
+            n_pad = int(mask.sum()); n_aud = ae.shape[1]
+            if n_pad != n_aud:
+                mn = min(n_pad, n_aud)
+                combined[0, np.where(mask)[0][:mn]] = ae[0, :mn]
+            else:
+                combined[0, mask] = ae[0]
+
+            gen = self._generate_tokens(combined, max_tokens)
+
+        raw = self.processor.decode(gen)
+        if "<asr_text>" in raw:
+            raw = raw.split("<asr_text>", 1)[1]
+        return raw.strip()
+
     def transcribe(
         self,
         audio: np.ndarray,
@@ -571,57 +637,33 @@ class ASREngine:
         language: str | None = None,
         context: str | None = None,
     ) -> str:
-        """将 16kHz float32 音频转录为繁体中文。
+        """将 16kHz float32 音频转录为文本（OpenVINO 路径统一简体输出）。
         language : 强制语言（如 "Chinese"），None 表示自动检测
         context  : 识别提示（歌词/关键字），放入 system message
         """
-        with self._lock:
-            # ── 前处理（纯 numpy，不需 torch）────────────────────────
-            mel, ids = self.processor.prepare(audio, language=language, context=context)
-
-            # ── 音频编码 + 文字 Embedding ────────────────────────────
-            ae = self._encode_audio(mel)
-            te = list(self.embedder({"input_ids": ids}).values())[0]
-
-            # ── 音频特征填入音频 pad 位置 ─────────────────────────────
-            combined = te.copy()
-            mask = ids[0] == self.pad_id
-            np_ = int(mask.sum()); na = ae.shape[1]
-            if np_ != na:
-                mn = min(np_, na)
-                combined[0, np.where(mask)[0][:mn]] = ae[0, :mn]
-            else:
-                combined[0, mask] = ae[0]
-
-            # ── Decoder 自回归生成（0.6B stateful / 1.7B KV-cache 挂勾）──
-            gen = self._generate_tokens(combined, max_tokens)
-
-            # ── 解码（纯 Python BPE decode）──────────────────────────
-            raw = self.processor.decode(gen)
-            if "<asr_text>" in raw:
-                raw = raw.split("<asr_text>", 1)[1]
-            text = raw.strip()
-            return text
+        return self._infer_chunk(audio, max_tokens=max_tokens,
+                                 language=language, context=context)
 
     @staticmethod
     def _quiet_split_pos(chunk: np.ndarray, target: int, lo: int, hi: int) -> int:
         """在 [lo, hi]（样本索引）内找短窗 RMS 最低的位置作为切点。
 
         人声在停顿处能量显著走低，以此把切分点吸附到词句间隙而非字词中间；
-        范围无效时回退 target。
+        范围无效时回退 target。窗矩阵向量化（一次性算全部候选能量），
+        替代旧的逐位置 Python 循环。
         """
         win, hop = 400, 200   # 25ms 窗 / 12.5ms 步进 @16kHz
         lo = max(lo, win)
         hi = min(hi, len(chunk))
         if lo >= hi:
             return target
-        best, best_e = target, None
-        for p in range(lo, hi + 1, hop):
-            seg = chunk[p - win:p]
-            e = float(np.mean(seg * seg))
-            if best_e is None or e < best_e:
-                best, best_e = p, e
-        return best
+        positions = np.arange(lo, hi + 1, hop)
+        if positions.size == 0:
+            return target
+        # 每个候选 p 的窗 = chunk[p-win:p] → 行向量索引矩阵 (P, win)
+        idx = positions[:, None] - win + np.arange(win)[None, :]
+        energies = np.mean(chunk[idx] * chunk[idx], axis=1)
+        return int(positions[int(np.argmin(energies))])
 
     def _enforce_chunk_limit(
         self,
@@ -760,6 +802,7 @@ class ASREngine:
         # ── ASR 逐段转录 ─────────────────────────────────────────────
         all_subs: list[tuple[float, float, str, str | None]] = []
         all_rich: list[dict] = []    # 与 all_subs 对应的字级结构（卡拉OK用）
+        align_fallback_n = 0         # 申请了字级对齐但失败的段数（质量降级提示用）
         total = len(groups_spk)
         for i, (g0, g1, chunk, spk) in enumerate(groups_spk):
             # 取消检查：段间立即返回（长音频不必等整段跑完）。
@@ -774,26 +817,10 @@ class ASREngine:
                             f"[{i+1}/{total}] {g0:.1f}s~{g1:.1f}s{spk_info}")
 
             # ── ASR 转录（取简体原始输出，对齐后再繁化）─────────────────
+            # 锁粒度由 _infer_chunk 内部管理（prepare/decode 锁外）
             max_tok = 400 if language == "Japanese" else 300
-            with self._lock:
-                mel, ids = self.processor.prepare(
-                    chunk, language=language, context=context)
-                ae = self._encode_audio(mel)
-                te = list(self.embedder({"input_ids": ids}).values())[0]
-                combined = te.copy()
-                mask = ids[0] == self.pad_id
-                np_ = int(mask.sum()); na = ae.shape[1]
-                if np_ != na:
-                    mn = min(np_, na)
-                    combined[0, np.where(mask)[0][:mn]] = ae[0, :mn]
-                else:
-                    combined[0, mask] = ae[0]
-                # 生成（0.6B stateful / 1.7B KV-cache 挂勾）
-                gen = self._generate_tokens(combined, max_tok)
-                raw_decoded = self.processor.decode(gen)
-                if "<asr_text>" in raw_decoded:
-                    raw_decoded = raw_decoded.split("<asr_text>", 1)[1]
-                raw_text = raw_decoded.strip()
+            raw_text = self._infer_chunk(chunk, max_tokens=max_tok,
+                                         language=language, context=context)
 
             if not raw_text:
                 continue
@@ -830,8 +857,15 @@ class ASREngine:
                                 all_rich.append({"start": s, "end": e, "text": t,
                                                  "speaker": sp, "words": words})
                             aligned = True
-                except Exception:
-                    aligned = False  # 静默 fallback 到比例估算
+                except Exception as _align_err:
+                    aligned = False  # fallback 到比例估算，但不再静默：
+                    try:
+                        from applog import log_warn
+                        log_warn(f"字级对齐异常（{g0:.1f}s~{g1:.1f}s），"
+                                 f"该段回退比例估算："
+                                 f"{type(_align_err).__name__}: {_align_err}")
+                    except Exception:
+                        pass
                 finally:
                     try:
                         os.remove(_tmp_wav)
@@ -839,6 +873,8 @@ class ASREngine:
                         pass
 
             if not aligned:
+                if self.use_aligner and self._fa_bin is not None:
+                    align_fallback_n += 1   # 申请了对齐但未产出（含空结果）
                 # ── 比例估算 Fallback ──────────────────────────────────────
                 text = raw_text
                 lines = _split_to_lines(text)
@@ -856,7 +892,11 @@ class ASREngine:
                     f"共 {deg_count} 段被略过，未产生有效字幕。"
                     f"此核心／设备可能不兼容，建议改用 CPU(OpenVINO) 核心。"
                 )
-            return TranscribeResult(diag=diag, degenerate=deg_count)
+            warn = None
+            if align_fallback_n:
+                warn = [f"{align_fallback_n} 段字级对齐失败，已用比例估算时间轴"]
+            return TranscribeResult(diag=diag, degenerate=deg_count,
+                                    warnings=warn)
 
         if progress_cb:
             progress_cb(total, total, "写入字幕…")
@@ -865,8 +905,12 @@ class ASREngine:
         # 共享写出层：依全域设置（或 out_format 覆盖）产出 .srt 或 .txt。
         ref = original_path if original_path is not None else audio_path
         out = write_transcript(ref, all_subs, out_format)
+        warn = None
+        if align_fallback_n:
+            warn = [f"{align_fallback_n} 段字级对齐失败，已用比例估算时间轴"
+                    f"（卡拉OK逐字精度下降）"]
         return TranscribeResult(output=out, segments_rich=all_rich,
-                                degenerate=deg_count)
+                                degenerate=deg_count, warnings=warn)
 
 
 # ══════════════════════════════════════════════════════

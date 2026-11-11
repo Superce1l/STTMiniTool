@@ -12,6 +12,9 @@
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 # ── 断句常数（与旧 app.py 行为一致）──────────────────────────────────
 MAX_CHARS      = 20
 _ZH_CLAUSE_END = frozenset('，。？！；：…—、·')
@@ -51,6 +54,109 @@ def _srt_ts(s: float) -> str:
     mm = ms // 60_000;    ms %= 60_000
     ss = ms // 1_000;     ms %= 1_000
     return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+
+def srt_text(lines: list[tuple[float, float, str, str | None]]) -> str:
+    """字幕行 → SRT 全文（含说话者前缀与空行分隔）。
+
+    write_transcript 与长音频切片合并写出共用此单一构造点，
+    避免「切片路径手写循环、常规路径走 write_transcript」两套格式漂移。
+    """
+    out = []
+    for idx, (s, e, line, spk) in enumerate(lines, 1):
+        prefix = f"{spk}：" if spk else ""
+        out.append(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n")
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def atomic_write_text(path, text: str) -> None:
+    """原子落盘文本：临时文件写完 → os.replace 原子替换。
+
+    转录中途进程被杀（关窗 / /api/shutdown）不会留下半截 SRT——
+    与 SettingsStore 同一模式；替换目标所在目录需已存在。
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+# ── ASS / WebVTT 导出 ──────────────────────────────────────────────────
+# 与前端「另存」菜单同一套视觉规格（ASS 头沿用 app.buildAss 的 Style 行）；
+# 后端出口供 CLI -f ass|vtt 与未来 UI 另存使用。
+
+def _ass_ts(s: float) -> str:
+    """秒 → ASS 时间戳 H:MM:SS.CS（小时不补零、厘秒两位，与前端 assTs 一致）。"""
+    ms = max(0, int(round(s * 1000)))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    sec, ms = divmod(ms, 1000)
+    return f"{h}:{m:02d}:{sec:02d}.{ms // 10:02d}"
+
+
+_ASS_HEADER = [
+    "[Script Info]", "ScriptType: v4.00+", "PlayResX: 1920", "PlayResY: 1080", "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    "Style: Default,Noto Sans SC,72,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,2,1,2,80,80,80,1",
+    "", "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+]
+
+
+def ass_text(lines: list[tuple[float, float, str, str | None]]) -> str:
+    """字幕行 → ASS（无卡拉OK；说话者前缀与 SRT 一致）。"""
+    out = list(_ASS_HEADER)
+    for (s, e, line, spk) in lines:
+        text = f"{spk}：{line}" if spk else line
+        out.append(f"Dialogue: 0,{_ass_ts(s)},{_ass_ts(e)},Default,,0,0,0,,{text}")
+    return "\n".join(out) + "\n"
+
+
+def ass_karaoke_text(rich: list[dict]) -> str:
+    """字级 segments（TranscribeResult.segments_rich 形态）→ ASS 卡拉OK。
+
+    与前端 buildAss 同一算法：逐字/词 ``\\k`` 拍点（厘秒），下一字的起点钳止
+    本字时长（防字级时间轴交叠出负值），最小 1 厘秒；无 words 的段退回整行
+    纯文本。
+    """
+    out = list(_ASS_HEADER)
+    for seg in (rich or []):
+        spk = seg.get("speaker")
+        prefix = f"{spk}：" if spk else ""
+        words = seg.get("words") or []
+        seg_end = float(seg.get("end", 0.0))
+        if words:
+            parts = []
+            for i, w in enumerate(words):
+                end_t = (float(words[i + 1]["start"])
+                         if i < len(words) - 1 else seg_end)
+                end_t = max(end_t, float(w.get("end", end_t)))
+                k = max(1, round((end_t - float(w.get("start", 0.0))) * 100))
+                parts.append("{\\k" + str(k) + "}" + str(w.get("text", "")))
+            text = prefix + "".join(parts)
+        else:
+            text = prefix + str(seg.get("text", ""))
+        out.append(f"Dialogue: 0,{_ass_ts(float(seg.get('start', 0.0)))},"
+                   f"{_ass_ts(seg_end)},Default,,0,0,0,,{text}")
+    return "\n".join(out) + "\n"
+
+
+def vtt_text(lines: list[tuple[float, float, str, str | None]]) -> str:
+    """字幕行 → WebVTT（句点毫秒分隔；说话者前缀与 SRT 一致）。"""
+    def _vtt_ts(s: float) -> str:
+        ms = max(0, int(round(s * 1000)))
+        h, ms = divmod(ms, 3_600_000)
+        m, ms = divmod(ms, 60_000)
+        sec, ms = divmod(ms, 1000)
+        return f"{h:02d}:{m:02d}:{sec:02d}.{ms:03d}"
+
+    out = ["WEBVTT", ""]
+    for idx, (s, e, line, spk) in enumerate(lines, 1):
+        prefix = f"{spk}：" if spk else ""
+        out.append(f"{idx}\n{_vtt_ts(s)} --> {_vtt_ts(e)}\n{prefix}{line}\n")
+    return "\n".join(out)
 
 
 # ── 全域输出格式（"srt" | "txt"）────────────────────────────────────────
@@ -101,21 +207,27 @@ def write_transcript(
     参数：
         ref        : 决定输出目录与主文件名的参考路径（通常为原始音频）。
         lines      : [(start_sec, end_sec, text, speaker|None), ...]
-        out_format : "srt" | "txt"；None 时采用全域 OUTPUT_FORMAT。
+        out_format : "srt" | "txt" | "ass" | "vtt"；None 时采用全域 OUTPUT_FORMAT。
                      端点固定传 "srt"（内部需解析时间轴），不受全域影响。
+                     ASS 卡拉OK（字级拍点）请改用 ass_karaoke_text(rich)。
     """
     from pathlib import Path
     fmt = (out_format or OUTPUT_FORMAT or "srt").lower()
     ref = Path(ref)
     if fmt == "txt":
         out = ref.parent / (ref.stem + ".txt")
-        out.write_text(lines_to_txt(lines), encoding="utf-8")
+        atomic_write_text(out, lines_to_txt(lines))
+        return out
+    if fmt == "vtt":
+        out = ref.parent / (ref.stem + ".vtt")
+        atomic_write_text(out, vtt_text(lines))
+        return out
+    if fmt == "ass":
+        out = ref.parent / (ref.stem + ".ass")
+        atomic_write_text(out, ass_text(lines))
         return out
     out = ref.parent / (ref.stem + ".srt")
-    with open(out, "w", encoding="utf-8") as f:
-        for idx, (s, e, line, spk) in enumerate(lines, 1):
-            prefix = f"{spk}：" if spk else ""
-            f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
+    atomic_write_text(out, srt_text(lines))
     return out
 
 

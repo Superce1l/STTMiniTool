@@ -17,27 +17,9 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-# chatllm 来源文件名沿用上游拼字（foced 非 forced），与 downloader 一致。
-FA_BIN_NAME = "qwen3-focedaligner-0.6b.bin"
-
-# Windows：隐藏子程序控制台窗口
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-
-
-def _startup_info():
-    if sys.platform == "win32":
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
-        return si
-    return None
-
-
-def _base_dir() -> Path:
-    """App 根目录（冻结时为 EXE 旁，否则为源码目录）。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
+# 文件名 / 子进程样板收敛于 engine_types.py（FA_BIN_NAME 沿上游拼字 foced 非 forced）
+from engine_types import (FA_BIN_NAME, CREATE_NO_WINDOW as _CREATE_NO_WINDOW,
+                          base_dir as _base_dir, startup_info as _startup_info)
 
 
 def find_chatllm_dir() -> Path | None:
@@ -131,6 +113,11 @@ class ChatLLMAligner:
             _s("时间轴对齐模型就绪（chatllm，无需 PyTorch）")
             return True
         except Exception as _e:
+            try:
+                from applog import log_warn
+                log_warn(f"ForcedAligner 验证失败：{type(_e).__name__}: {_e}")
+            except Exception:
+                pass
             _s(f"⚠ ForcedAligner 加载失败（{_e}），改用比例估算")
             return False
 
@@ -166,7 +153,14 @@ class ChatLLMAligner:
                 timeout=120, cwd=str(self._chatllm_dir),
                 creationflags=_CREATE_NO_WINDOW, startupinfo=_startup_info(),
             )
-        except Exception:
+        except Exception as _e:
+            # 不再静默：用户拿到的字幕时间轴是比例估算，日志须能追溯原因
+            try:
+                from applog import log_warn
+                log_warn(f"字级对齐子进程失败，回退比例估算："
+                         f"{type(_e).__name__}: {_e}")
+            except Exception:
+                pass
             return []
 
         out = r.stdout + r.stderr
@@ -174,10 +168,21 @@ class ChatLLMAligner:
         i = out.find("[")
         j = out.rfind("]")
         if i < 0 or j <= i:
+            try:
+                from applog import log_warn
+                head = (out or "").strip()[:160].replace("\n", " | ")
+                log_warn(f"字级对齐输出不含 JSON 数组，回退比例估算：{head}")
+            except Exception:
+                pass
             return []
         try:
             data = json.loads(out[i:j + 1])
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError) as _e:
+            try:
+                from applog import log_warn
+                log_warn(f"字级对齐 JSON 解析失败，回退比例估算：{_e}")
+            except Exception:
+                pass
             return []
 
         items: list[tuple[str, float, float]] = []

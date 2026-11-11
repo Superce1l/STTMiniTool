@@ -24,8 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
-SR = 16000
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+from engine_types import CREATE_NO_WINDOW as _CREATE_NO_WINDOW   # 子进程样板收敛处
+
+SR = 16000   # 对外契约即 16k mono；与 common.SAMPLE_RATE 同值（保持本模块原名）
 
 
 def _resample(data: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:

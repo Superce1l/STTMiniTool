@@ -159,7 +159,14 @@ class DiarizationEngine:
         seg_path = self._diar_dir / "segmentation-community-1.onnx"
         emb_path = self._diar_dir / "embedding_model.onnx"
         if not seg_path.exists() or not emb_path.exists():
-            return   # 静默失败，self.ready 保持 False
+            # 缺档是常态（未下载该可选组件），留痕但不打扰用户
+            try:
+                from applog import log_warn
+                missing = [p.name for p in (seg_path, emb_path) if not p.exists()]
+                log_warn(f"说话者分离模型缺失（{', '.join(missing)}），功能不可用")
+            except Exception:
+                pass
+            return
 
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2
@@ -502,6 +509,12 @@ class DiarizationEngine:
         Z = linkage(squareform(dist, checks=False), method="average")
 
         if M < 4:   # 样本太少 → 退回固定阈值
+            try:
+                from applog import log_info
+                log_info(f"说话者人数自动判定：聚类样本较少（M={M}<4），"
+                         f"退回固定阈值，结果可能不确定")
+            except Exception:
+                pass
             return fcluster(Z, t=AUTO_DIST_THRESH,
                             criterion="distance").tolist()
 

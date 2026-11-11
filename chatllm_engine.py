@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-VAD_THRESHOLD = 0.5
+from engine_types import VAD_THRESHOLD   # 与 app 的 VAD 判定同一基准（原两处重复）
 
 
 def format_vad_diag(stats: dict) -> str:

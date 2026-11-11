@@ -39,22 +39,19 @@ import numpy as np
 # 与 Qwen 路径统一的字幕分行（字级时间轴 → 字幕行，全引擎共享）
 from subtitle_lines import (_ts_chatllm_to_subtitle_lines, _srt_ts, write_transcript,
                             _ZH_CLAUSE_END, _EN_SENT_END)
-from engine_types import TranscribeResult
+from slicing import assign_speaker_by_overlap as _assign_speaker_by_overlap
+from engine_types import (TranscribeResult, SAMPLE_RATE, CREATE_NO_WINDOW,
+                          base_dir, startup_info)
 
 # 中文/英文标点集合（与断句器一致）：Qwen 模式下标点只当切点、不进 items
 _PUNCT = _ZH_CLAUSE_END | _EN_SENT_END
 
-# ── 共享常数 ──────────────────────────────────────────────────────────
-SAMPLE_RATE = 16000
-
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).parent
+# ── 共享常数（SAMPLE_RATE 等收敛于 common.py；保留模块级别名供旧引用）──
+BASE_DIR = base_dir()
 
 # Windows：隐藏子程序控制台窗口（避免识别时画面闪烁）
-_CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
-_STARTUP_INFO: "subprocess.STARTUPINFO | None" = None
+_CREATE_NO_WINDOW = CREATE_NO_WINDOW
+_STARTUP_INFO: "subprocess.STARTUPINFO | None" = startup_info()
 
 # 实时/单段转录子进程超时：单段音频通常 <30s，crispasr 处理应在几分钟内完成。
 # 超时即认为挂死（Vulkan 初始化卡死等），杀进程并抛错，避免永久持有 self._lock。
@@ -66,10 +63,6 @@ _PROC_SHUTDOWN_GRACE_SECS = 30
 # 且上游明确不出 progress 行（-pp 仅 whisper 后端有效），进度只能靠
 # 「行活跃度」近似回报，停滞看门狗是唯一的挂死防线。
 _PROC_STALL_TIMEOUT_SECS = 180
-if sys.platform == "win32":
-    _STARTUP_INFO = subprocess.STARTUPINFO()
-    _STARTUP_INFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    _STARTUP_INFO.wShowWindow = 0  # SW_HIDE
 
 # 默认 crispasr 目录与模型文件名
 _DEFAULT_CRISPASR_DIR = BASE_DIR / "crispasr"
@@ -262,6 +255,14 @@ def _lid_model_path(crispasr_dir: Path | None = None) -> Path | None:
 
 class CrispWhisperEngine:
     """CrispASR(whisper backend) 推理引擎。子程序模式调用 crispasr.exe。"""
+
+    # whisper_fa 做成 property：三处判定收敛一处（原先两处内联重复，改一处
+    # 漏一处即「字级时间轴走没走 -am 对齐」行为分叉）。
+    @property
+    def whisper_fa(self) -> bool:
+        """whisper 后端且对齐器就绪 → 字级时间轴走 -am 对齐链路。"""
+        return (self._backend == "whisper" and self.use_aligner
+                and bool(self._aligner_path))
 
     # use_aligner 做成 property：对齐器与模型不兼容时，**任何**调用端把它设成
     # True 都会被挡下（webview_backend.transcribe 每次转录都会依 UI 勾选重置，
@@ -520,8 +521,7 @@ class CrispWhisperEngine:
         is_qwen = (self._backend or "").startswith("qwen3")
         # 统一 dispatch 的 whisper（挂 FA 时才走，见 _build_cmd）同样不出 progress
         # 行 → 与 qwen3 共用行活跃度模拟进度。
-        whisper_fa = (self._backend == "whisper" and self.use_aligner
-                      and bool(self._aligner_path))
+        whisper_fa = self.whisper_fa
         # qwen3 活跃度进度：输出行数 → 模拟百分比（对数逼近 90）
         sim_base = 0
 
@@ -682,8 +682,7 @@ class CrispWhisperEngine:
         #   _fa_blocked 的内插路径维持原契约（标点随字内插、行首标点移回前行）。
         is_qwen = (self._backend or "").startswith("qwen3")
         fa_blocked = getattr(self, "_fa_blocked", False)
-        whisper_fa = (self._backend == "whisper" and self.use_aligner
-                      and bool(self._aligner_path))
+        whisper_fa = self.whisper_fa
         ts_items, raw_text = _parse_srt_words(raw, drop_punct=(is_qwen or not fa_blocked),
                                               strip_attached=not fa_blocked)
         if not ts_items:
@@ -696,7 +695,6 @@ class CrispWhisperEngine:
             # 之间，后者对字幕明显有用；且段落起止仍是后端给的真实时间。
             ts_items = _interpolate_chars(ts_items)
 
-        self._last_segments_rich = None   # 旧侧通道属性：仅供外部兼容读取，本引擎不再依赖
         lines5 = _ts_chatllm_to_subtitle_lines(
             ts_items, raw_text, 0.0, None,
             break_on_space=(not is_qwen and not whisper_fa), with_words=True,
@@ -717,7 +715,6 @@ class CrispWhisperEngine:
             {"start": a[0], "end": a[1], "text": a[2], "speaker": a[3], "words": b[4]}
             for a, b in zip(lines, lines5)
         ]
-        self._last_segments_rich = rich   # 兼容残留：旧调用端仍可从此读取
 
         # 共享写出层：依全域设置（或 out_format 覆盖）产出 .srt 或 .txt。
         ref = original_path if original_path is not None else diar_audio
@@ -738,24 +735,43 @@ class CrispWhisperEngine:
                 progress_cb(1, 1, "说话者分离中…")
             audio, _ = load_audio_16k_mono(Path(audio_path), SAMPLE_RATE)
             segs = self.diar_engine.diarize(audio, n_speakers=n_speakers)
-        except Exception:
+        except Exception as _e:
+            try:
+                from applog import log_warn
+                log_warn(f"说话者分离失败，字幕保持无说话者标签："
+                         f"{type(_e).__name__}: {_e}")
+            except Exception:
+                pass
             return lines
         if not segs:
             return lines
 
-        def _spk_at(t: float) -> str:
-            for (t0, t1, lab) in segs:           # 中点落在哪个说话者段落
-                if t0 <= t < t1:
-                    return lab
-            return min(segs, key=lambda g: abs((g[0] + g[1]) / 2.0 - t))[2]  # 否则取最近段
+        def _spk_at(s: float, e: float) -> str:
+            # 重叠最长的说话者段（跨界行不再随机归给中点一侧）；无交集取最近段
+            return _assign_speaker_by_overlap(s, e, segs)
 
-        return [(s, e, txt, _spk_at((s + e) / 2.0)) for (s, e, txt, _spk) in lines]
+        return [(s, e, txt, _spk_at(s, e)) for (s, e, txt, _spk) in lines]
 
     # ══ 实时/单段转录 → 纯文字 ═════════════════════════════════════════
 
     def transcribe(self, audio: np.ndarray, max_tokens: int = 300,
                    language: str | None = None, context: str | None = None) -> str:
-        """16kHz float32 音频 → 文字（实时模式用，不需字级时间轴）。"""
+        """16kHz float32 音频 → 文字（实时模式用，不需字级时间轴）。
+
+        ── 2026-11 实测（GTX 1660 SUPER / 核心 0.8.53 / qwen3 Q8 2.5GB）────
+        每段一次 spawn 的固定开销实测 **2.35s**（0.2s 静音即跑 2.35s：Vulkan
+        init + 权重上显存），占实时出字延迟的 ~90%；推理本身仅 ~0.2s。
+        「常驻子进程」可省这 2.35s，但上游不支持：
+          • crispasr.exe 无 server/stdin/stream 模式（--help 全量核对）
+          • crispasr.dll 9951 个导出全为 C++ mangled 内部符号、零干净 C ABI
+            （符号里可见 core_qwen3_stream 流式命名空间——能力在上游内部，
+             未暴露接口；ctypes 调 MSVC mangled + std::string 属逆向工程，
+             崩溃/显存泄漏/随版本漂移风险不可控）
+          • 多输入（file0 file1…）存在但会牺牲「段结束即出字」的实时语义
+        → 结论：驻留不可行，是上游能力缺口；降低实时延迟的现实手段是
+          选低开销模型档（whisper base 固定开销 0.45s vs qwen3 2.35s，
+          见录制页提示）。若上游未来提供 server/C ABI，此处是接入点。
+        """
         import soundfile as sf
         with tempfile.TemporaryDirectory() as td:
             wav = Path(td) / "seg.wav"
