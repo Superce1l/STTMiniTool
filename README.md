@@ -8,7 +8,7 @@
 > 的本地改进分支（fork 起点 v2.0.0）。上游的繁体中文界面、批量识别、端点服务等内容在本分支中
 > 已按需移除或替换。本仓库地址：https://github.com/Superce1l/STTMiniTool
 >
-> 当前版本 **v2.2.8** · [下载最新版](https://github.com/Superce1l/STTMiniTool/releases/latest) · [版本历史](#版本历史)
+> 当前版本 **v2.3.0** · [下载最新版](https://github.com/Superce1l/STTMiniTool/releases/latest) · [版本历史](#版本历史)
 
 ---
 
@@ -50,6 +50,9 @@
 - 📜 **运行日志**：转录／加载／下载事件自动记录到 `logs/`，问题可回溯
 - ✂️ **长音频切片**：>2 小时自动 FFmpeg 切片转录，切片时长依可用内存自适应，稳定不爆内存
 - 🎨 **深浅色主题 + 界面缩放 + 双语界面**（简体／English）
+- ✍️ **字幕校对**：撤销/重做（Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）、搜索替换（大小写不敏感，逐处/全部替换、Enter 循环跳转）、点字幕行选中区间循环播放
+- ⏹️ **转录取消**：转换进行中一键取消（立即终止子进程 / 段间生效），不必等跑完
+- 🧵 **批量队列**：多个转录任务排队串行执行（`/api/queue`，排队/开始/完成事件经 SSE 实时推送）
 - 📦 **开箱即用**：CrispASR 核心与 VAD 随包附带；各模型／ffmpeg 按需自动下载
 
 ---
@@ -135,13 +138,31 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 常用选项：`-l Chinese`（指定语言）、`--profile zh|ja|whisper`（依用途换模型，
 **只影响这次执行**）、`--hint "人名、术语"`、`--diarize [--speakers N]`、
-`-o out.srt -f srt|txt|json`。退出码 `0` 成功／`1` 转录失败／`2` 参数错误。
+`-o out.srt -f srt|txt|json|ass|vtt`（ass 有字级数据时自动带 `\k` 卡拉OK）。
+退出码 `0` 成功／`1` 转录失败／`2` 参数错误。
 
 ---
 
 ## 版本历史
 
-- **v2.2.8（当前）**：OCR 代码审查修复（15 条意见采纳 14 条）——说话者分离输出段界重叠导致**字幕重复**（high，重叠区被转录两遍）；模型加载期间改选会被**误报为已加载**；拆分泄漏监听器、卡拉OK词界与文字切点**脱节**；合并模式下编辑入口**写坏别的行**等 6 处交互/正确性修复；长字幕重绘性能减半
+- **v2.3.0（当前）**：安全、性能、结构与体验的全面升级（九批改进）——
+  - 🔐 **下载安全**：模型/可执行件下载补 SHA256 清单校验、TLS 降级只允许固定可信主机、
+    CrispASR 核心 zip 首次下载记录 TOFU pin 防替换；
+  - 🧱 **结构**：webview_backend 1982→1343 行并拆出 slicing / model_catalog /
+    transcription_service / transcription_queue / engine_types（共享常数收敛）；
+    前端迁移 ES modules（main 入口 + state 容器 + views/modelView），工具函数下沉 util.js；
+  - ⚡ **性能**：模型四路并行加载（启动 ~20s）、推理锁粒度缩小、切点吸附向量化、
+    字幕列表 >400 段自动窗口化渲染 + 事件委托 + 编辑脏区更新、卡拉OK游标式增量渲染；
+  - ✍️ **体验**：字幕撤销/重做（Ctrl+Z/Y）、搜索替换、转录取消按钮、录制页延迟提示、
+    CLI 与 GUI 字幕写出统一（补说话者前缀）；
+  - 🧰 **功能**：批量转录任务队列（/api/queue）、ASS/VTT 后端导出（CLI `-f ass|vtt`）、
+    服务端请求校验（坏 JSON 400、上传上限、临时目录全路径清理、SSE 丢事件告警）、
+    字幕原子落盘；
+  - 🧪 **工程**：GitHub Actions CI（unittest + ruff + mypy）、requirements-lock.txt、
+    测试 98→151 例（下载断点续传/TOFU、转录编排、队列、semver 预发布比较等）；
+  - 📋 修复：CLI 丢弃说话者前缀、semver 预发布版误判更新、模型页按钮文案与
+    加速器提示矛盾、.venv 指针、连开两卡编辑卡死等。
+- **v2.2.8～v2.2.10**：OCR 代码审查修复（15 条意见采纳 14 条）——说话者分离输出段界重叠导致**字幕重复**（high，重叠区被转录两遍）；模型加载期间改选会被**误报为已加载**；拆分泄漏监听器、卡拉OK词界与文字切点**脱节**；合并模式下编辑入口**写坏别的行**等 6 处交互/正确性修复；长字幕重绘性能减半（详见 GitHub Releases 分版说明）
 - **v2.2.7**：说话者工作台——「自动」人数判定修复（群心距离搜索，真实对唱实测正确，此前恒判 1 人）；结果页逐行**切换说话者**（可新增说话者手工纠错）与标签**改名**；单句**拆分**（光标处切开）+ 同说话者相邻**合并**（双模式互斥编辑）；点字幕行**选中区间**、播放键**循环播放片段**（校对不再突然出声）；左下角状态点五态；最近转录可删除（移入回收站）；随包 CrispASR 核心 0.8.44；测试增至 98 例
 - **v2.2.6**：正确性三连修复（OpenVINO 转录可中途取消、长音频切片说话者标签跨片一致、CrispASR 识别提示生效）；设置页精简——VAD 灵敏度与每段最长秒数改自动判断（未检出自动降灵敏度重试；段长依「是否字级对齐」自适应）；新增 ASS 卡拉OK / LRC 导出、最近转录列表、真实更新检查；录制时间轴改真实秒数；VAD 长音频批量提速、大文件上传流式落盘、卡拉OK逐字弹跳补完；settings.json 原子写 + 单点读写；新增 75 例单元测试
 - **v2.2.5**：模型下载「加载失败：CERTIFICATE_VERIFY_FAILED」修复——企业／校园代理重签 TLS 导致证书验证失败，下载自动降级重试；下载提示的 ⚠✅ 字符在简中 GBK 控制台崩溃并掩盖原始错误，改安全输出
@@ -297,7 +318,14 @@ app.py                  # ASR 引擎层（OpenVINO ASREngine / VAD / 常量）�
 crisp_engine.py         # CrispASR（CUDA / Vulkan）推理引擎：Whisper / Qwen3 GGUF
 applog.py               # 运行日志（转录/加载/下载事件 → logs/app-年月.log）
 chatllm_engine.py       # ASR 输出诊断辅助（VAD 诊断／退化输出检测，原 chatllm 后端）
-subtitle_lines.py       # 全引擎共享字幕分行（字级时间轴 → 字幕行）
+subtitle_lines.py       # 全引擎共享字幕分行（字级时间轴 → 字幕行）+ SRT/ASS/VTT/TXT 写出
+engine_types.py         # 引擎共享结果类型与常数（SAMPLE_RATE/VAD 阈值/FA 文件名/子进程样板）
+settings_store.py       # settings.json 单点读写（锁 + 原子替换 + mtime 缓存）
+slicing.py              # 长音频切片纯函数层（切片计划/合并去重/SRT 解析/跨片说话者匹配）
+model_catalog.py        # 模型目录元数据（引擎→模型→settings patch；CLI --profile 同源）
+transcription_service.py# 转录编排 mixin（WebBackend 继承：单片/切片/ffmpeg 就绪）
+transcription_queue.py  # 批量转录任务队列（单 worker FIFO；事件经 SSE 推送）
+tests/                  # 单元测试（unittest；python -m unittest discover -s tests）
 fa_aligner.py           # ForcedAligner 字级时间轴（OpenVINO 卡拉OK逐字用，调 chatllm main.exe）
 diarize.py              # 说话者分离引擎（外部 ONNX，不依赖 torch）
 audio_io.py             # 音频读取（16k mono，零 librosa/numba）

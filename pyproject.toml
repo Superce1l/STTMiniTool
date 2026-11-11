@@ -1,0 +1,37 @@
+# 工具链配置。本项目不作为 Python 包发布，只用 [tool.*] 表；
+# CI 见 .github/workflows/ci.yml（分级治理：门禁只挡「真实错误」级，
+# 风格/类型问题在存量代码清偿后逐级收紧，避免一次性大改淹没真实回归）。
+#
+#   ruff check .        — 门禁：语法/未定义名/重复定义等真实错误
+#   mypy                — 门禁：纯逻辑层类型检查（files 见下）
+#   unittest discover   — 门禁：单元测试（tests/，stdlib unittest）
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "build", "dist2",          # PyInstaller 产物
+    "ov_models", "crispasr", "tools",  # 模型 / 第三方二进制（非源码）
+    "logs", "subtitles",       # 运行产物
+]
+
+[tool.ruff.lint]
+# F63/F7：无效语法级；E9：语法错误；F821：未定义名；F811：重复定义。
+# 风格类（E4/E5/E7/W/UP/B/SIM…）暂不入门禁——存量债务另批清偿。
+select = ["E9", "F63", "F7", "F821", "F811"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+no_strict_optional = true
+check_untyped_defs = true
+# 先覆盖纯逻辑层（零重依赖、可静态验证）；
+# webview_backend / app / crisp_engine 待拆分与类型化偿还后逐个加入 files。
+files = [
+    "settings_store.py",
+    "subtitle_lines.py",
+    "engine_types.py",
+    "slicing.py",
+    "model_catalog.py",
+    "transcription_queue.py",
+]

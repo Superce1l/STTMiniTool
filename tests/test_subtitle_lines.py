@@ -6,7 +6,8 @@ from pathlib import Path
 from common import *  # noqa: F401,F403  (sys.path 注入)
 
 from subtitle_lines import (_srt_ts, _strip_pua, _ts_chatllm_to_subtitle_lines,
-                            lines_to_txt, write_transcript, MAX_CHARS)
+                            lines_to_txt, write_transcript, MAX_CHARS,
+                            ass_text, ass_karaoke_text, vtt_text)
 
 
 class TestStripPua(unittest.TestCase):
@@ -120,6 +121,53 @@ class TestWriteTranscript(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             out = write_transcript(Path(td) / "a", lines, out_format="txt")
             self.assertEqual(out.read_text(encoding="utf-8"), "how are you")
+
+
+class TestVttAndAss(unittest.TestCase):
+    def _lines(self):
+        return [(0.0, 1.5, "第一句", None), (2.0, 3.5, "第二句", "说话者1")]
+
+    def test_vtt_format(self):
+        v = vtt_text(self._lines())
+        self.assertTrue(v.startswith("WEBVTT\n\n"))
+        self.assertIn("00:00:00.000 --> 00:00:01.500\n第一句", v)
+        self.assertIn("00:00:02.000 --> 00:00:03.500\n说话者1：第二句", v)
+
+    def test_ass_plain(self):
+        a = ass_text(self._lines())
+        self.assertTrue(a.startswith("[Script Info]"))
+        self.assertIn("Dialogue: 0,0:00:00.00,0:00:01.50,Default,,0,0,0,,第一句", a)
+        self.assertIn("Dialogue: 0,0:00:02.00,0:00:03.50,Default,,0,0,0,,说话者1：第二句", a)
+
+    def test_ass_karaoke_word_timings(self):
+        rich = [
+            {"start": 1.0, "end": 2.0, "text": "你好", "speaker": "说话者2",
+             "words": [{"start": 1.0, "end": 1.4, "text": "你"},
+                       {"start": 1.5, "end": 2.0, "text": "好"}]},
+            {"start": 3.0, "end": 4.0, "text": "整行", "speaker": None, "words": []},
+        ]
+        k = ass_karaoke_text(rich)
+        self.assertIn("{\\k50}你{\\k50}好", k)        # 0.5s → 50 厘秒
+        self.assertIn("说话者2：", k)
+        self.assertIn("Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,整行", k)
+
+    def test_ass_karaoke_overlapping_words_clamped(self):
+        # 下一字起点早于本字终点（时间轴交叠）→ 拍点钳到本字 end，不为负
+        rich = [{"start": 1.0, "end": 2.0, "text": "ab", "speaker": None,
+                 "words": [{"start": 1.0, "end": 1.2, "text": "a"},
+                           {"start": 1.1, "end": 2.0, "text": "b"}]}]
+        k = ass_karaoke_text(rich)
+        self.assertIn("{\\k20}a{\\k90}b", k)
+
+    def test_write_transcript_vtt_and_ass(self):
+        with tempfile.TemporaryDirectory() as td:
+            ref = Path(td) / "a"
+            out = write_transcript(ref, self._lines(), out_format="vtt")
+            self.assertEqual(out.suffix, ".vtt")
+            self.assertIn("WEBVTT", out.read_text(encoding="utf-8"))
+            out = write_transcript(ref, self._lines(), out_format="ass")
+            self.assertEqual(out.suffix, ".ass")
+            self.assertIn("[Script Info]", out.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

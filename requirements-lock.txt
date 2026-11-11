@@ -1,0 +1,36 @@
+# 运行环境锁定版本（requirements.txt 的精确快照，来源：开发机 .venv 实测组合）。
+# 日常开发用 requirements.txt（下限浮动）；CI / 复现构建用本文件：
+#   pip install -r requirements-lock.txt
+# 升级某个依赖时：改 requirements.txt 的下限 → 本机实测 → 同步更新这里的 == 行。
+# Python：3.12（32/64 位以依赖自身 wheel 为准；项目按 64 位打包）
+
+# ── WebView 界面 ──────────────────────────────────────────────────────
+pywebview==6.2.1
+pythonnet==3.1.0; sys_platform == "win32"      # pywebview 的 WebView2 后端依赖
+clr_loader==0.3.1; sys_platform == "win32"
+
+# ── 推理引擎 ──────────────────────────────────────────────────────────
+openvino==2026.4.0
+onnxruntime==1.30.0
+
+# ── 音频处理 ──────────────────────────────────────────────────────────
+numpy==2.5.3
+soundfile==0.14.0
+scipy==1.18.1              # 说话者分离聚类（linkage/fcluster）＋重采样后备
+
+# ── 模型下载 / 网络 ───────────────────────────────────────────────────
+requests==2.34.2           # check_update 使用（下载主链路为零依赖 urllib）
+certifi==2026.7.22         # TLS 证书首选 bundle（企业代理环境兜底链的第一级）
+urllib3==2.8.0
+charset-normalizer==3.5.1
+idna==3.20
+
+# ── 传递依赖（保证组合可复现）────────────────────────────────────────
+packaging==26.3
+protobuf==7.36.2
+flatbuffers==25.12.19
+ml_dtypes==0.6.0
+typing_extensions==4.16.0
+colorama==0.4.6; sys_platform == "win32"
+pyyaml==6.0.3
+tqdm==4.70.1

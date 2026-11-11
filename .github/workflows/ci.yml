@@ -1,0 +1,43 @@
+name: CI
+
+# 门禁三件套：ruff（真实错误级）→ mypy（纯逻辑层）→ unittest（全套单测）。
+# 项目面向 Windows 打包，但测试/静态检查双平台跑，防平台耦合回归。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: unittest (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install locked runtime deps
+        run: pip install -r requirements-lock.txt
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  static:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff mypy
+      - name: ruff (real-error gate)
+        run: ruff check .
+      - name: mypy (pure-logic layer)
+        run: mypy

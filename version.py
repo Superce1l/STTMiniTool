@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-__version__ = "2.2.10"
+__version__ = "2.3.0"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用

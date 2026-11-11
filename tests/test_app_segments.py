@@ -5,7 +5,8 @@ from common import *  # noqa: F401,F403
 
 import numpy as np
 from engine_types import TranscribeResult
-from app import GAP_SEC, SAMPLE_RATE, ASREngine, _assign_ts, _resolve_backend, _split_to_lines
+from app import (GAP_SEC, SAMPLE_RATE, ASREngine, _assign_ts, _resolve_backend,
+                 _split_to_lines)
 
 
 class TestSplitToLines(unittest.TestCase):
@@ -108,6 +109,50 @@ class TestEngineContract(unittest.TestCase):
         self.assertIsNone(r.diag)
         self.assertFalse(r.cancelled)
         self.assertEqual(r.degenerate, 0)
+
+
+class TestQuietSplitPos(unittest.TestCase):
+    """向量化切点吸附：与朴素逐位置实现对拍（数值等价）+ 边界行为。"""
+
+    @staticmethod
+    def _naive(chunk, target, lo, hi):
+        win, hop = 400, 200
+        lo = max(lo, win)
+        hi = min(hi, len(chunk))
+        if lo >= hi:
+            return target
+        best, best_e = target, None
+        for p in range(lo, hi + 1, hop):
+            seg = chunk[p - win:p]
+            e = float(np.mean(seg * seg))
+            if best_e is None or e < best_e:
+                best, best_e = p, e
+        return best
+
+    def test_matches_naive_on_random_chunks(self):
+        rng = np.random.default_rng(7)
+        sp = ASREngine._quiet_split_pos
+        for trial in range(8):
+            n = int(rng.integers(16000, 48000))
+            chunk = rng.normal(0, 0.1, n).astype(np.float32)
+            # 挖一个安静谷（吸附目标应落在谷内）
+            g0 = int(rng.integers(4000, n - 4000))
+            chunk[g0:g0 + 1200] *= 0.01
+            lo, hi = g0 - 2000, g0 + 2000
+            self.assertEqual(sp(chunk, g0, lo, hi),
+                             self._naive(chunk, g0, lo, hi),
+                             f"trial {trial}")
+
+    def test_invalid_range_returns_target(self):
+        chunk = np.ones(2000, dtype=np.float32)
+        sp = ASREngine._quiet_split_pos
+        self.assertEqual(sp(chunk, 123, 0, 150), 123)   # lo>=hi 截断后无效
+        self.assertEqual(sp(chunk, 77, 500, 400), 77)
+
+    def test_energy_valley_wins(self):
+        chunk = np.ones(16000, dtype=np.float32)
+        chunk[8000:8400] *= 0.001          # 唯一安静谷：窗 [p-400,p] 完全落入谷内
+        self.assertEqual(ASREngine._quiet_split_pos(chunk, 9000, 400, 12000), 8400)
 
 
 if __name__ == "__main__":
