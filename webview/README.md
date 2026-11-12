@@ -12,10 +12,20 @@ webview/
 ├── css/app.css       设计系统（色彩 token、组件、响应式）
 ├── favicon.png       标签页图标（64px，由 assets/make_icon.py 生成）
 └── js/
-    ├── bridge.js     window.QwenAPI 统一桥接层（传输抽象 + event bus）
-    ├── app.js        UI 逻辑（只通过 QwenAPI，与后端解耦）
-    └── i18n.js       界面语言（简体中文 / English）
+    ├── bridge.js     window.QwenAPI 统一桥接层（传输抽象 + event bus + 请求超时）
+    ├── i18n.js       界面语言（简体中文 / English）
+    ├── main.js       ESM 入口：import 编排 + boot()
+    ├── state.js      跨视图共享状态容器（curSegs / speakerNames / REC / 搜索 …）
+    ├── util.js       纯工具（DOM 简写 / 字幕时间格式 / 撤销栈 / 虚拟窗口 / 卡拉OK游标）
+    ├── appCore.js    应用核心（音频页 / 字幕编辑与渲染 / 波形 / 录制 / 设置 / 历史）
+    └── views/
+        └── modelView.js   模型页视图（自检 / 引擎模型选择 / 加速版本 / 加载协调）
 ```
+
+> `bridge.js` / `i18n.js` 保持经典脚本（挂全局 `window.QwenAPI` / `window.I18N`），
+> 其余为 **ES modules**（`<script type="module" src="js/main.js">`）。
+> import 图无环单向：`main → state → util → views/modelView → appCore`，
+> 视图模块对 appCore 的反向导航经 `state.gotoView` 回调（零反向 import）。
 
 ## 架构：本机服务器 + 浏览器渲染（同 Eel / flaskwebgui，但纯标准库）
 

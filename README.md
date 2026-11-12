@@ -20,17 +20,17 @@
   <img src="readme/audio-tab.png" width="720" alt="音频转字幕界面">
 </p>
 
-**录制转换** 与 **模型与设备**：
+**录制转换**（含实时出字延迟提示）与 **模型与设备**（系统自检 / 设备 / 推理引擎）：
 
 <p align="center">
-  <img src="readme/record-tab.png" width="48%" alt="录制转换界面">
-  <img src="readme/models-tab.png" width="48%" alt="模型与设备界面">
+  <img src="readme/record-tab.png" width="48%" alt="录制转换界面（含实时延迟提示）">
+  <img src="readme/models-tab.png" width="48%" alt="模型与设备：系统自检、设备检测、推理引擎选择">
 </p>
 
-**推理加速版本选择** 与 **设置**：
+**模型选择与推理加速版本** 与 **设置**：
 
 <p align="center">
-  <img src="readme/accel-tab.png" width="48%" alt="推理加速版本选择">
+  <img src="readme/accel-tab.png" width="48%" alt="模型选择、检查明细与推理加速版本（CUDA/Vulkan/CPU）">
   <img src="readme/settings-tab.png" width="48%" alt="设置界面">
 </p>
 
@@ -51,8 +51,11 @@
 - ✂️ **长音频切片**：>2 小时自动 FFmpeg 切片转录，切片时长依可用内存自适应，稳定不爆内存
 - 🎨 **深浅色主题 + 界面缩放 + 双语界面**（简体／English）
 - ✍️ **字幕校对**：撤销/重做（Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）、搜索替换（大小写不敏感，逐处/全部替换、Enter 循环跳转）、点字幕行选中区间循环播放
+- 💾 **多种导出格式**：SRT 字幕／ASS 卡拉OK（字级 `\k` 逐字拍点）／LRC 歌词／VTT／纯文本
 - ⏹️ **转录取消**：转换进行中一键取消（立即终止子进程 / 段间生效），不必等跑完
 - 🧵 **批量队列**：多个转录任务排队串行执行（`/api/queue`，排队/开始/完成事件经 SSE 实时推送）
+- ⚡ **大字幕流畅编辑**：>400 段自动窗口化渲染 + 事件委托 + 编辑脏区更新；卡拉OK游标式增量渲染，数千段也不卡
+- ⏱️ **实时延迟可见**：录制页按当前引擎提示每段出字延迟预期（大模型约 2-3 秒/段，Whisper Base 约 0.5 秒，CPU 无冷启动）
 - 📦 **开箱即用**：CrispASR 核心与 VAD 随包附带；各模型／ffmpeg 按需自动下载
 
 ---
@@ -65,8 +68,22 @@
 
 1. 上方可设置 **语言**（默认自动）、**说话者分离**（可选人数）、**时间轴对齐**（字级时间轴）
 2. 可在「**识别提示**」贴入歌词／关键字，或「读入 TXT」加载参考文字
-3. 点「**▶ 开始转换**」，进度条实时显示；完成后可「**打开输出文件夹**」或「**保存字幕**」
-4. 下方呈现**真实波形 + 播放头 + 分段标注**，点波形、字幕条或区块都能跳播
+3. 点「**▶ 开始转换**」，进度条实时显示，**转换中可点「取消转换」立即中止**；完成后可「**打开输出文件夹**」或「**保存字幕**」
+4. 保存时可选格式：**SRT / ASS 卡拉OK / LRC / VTT / 纯文本**
+5. 下方呈现**真实波形 + 播放头 + 分段标注**，点波形、字幕条或区块都能跳播
+
+结果区工具条提供完整校对能力（图中为结果页面）：
+
+| 功能 | 操作 |
+|---|---|
+| **选中区间循环播放** | 点字幕卡或波形区块 → 选中该句，播放键循环播放片段 |
+| **搜索替换** | 工具条搜索框输入即搜，`n/m` 计数 + ↑↓（Enter/Shift+Enter）循环跳转，逐处替换或全部替换 |
+| **撤销 / 重做** | 工具条 ↶ ↷ 按钮，或 Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z（拆分、合并、改字、换说话者、重命名、替换均可撤销） |
+| **拆分** | 剪刀进入拆分模式 → 点文本放光标 → √ 或 Ctrl+Enter 在光标处一分为二（切点吸附最近字边界） |
+| **合并** | 「合并段落」选择模式多选 → 仅允许相邻且同一说话者 |
+| **说话者** | 点字幕卡的说话者标签即点即换（含「＋新说话者」「重命名…」） |
+
+> 字幕超过 400 段自动切换**窗口化渲染**（只挂载可视区附近的卡片），数千段列表滚动与编辑依然流畅；卡拉OK逐字高亮为增量更新，长句播放不掉帧。
 
 ### 录制转换
 
@@ -74,15 +91,29 @@
 （句中短暂停顿不会中断），结果逐段出现在下方「实时字幕」。可开「**实时保存**」边录边存，
 或录完按「**保存字幕**」。再按一次麦克风钮结束并完成最后一段。
 
+麦克风钮下方会显示**实时出字延迟提示**（依当前引擎动态变化，可点 × 关闭）：
+
+| 当前引擎/模型 | 每段出字延迟 | 说明 |
+|---|---|---|
+| CrispASR + Qwen3 大模型 | 约 **2-3 秒** | 进程内模型加载开销为主；可换 Whisper Base 或 CPU 核心改善 |
+| CrispASR + Whisper Base | 约 **0.5 秒** | 固定开销小、出字快；长句精度低于大模型 |
+| OpenVINO（CPU） | **无冷启动延迟** | 进程内推理，适合追求即时出字 |
+
 ### 模型与设备
 
 切到「**模型**」标签页：
 
-- **系统自检**：逐核心 × 逐能力列出文件就绪状况（绿＝已备、黄＝启用时自动下载）
+- **系统自检**：逐核心 × 逐能力列出文件就绪状况（绿＝已备、黄＝启用时自动下载、红＝需处理）；
+  「共享组件」另列 FFmpeg 与说话者分离模型（两核心共用）
+- **检测到的设备**：CPU 与各显卡（含显存大小与可用量）
 - **推理引擎二选一**：OpenVINO（纯 CPU，2 种模型）／CrispASR（GPU，9 种模型），选择后进入模型下拉
-- **推理加速版本**：检测显卡后推荐 CrispASR 的 CUDA／Vulkan／CPU build，可自行改选（下次加载时自动下载切换）
-  - **NVIDIA → 默认 CUDA**（驱动 ≥580 选 CUDA 13，否则 CUDA 12；自带 runtime）
+- **选择模型 + 检查明细**：所选模型的就绪状态一目了然——程序检查的模型目录、CrispASR 核心目录、
+  缺哪些文件（「明明有模型却说未下载」时的自查依据）
+- **推理加速版本**：检测显卡后推荐 CrispASR 的 CUDA／Vulkan／CPU build，可自行改选（加载时自动下载切换）
+  - **NVIDIA → 默认 CUDA**（驱动 ≥580 选 CUDA 13，否则 CUDA 12；自带 runtime，免装 Toolkit）
   - **AMD / Intel → Vulkan**（Windows 无 ROCm/SYCL，Vulkan 即最佳解）
+- **「下载并加载模型」按钮**：所选模型/加速器有缺失或版本不符时，点它会一并下载并就地热切换
+  （与上方提示条口径一致）；全部就绪后才变为「前往语音转文字」
 
 ### 设置
 
@@ -311,9 +342,17 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 ```
 app_webview.py          # 唯一入口：原生 WebView2 窗口 + 本机 HTTP server（关闭确认/屏幕适配）
-webview_server.py       # 本机 stdlib HTTP server（serve webview/ + /api，SSE 推送）
-webview_backend.py      # WebView 后端逻辑（模型目录、热切换加载、转录、切片调度、设置）
-webview/                # 前端（HTML / CSS / JS，i18n：简中 / English，宽度自适应）
+webview_server.py       # 本机 stdlib HTTP server（serve webview/ + /api，SSE 推送，请求校验）
+webview_backend.py      # WebView 后端逻辑（模型目录、热切换加载、设置、历史、队列协调）
+webview/                # 前端（HTML / CSS / ESM，i18n：简中 / English，宽度自适应）
+  index.html            #   bridge.js / i18n.js 经典脚本 + <script type="module" src="js/main.js">
+  js/main.js            #   ESM 入口：import 编排（state → util → views → appCore）+ boot()
+  js/state.js           #   跨视图共享可变状态容器（curSegs / speakerNames / REC / 搜索 / 合并…）
+  js/util.js            #   纯工具（DOM 简写 / 字幕时间格式 / 撤销栈 / 虚拟窗口 / 卡拉OK游标）
+  js/appCore.js         #   应用核心：音频页、字幕编辑与渲染、波形、录制、设置、历史
+  js/views/modelView.js #   模型页视图（自检 / 引擎与模型选择 / 加速版本 / 加载协调）
+  js/bridge.js          #   QwenAPI 桥（web 回溯 HTTP+SSE / mock 展示模式；含请求超时）
+  js/i18n.js            #   双语词典与 data-i18n 应用
 app.py                  # ASR 引擎层（OpenVINO ASREngine / VAD / 常量），无 GUI
 crisp_engine.py         # CrispASR（CUDA / Vulkan）推理引擎：Whisper / Qwen3 GGUF
 applog.py               # 运行日志（转录/加载/下载事件 → logs/app-年月.log）
@@ -321,16 +360,16 @@ chatllm_engine.py       # ASR 输出诊断辅助（VAD 诊断／退化输出检�
 subtitle_lines.py       # 全引擎共享字幕分行（字级时间轴 → 字幕行）+ SRT/ASS/VTT/TXT 写出
 engine_types.py         # 引擎共享结果类型与常数（SAMPLE_RATE/VAD 阈值/FA 文件名/子进程样板）
 settings_store.py       # settings.json 单点读写（锁 + 原子替换 + mtime 缓存）
-slicing.py              # 长音频切片纯函数层（切片计划/合并去重/SRT 解析/跨片说话者匹配）
+slicing.py              # 长音频切片纯函数层（切片计划/合并去重/SRT 解析/跨片说话者匹配/指派）
 model_catalog.py        # 模型目录元数据（引擎→模型→settings patch；CLI --profile 同源）
 transcription_service.py# 转录编排 mixin（WebBackend 继承：单片/切片/ffmpeg 就绪）
 transcription_queue.py  # 批量转录任务队列（单 worker FIFO；事件经 SSE 推送）
-tests/                  # 单元测试（unittest；python -m unittest discover -s tests）
+tests/                  # 单元测试 151 例（unittest；python -m unittest discover -s tests）
 fa_aligner.py           # ForcedAligner 字级时间轴（OpenVINO 卡拉OK逐字用，调 chatllm main.exe）
 diarize.py              # 说话者分离引擎（外部 ONNX，不依赖 torch）
 audio_io.py             # 音频读取（16k mono，零 librosa/numba）
 processor_numpy.py      # 纯 numpy Mel / BPE 处理器
-downloader.py           # 模型完整性检查与按需下载（含 HF 镜像、CUDA 版本推荐、完整性校验）
+downloader.py           # 模型检查与按需下载（SHA256 清单校验 / TLS 可信主机名单 / TOFU pin / HF 镜像）
 ffmpeg_utils.py         # ffmpeg 检测与音轨提取
 cli_mode.py             # 无头 CLI（transcribe / apply / status / profiles）
 proc_guard.py           # Windows Job Object：主进程退出连带终止子进程
@@ -338,6 +377,10 @@ version.py              # 版本单一事实来源
 build_webview.bat       # PyInstaller onedir 打包（WebView EXE + 发行 zip）
 motw_unblock.py         # 启动自清 Mark-of-the-Web（onedir 发行版必需）
 assets/make_icon.py     # 图标生成（SVG → PNG/ICO，语音转文字图标）
+pyproject.toml          # ruff / mypy 工具链配置（CI 分级门禁）
+requirements-lock.txt   # 依赖锁定版本（可复现构建）
+.github/workflows/ci.yml# CI：unittest（Windows+Ubuntu）/ ruff / mypy
+docs/                   # 发行说明与上游 feature request 等文档
 ```
 
 
@@ -351,8 +394,14 @@ assets/make_icon.py     # 图标生成（SVG → PNG/ICO，语音转文字图标
 git clone https://github.com/Superce1l/STTMiniTool.git
 cd STTMiniTool
 python -m venv .venv && .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.txt        # 或 requirements-lock.txt（精确锁定版本，CI 同款）
 python app_webview.py          # 启动 WebView 界面
+```
+
+运行测试（151 例，无需模型即可跑绝大部分）：
+
+```bash
+python -m unittest discover -s tests
 ```
 
 ### 打包 EXE
