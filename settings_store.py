@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 from pathlib import Path
+
+from instance_lock import atomic_replace
 
 
 class SettingsStore:
@@ -74,12 +77,24 @@ class SettingsStore:
             return cur
 
     def _write(self, cur: dict):
-        """原子落盘 + 刷新缓存（调用方须已持锁）。"""
+        """原子落盘 + 刷新缓存（调用方须已持锁）。
+
+        临时名由 mkstemp 生成（唯一）：两个实例同时改设置时不再抢
+        settings.json.tmp 而互相截断／FileNotFoundError（反馈 #6）。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self.path)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self.path.parent),
+                                        prefix=self.path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(cur, ensure_ascii=False, indent=2))
+            atomic_replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         try:
             st = self.path.stat()
             self._sig = (st.st_mtime_ns, st.st_size)

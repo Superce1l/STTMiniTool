@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
+
+from instance_lock import atomic_replace
 
 # ── 断句常数（与旧 app.py 行为一致）──────────────────────────────────
 MAX_CHARS      = 20
@@ -70,16 +73,27 @@ def srt_text(lines: list[tuple[float, float, str, str | None]]) -> str:
 
 
 def atomic_write_text(path, text: str) -> None:
-    """原子落盘文本：临时文件写完 → os.replace 原子替换。
+    """原子落盘文本：同目录唯一临时文件写完 → os.replace 原子替换。
 
-    转录中途进程被杀（关窗 / /api/shutdown）不会留下半截 SRT——
-    与 SettingsStore 同一模式；替换目标所在目录需已存在。
+    临时名带随机后缀（tempfile.mkstemp）：两个实例／两个线程写**同一目标**
+    时不再抢固定名 .tmp —— 旧实现会互相截断，或对方先 replace 掉临时文件后
+    自己 os.replace 抛 FileNotFoundError（反馈 #6 的双开场景）。
+    转录中途进程被杀（关窗 / /api/shutdown）不会留下半截 SRT——与
+    SettingsStore 同一模式；替换目标所在目录需已存在。
     """
     path = Path(path)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent),
+                                    prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        atomic_replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 # ── ASS / WebVTT 导出 ──────────────────────────────────────────────────

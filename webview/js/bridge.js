@@ -76,7 +76,12 @@
   //   计时只罩到响应头：本地 server 响应体小、紧跟头到达；请求结束后才
   //   触发的 abort 是无害 no-op。SSE（EventSource）不走此路径。
   const DEFAULT_TIMEOUT_MS = 30000;
-  const TRANSCRIBE_TIMEOUT_MS = 30 * 60 * 1000;   // 上传 + 转录上限 30 分钟
+  // 转录（上传 + 推理）不设「固定分钟数」上限：耗时只取决于音频长度与机器速度。
+  // 反馈 #4：53 分钟片子单跑约 25 分钟，同时开两个实例时被 GPU 争用拖过原先
+  // 写死的 30 分钟线 → 前端 abort、后端仍在跑，界面报「请求超时」且拿不到产物。
+  // 真正的控制面是 SSE 进度 + 「取消转换」按钮（服务端另有断连即取消）；
+  // 这里的 6 小时只是「服务端静默死掉时 UI 别永远转圈」的兜底，正常撞不到。
+  const TRANSCRIBE_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
   async function apiFetch(path, init, timeoutMs) {
     const ms = timeoutMs == null ? DEFAULT_TIMEOUT_MS : timeoutMs;
@@ -266,9 +271,19 @@
     if (opts.nSpeakers && opts.nSpeakers !== "auto") fd.append("n_speakers", String(opts.nSpeakers));
     if (opts.hint) fd.append("hint", opts.hint);
     emit("progress", { pct: 3, status: tr("file.uploading", "上传中…") });
-    // 上传 + 转录是分钟级长任务：单独放行 30 分钟上限（实时进度经 SSE 推送）
-    const r = await apiFetch("/api/transcribe",
-      { method: "POST", body: fd, headers: authHeaders() }, TRANSCRIBE_TIMEOUT_MS);
+    // 上传 + 转录是分钟级长任务（进度经 SSE 推送）；不发固定分钟数上限，
+    // 见 TRANSCRIBE_TIMEOUT_MS 处的说明。
+    let r;
+    try {
+      r = await apiFetch("/api/transcribe",
+        { method: "POST", body: fd, headers: authHeaders() }, TRANSCRIBE_TIMEOUT_MS);
+    } catch (e) {
+      // 传输层失败（连接被重置 / 服务端提前关闭 / 浏览器内部错误）：这次请求
+      // 已经没人收结果了。告知后端停下——否则「界面已报错、后端还在烧 GPU
+      // 转录」会一直持续到整档跑完，结果也无人接收（反馈 #4/#5）。
+      try { await apiPost("/api/cancel", {}); } catch {}
+      throw e;
+    }
     if (!r.ok) {
       let msg = "HTTP " + r.status;
       try { msg = (await r.json()).error?.message || msg; } catch {}

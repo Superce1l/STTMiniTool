@@ -23,6 +23,7 @@ from pathlib import Path
 _LOCK = threading.Lock()
 _DIR: Path | None = None
 _CURRENT_MONTH: str = ""
+_SUFFIX: str = ""          # 并行实例的文件名后缀（"-pid1234"），空 = 共用
 _FH = None
 
 
@@ -50,7 +51,7 @@ def _get_fh():
             if _DIR is None:
                 _DIR = _base_dir() / "logs"
             _DIR.mkdir(parents=True, exist_ok=True)
-            _FH = open(_DIR / f"app-{month}.log", "a", encoding="utf-8")
+            _FH = open(_DIR / f"app-{month}{_SUFFIX}.log", "a", encoding="utf-8")
             _CURRENT_MONTH = month
             return _FH
         except Exception:
@@ -104,3 +105,29 @@ def log_transcribe(msg: str):
 def log_model(msg: str):
     """模型加载事件。"""
     _write("MODEL", msg)
+
+
+def set_instance_suffix(suffix: str) -> None:
+    """并行实例的日志文件后缀（如 "-pid1234"）；空串 = 与单实例共用 app-YYYYMM.log。
+
+    两个实例同时写同一文件会把行交错（反馈 #6：作者要 log 时拿到的是一锅粥），
+    故并行实例各写各的。切换会关闭当前句柄，下次写入按新名重开。
+    """
+    global _SUFFIX, _FH, _CURRENT_MONTH
+    with _LOCK:
+        _SUFFIX = suffix or ""
+        try:
+            if _FH is not None:
+                _FH.close()
+        except Exception:
+            pass
+        _FH = None
+        _CURRENT_MONTH = ""
+
+
+def log_path() -> Path | None:
+    """当前日志文件路径（启动横幅与诊断用；首调用会按需创建 logs/）。"""
+    _get_fh()
+    if _DIR is None or not _CURRENT_MONTH:
+        return None
+    return _DIR / f"app-{_CURRENT_MONTH}{_SUFFIX}.log"

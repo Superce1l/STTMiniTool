@@ -68,6 +68,7 @@ class TranscribeService:
         # 视频 → 先抽音轨
         audio_path = Path(path)
         tmp_extra = None
+        out_lock = None        # 产物跨进程锁（双开时同名字幕只许一个实例写）
         try:
             ext = audio_path.suffix.lower()
             from ffmpeg_utils import VIDEO_EXTS
@@ -132,6 +133,15 @@ class TranscribeService:
             except Exception:
                 out_ref = srt_dir / "transcript"
 
+            # ── 输出唯一化：两个实例转同一个源文件会算出同一个字幕名（互相覆盖；
+            # txt 分支还会把对方的 .srt 删掉 —— 反馈 #6）。按产物路径取跨进程锁，
+            # 已被别的实例占用就退到「<名> (2)」…，锁持有到本次转录结束。
+            try:
+                from instance_lock import unique_artifact
+                out_ref, out_lock = unique_artifact(out_ref)
+            except Exception:
+                traceback.print_exc()      # 锁不可用 → 用原名，绝不挡住转录
+
             with self._lock:
                 self._apply_chunk_secs(want_align)   # 任务自适应的每段上限（对齐→短段抗漂移）
 
@@ -158,6 +168,11 @@ class TranscribeService:
                 self._transcribe_gate.release()   # 只有置位者会走到这里（acquire 失败早已抛出）
             except RuntimeError:
                 pass
+            if out_lock is not None:
+                try:
+                    out_lock.release()
+                except Exception:
+                    pass
             if tmp_extra:
                 try:
                     Path(tmp_extra).unlink(missing_ok=True)

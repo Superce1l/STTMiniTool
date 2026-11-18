@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import queue
+import select
+import socket
 import sys
 import tempfile
 import threading
@@ -199,6 +201,26 @@ def _parse_multipart_stream(rfile, boundary: bytes, out_dir: Path,
                 sink.close()
         if acc is not None:
             fields[name] = bytes(acc).decode("utf-8", errors="replace")
+
+
+def _client_disconnected(conn) -> bool:
+    """非阻塞探测 HTTP 客户端连接是否已断开（对端关闭 → 可读且 recv 返回 b""）。
+
+    转录是分钟级请求：浏览器侧 abort（超时／关标签页／关窗）后连接就断了，但
+    服务端线程仍阻塞在 backend.transcribe 里。调用方据此取消「已无人接收结果」
+    的转录，避免继续白烧 GPU（反馈 #4/#5）。读到的若不是 EOF（keep-alive 上
+    恰好有后续请求数据）则视为仍在线。
+    """
+    try:
+        r, _, _ = select.select([conn], [], [], 0)
+        if not r:
+            return False
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True             # 连接已被重置／关闭
+    except Exception:
+        return False
+
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -493,6 +515,7 @@ class WebViewServer:
                                           f"{_MAX_UPLOAD_BYTES // (1024 ** 3)} GB")
 
                 tmp_dir = Path(tempfile.mkdtemp(prefix="asr_web_"))
+                done = threading.Event()      # 转录结束/异常 → 停掉断连看门狗
                 try:
                     # 此前「缺少 file 部件」/「内容为空」两个早退路径不清理
                     # tmp_dir，异常/恶意请求会在 %TEMP% 留垃圾——统一由
@@ -504,6 +527,28 @@ class WebViewServer:
                     filename, in_path = files["file"]
                     if not in_path.is_file() or in_path.stat().st_size == 0:
                         return self._err(400, "file 内容为空")
+
+                    # ── 断连看门狗：浏览器 abort（超时／关标签页）或关窗后连接
+                    # 即断，但本线程还阻塞在 backend.transcribe 里。立刻取消，
+                    # 避免「界面已报错、后端还在烧 GPU」跑完整档（反馈 #4/#5）。
+                    # 取消走既有链路：_cancel + 引擎 cancel_event。
+                    def _watch_client(_conn=self.connection, _name=filename):
+                        while not done.wait(1.0):
+                            if not _client_disconnected(_conn):
+                                continue
+                            try:
+                                server.backend.cancel()
+                            except Exception:
+                                pass
+                            try:
+                                from applog import log_transcribe
+                                log_transcribe(f"客户端已断开，取消转录：{_name}")
+                            except Exception:
+                                pass
+                            return
+
+                    threading.Thread(target=_watch_client, daemon=True,
+                                     name="client-disconnect-watch").start()
 
                     opts = {
                         "path": str(in_path),
@@ -518,15 +563,24 @@ class WebViewServer:
                         result = server.backend.transcribe(
                             opts, progress_cb=lambda pct, status:
                             server.hub.publish("progress", {"pct": pct, "status": status}))
-                        return self._json(result)
                     except Exception as e:
                         from applog import log_error
                         log_error(f"转录失败：{filename}", exc=e)
                         # 回结构化的 500 而非 raise（raise 会让 HTTP 层打印
                         # traceback 并中断连接，前端只能看到网络错误）。
                         head = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
-                        return self._err(500, head)
+                        try:
+                            self._err(500, head)
+                        except OSError:
+                            pass        # 客户端已断开（上面刚取消了它的任务）
+                        return
+                    try:
+                        self._json(result)
+                    except OSError:
+                        pass            # 同上：结果无人接收
+                    return
                 finally:
+                    done.set()          # 停掉断连看门狗
                     import shutil
                     shutil.rmtree(tmp_dir, ignore_errors=True)
 

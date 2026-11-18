@@ -432,6 +432,46 @@ def _cli_argv() -> list[str] | None:
     return None
 
 
+def _ask_existing_instance(state: dict) -> str:
+    """已有实例在运行 → 询问使用者：'focus' / 'parallel' / 'quit'。
+
+    「是」聚焦已有窗口（默认，最安全）／「否」仍要并行／「取消」退出。
+    无 tkinter 或对话框异常 → 'parallel'：守卫只提供更好的选择，绝不把
+    程序挡在门外（例如服务器／无桌面环境下 tkinter 不可用）。
+    """
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception:
+        return "parallel"
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            extra = ""
+            if state.get("url"):
+                extra = (f"\n\n已有窗口：{state['url']}"
+                         f"（PID {state.get('pid', '?')}）")
+            yes = messagebox.askyesnocancel(
+                f"{APP_NAME} — 已在运行",
+                "检测到另一个实例正在运行。" + extra +
+                "\n\n「是」打开已有窗口\n"
+                "「否」仍要再开一个（并行转录会争用 GPU/显存，"
+                "两个实例也可能互相覆盖输出，建议只开一个）\n"
+                "「取消」退出",
+                parent=root)
+        finally:
+            root.destroy()
+    except Exception:
+        return "parallel"
+    if yes is True:
+        return "focus"
+    if yes is False:
+        return "parallel"
+    return "quit"
+
+
 def main():
     # ── MOTW 自清（onedir 发行版必需，必须最先执行）─────────────────────
     #   发行 zip 解压时 Zone.Identifier 落到 _internal 的每个 DLL，.NET 拒载
@@ -461,9 +501,63 @@ def main():
     # 设置独立 AppUserModelID（要在开任何窗口前）→ 任务栏图标不跟 python.exe 共享。
     set_app_user_model_id()
 
+    # ── 单实例守卫 ──────────────────────────────────────────────────────
+    # 安装目录是共享的（subtitles/ 输出、settings.json、logs/、crispasr/ 与
+    # ffmpeg/ 的解压、ov_models/ 的下载）。两个实例并行会互相覆盖产物、并发
+    # 解压／删除对方正在运行的 crispasr.exe、把日志混成一条（反馈 #6）。
+    # 第二个实例先问使用者：聚焦已有窗口 / 仍要并行 / 退出。
+    from instance_lock import SingleInstance
+    guard = SingleInstance("STTMiniTool")
+    try:
+        is_first = guard.acquire()
+    except Exception:
+        is_first, guard = True, None      # 守卫不可用 → 照常启动，绝不挡路
+    if not is_first and not guard.already_running:
+        is_first, guard = True, None      # 锁文件打不开 ≠ 已有实例：照常启动
+    if not is_first:
+        choice = _ask_existing_instance(guard.read_state())
+        if choice == "focus":
+            url = str(guard.read_state().get("url") or "")
+            if url:
+                try:
+                    open_edge_app(url)
+                except Exception:
+                    pass
+            else:
+                # 对方刚拿到锁、还没写 state（启动中）→ 没窗口可聚焦，记一笔即可
+                try:
+                    from applog import log_warn
+                    log_warn("已有实例在运行但尚未写入窗口地址（启动中？），本次不启动。")
+                except Exception:
+                    pass
+            return
+        if choice == "quit":
+            return
+        # 并行：日志按 PID 分文件，避免与已有实例混流（作者要看 log 时能拆开）
+        try:
+            from applog import set_instance_suffix
+            set_instance_suffix(f"-pid{os.getpid()}")
+        except Exception:
+            pass
+
     srv = WebViewServer(host="127.0.0.1", port=0)   # 随机空闲端口，只绑回环
     srv.start()
     _BACKEND_REF[0] = srv.backend
+    # 启动横幅（pid/端口/日志路径）+ 把「已有实例」的落点写给下一个实例：
+    # 双开排查时凭这一行就能分清是哪个进程、日志在哪个文件。
+    try:
+        from applog import log_info, log_path
+        try:
+            from version import __version__ as _ver
+        except Exception:
+            _ver = ""
+        log_info(f"(pid {os.getpid()}) 启动 v{_ver}，端口 {srv.port}，"
+                 f"日志 {log_path()}")
+        if is_first and guard is not None:
+            guard.write_state(pid=os.getpid(), port=srv.port,
+                              url=srv.url, version=_ver)
+    except Exception:
+        pass
     # 窗口外观：读持久化外观偏好决定初始标题栏深浅；注册回调，让 UI 切换主题时
     # 窗口标题栏实时跟着深/浅。
     global _initial_theme
@@ -513,6 +607,11 @@ def main():
         try:
             srv.stop()
         finally:
+            try:
+                if is_first and guard is not None:
+                    guard.clear_state()     # 清掉 instance.json，别留陈旧 URL
+            except Exception:
+                pass
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)

@@ -994,8 +994,30 @@ def quick_check_crispasr(crispasr_dir: Path, variant: str | None = None) -> bool
     return info["version"] == crispasr_version() and info["variant"] == variant
 
 
+# 跨进程锁等待上限（秒）：两个实例同时要同一份下载/解压时，先到的做完，
+# 后到的等这么久仍拿不到就回可读错误（反馈 #6：并发解压会删掉对方正在跑的 exe）。
+_XPROC_LOCK_WAIT_SECS = 120
+
+
 def download_crispasr_core(crispasr_dir: Path, progress_cb=None,
                            variant: str | None = None):
+    """下载 CrispASR 核心并解压（跨进程串行；实作见 _download_crispasr_core_locked）。
+
+    解压前会清掉旧的 .exe/.dll 再 copy，两个实例同时做会把对方正在运行的
+    crispasr.exe 删掉/覆盖（反馈 #6）。故整段持一把跨进程命名锁。
+    """
+    from instance_lock import FileLock
+    lock = FileLock.named("crispasr-core", timeout=_XPROC_LOCK_WAIT_SECS)
+    if not lock.acquire():
+        raise RuntimeError("另一个实例正在解压 CrispASR 核心，请等它完成后重试。")
+    try:
+        return _download_crispasr_core_locked(crispasr_dir, progress_cb, variant)
+    finally:
+        lock.release()
+
+
+def _download_crispasr_core_locked(crispasr_dir: Path, progress_cb=None,
+                                   variant: str | None = None):
     """下载指定加速版本的 CrispASR zip 并解压（扁平化）至 crispasr_dir。
 
     progress_cb(pct: float, msg: str)。GitHub 来源不套用 HF 镜像。
@@ -1073,6 +1095,21 @@ def quick_check_ffmpeg(dest_dir: Path) -> bool:
 
 
 def download_ffmpeg(dest_dir: Path, progress_cb=None):
+    """下载 ffmpeg 并解压（跨进程串行；实作见 _download_ffmpeg_locked）。
+
+    解压后 copy 覆盖 exe：两个实例同时做会互相占用文件，持命名锁串行。
+    """
+    from instance_lock import FileLock
+    lock = FileLock.named("ffmpeg", timeout=_XPROC_LOCK_WAIT_SECS)
+    if not lock.acquire():
+        raise RuntimeError("另一个实例正在准备 ffmpeg，请稍后重试。")
+    try:
+        return _download_ffmpeg_locked(dest_dir, progress_cb)
+    finally:
+        lock.release()
+
+
+def _download_ffmpeg_locked(dest_dir: Path, progress_cb=None):
     """下载 ffmpeg.zip（HF）并解压 ffmpeg.exe/ffprobe.exe 至 dest_dir（扁平化）。
 
     progress_cb(pct: float, msg: str)。仿 download_crispasr_core 的流程。
@@ -1405,6 +1442,27 @@ def crispasr_core_issue(crispasr_dir: Path, variant: str | None = None) -> str:
 
 def _download_file(url: str, dest: Path, progress_cb=None,
                    pin_scope: Path | None = None):
+    """下载单一文件（跨进程互斥；实作见 _download_file_impl）。
+
+    两个实例同时下同一目标文件会互相截断、把对方的残档当续传起点
+    （反馈 #6）。按目标路径取锁；同一文件被别的实例占用则最多等
+    _XPROC_LOCK_WAIT_SECS 秒，仍在下载就给可读错误。
+    """
+    try:
+        from instance_lock import FileLock
+    except Exception:                     # 锁模块不可用 → 维持旧行为
+        return _download_file_impl(url, dest, progress_cb, pin_scope)
+    lock = FileLock.for_artifact(dest, timeout=_XPROC_LOCK_WAIT_SECS)
+    if not lock.acquire():
+        raise RuntimeError(f"另一个实例正在下载 {Path(dest).name}，请等它完成后重试。")
+    try:
+        return _download_file_impl(url, dest, progress_cb, pin_scope)
+    finally:
+        lock.release()
+
+
+def _download_file_impl(url: str, dest: Path, progress_cb=None,
+                        pin_scope: Path | None = None):
     """
     下载单一文件至 dest，支持断点续传（Resume）。
     progress_cb(done_bytes: int, total_bytes: int)

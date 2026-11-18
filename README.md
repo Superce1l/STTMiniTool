@@ -8,7 +8,7 @@
 > 的本地改进分支（fork 起点 v2.0.0）。上游的繁体中文界面、批量识别、端点服务等内容在本分支中
 > 已按需移除或替换。本仓库地址：https://github.com/Superce1l/STTMiniTool
 >
-> 当前版本 **v2.3.0** · [下载最新版](https://github.com/Superce1l/STTMiniTool/releases/latest) · [版本历史](#版本历史)
+> 当前版本 **v2.3.1** · [下载最新版](https://github.com/Superce1l/STTMiniTool/releases/latest) · [版本历史](#版本历史)
 
 ---
 
@@ -52,7 +52,8 @@
 - 🎨 **深浅色主题 + 界面缩放 + 双语界面**（简体／English）
 - ✍️ **字幕校对**：撤销/重做（Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z）、搜索替换（大小写不敏感，逐处/全部替换、Enter 循环跳转）、点字幕行选中区间循环播放
 - 💾 **多种导出格式**：SRT 字幕／ASS 卡拉OK（字级 `\k` 逐字拍点）／LRC 歌词／VTT／纯文本
-- ⏹️ **转录取消**：转换进行中一键取消（立即终止子进程 / 段间生效），不必等跑完
+- ⏹️ **转录取消**：转换进行中一键取消（立即终止子进程 / 段间生效），不必等跑完；**界面断开／关窗即自动停止**，不会空烧 GPU
+- 🛡️ **双开保护**：第二个实例会提示「打开已有窗口／仍要并行／退出」；并行时输出与日志自动隔离，不会互相覆盖
 - 🧵 **批量队列**：多个转录任务排队串行执行（`/api/queue`，排队/开始/完成事件经 SSE 实时推送）
 - ⚡ **大字幕流畅编辑**：>400 段自动窗口化渲染 + 事件委托 + 编辑脏区更新；卡拉OK游标式增量渲染，数千段也不卡
 - ⏱️ **实时延迟可见**：录制页按当前引擎提示每段出字延迟预期（大模型约 2-3 秒/段，Whisper Base 约 0.5 秒，CPU 无冷启动）
@@ -176,7 +177,19 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 ## 版本历史
 
-- **v2.3.0（当前）**：安全、性能、结构与体验的全面升级（九批改进）——
+- **v2.3.1（当前）**：双开稳定 + 长视频不再误报「请求超时」（反馈 #4 / #5 / #6）——
+  - ⏱️ **超时**：转录不再硬限 30 分钟。53 分钟素材单跑约 25 分钟，两个实例并行时被 GPU 争用拖过
+    30 分钟线 → 前端 abort、后端仍在跑、界面报「请求超时」且拿不到产物。改为 SSE 进度 +
+    取消按钮做控制面，只留 6 小时兜底；
+  - 🔌 **断连即停**：浏览器 abort／关标签页／关窗后 1 秒内取消转录（服务端探测连接 EOF）并记
+    日志，不再跑完整档；
+  - 🛡️ **单实例守卫**：第二个实例不再静默双开，弹窗三选一「打开已有窗口／仍要并行／退出」；
+    并行时日志按 PID 分文件、启动横幅记录 pid／端口／日志路径；
+  - 🔒 **并发隔离**：CrispASR 核心与 ffmpeg 解压、同一目标文件下载各持跨进程锁；同一份字幕
+    两个实例只许一个写（后者自动「(2)」）；原子写临时名唯一 + Windows replace 短重试，杜绝
+    「转完最后一步写盘失败」；
+  - 🧪 测试 151 → 165 例（跨进程锁、持有者崩溃后自动释放、产物唯一化、并发原子写、断连探测）。
+- **v2.3.0**：安全、性能、结构与体验的全面升级（九批改进）——
   - 🔐 **下载安全**：模型/可执行件下载补 SHA256 清单校验、TLS 降级只允许固定可信主机、
     CrispASR 核心 zip 首次下载记录 TOFU pin 防替换；
   - 🧱 **结构**：webview_backend 1982→1343 行并拆出 slicing / model_catalog /
@@ -355,7 +368,8 @@ webview/                # 前端（HTML / CSS / ESM，i18n：简中 / English，
   js/i18n.js            #   双语词典与 data-i18n 应用
 app.py                  # ASR 引擎层（OpenVINO ASREngine / VAD / 常量），无 GUI
 crisp_engine.py         # CrispASR（CUDA / Vulkan）推理引擎：Whisper / Qwen3 GGUF
-applog.py               # 运行日志（转录/加载/下载事件 → logs/app-年月.log）
+applog.py               # 运行日志（转录/加载/下载事件 → logs/app-年月.log；并行实例按 PID 分文件）
+instance_lock.py        # 跨进程锁与单实例守卫（msvcrt/flock；state 落 %LOCALAPPDATA%）
 chatllm_engine.py       # ASR 输出诊断辅助（VAD 诊断／退化输出检测，原 chatllm 后端）
 subtitle_lines.py       # 全引擎共享字幕分行（字级时间轴 → 字幕行）+ SRT/ASS/VTT/TXT 写出
 engine_types.py         # 引擎共享结果类型与常数（SAMPLE_RATE/VAD 阈值/FA 文件名/子进程样板）
@@ -364,7 +378,7 @@ slicing.py              # 长音频切片纯函数层（切片计划/合并去�
 model_catalog.py        # 模型目录元数据（引擎→模型→settings patch；CLI --profile 同源）
 transcription_service.py# 转录编排 mixin（WebBackend 继承：单片/切片/ffmpeg 就绪）
 transcription_queue.py  # 批量转录任务队列（单 worker FIFO；事件经 SSE 推送）
-tests/                  # 单元测试 151 例（unittest；python -m unittest discover -s tests）
+tests/                  # 单元测试 165 例（unittest；python -m unittest discover -s tests）
 fa_aligner.py           # ForcedAligner 字级时间轴（OpenVINO 卡拉OK逐字用，调 chatllm main.exe）
 diarize.py              # 说话者分离引擎（外部 ONNX，不依赖 torch）
 audio_io.py             # 音频读取（16k mono，零 librosa/numba）

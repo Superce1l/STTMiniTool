@@ -9,12 +9,31 @@
 """
 from __future__ import annotations
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.3.1 更新汇总（双开稳定 + 长视频不再误报「请求超时」）──────────────────
+#   超时：前端原先把「上传 + 转录」硬限 30 分钟（bridge.js
+#         TRANSCRIBE_TIMEOUT_MS）→ 53 分钟素材单跑约 25 分钟，两个实例并行时被
+#         GPU 争用拖过 30 分钟线，前端 abort、后端仍在跑：界面报「请求超时」、
+#         结果无人接收（反馈 #4/#5）。改为不设固定分钟数（留 6 小时兜底），
+#         控制面交给 SSE 进度 + 取消按钮。
+#   断连：服务端在转录期间每秒探测连接（select + MSG_PEEK），浏览器 abort／
+#         关标签页／关窗后立刻取消转录并记日志，不再空烧 GPU 跑完整档。
+#   单实例：新增 instance_lock（Windows msvcrt 字节锁／POSIX flock；持有者崩溃
+#         由内核释放）。第二个实例不再静默双开——弹窗三选一（打开已有窗口／
+#         仍要并行／退出）；并行时日志按 PID 分文件，启动横幅记录 pid／端口／
+#         日志路径。
+#   并发：CrispASR 核心与 ffmpeg 解压各持跨进程锁（并发解压会删掉对方正在跑
+#         的 crispasr.exe）；同一目标文件的下载串行；同一份字幕两个实例只许一个
+#         写（后者自动「(2)」）；原子写临时名改唯一（mkstemp）+ Windows replace
+#         冲突短重试——「转完最后一步写盘失败」不再发生。
+#   测试：151 → 165 例（跨进程锁／持有者崩溃后自动释放／锁不可写≠已占用／
+#         产物唯一化／并发原子写／客户端断连探测）。
 
 # ── 2.2.10 更新汇总（Whisper 字级对齐生效 + 字幕标点／长词／数字格式 + CPU 多线程）
 #   对齐：whisper 模型挂 FA 时显式 --backend whisper。省略 --backend 时 crispasr
