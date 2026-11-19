@@ -85,6 +85,34 @@ class TestTsToSubtitleLines(unittest.TestCase):
         self.assertEqual(words[0]["text"], "你")
         self.assertEqual(words[1]["start"], 0.2)
 
+    def test_mixed_latin_cjk_keeps_spacing_sane(self):
+        # 上游 2.0.1 同类问题：中英混排只在英文词之间留空格，不再逐字空格
+        items = [("我们", 0, 0.3), ("play", 0.4, 0.6), ("golf", 0.6, 0.9), ("吧", 0.9, 1.0)]
+        out = _ts_chatllm_to_subtitle_lines(items, "我们play golf吧", 0.0, None)
+        self.assertEqual(out[0][2], "我们play golf吧")
+
+    def test_korean_words_keep_spaces(self):
+        # 上游 2.1.0 韩文修正：韩文以空格分词，不能被当成中文逐字拼接
+        items = [("안녕", 0, 1.0), ("하세요", 1.0, 2.0)]
+        out = _ts_chatllm_to_subtitle_lines(items, "안녕 하세요", 0.0, None)
+        self.assertEqual(out[0][2], "안녕 하세요")
+
+    def test_long_silence_breaks_even_short_line(self):
+        # 上游 #31：3 秒静音不能被并进同一行（旧实现要行内已 ≥5 字才断）
+        out = _ts_chatllm_to_subtitle_lines(
+            [("嗯", 0, 0.2), ("好", 3.2, 3.4)], "嗯好", 0.0, None)
+        self.assertEqual([t for _s, _e, t, _ in out], ["嗯", "好"])
+
+    def test_japanese_long_line_breaks_after_particle(self):
+        # 上游 2.1.0：无标点日文长句在助词后换行，不在词中间硬切
+        text = "これはとてもながいぶんしょうでそしてつづきます"
+        items = [(ch, i * 0.15, i * 0.15 + 0.12) for i, ch in enumerate(text)]
+        out = _ts_chatllm_to_subtitle_lines(items, text, 0.0, None)
+        self.assertGreater(len(out), 1)
+        self.assertTrue(out[0][2].endswith("で"), [t for _s, _e, t, _ in out])
+        for _s, _e, txt, _ in out:
+            self.assertLessEqual(len(txt.replace(" ", "")), MAX_CHARS)
+
     def test_latin_words_join_with_space(self):
         # whisper 契约（break_on_space=True）：空白＝语句边界 → 逐词切行
         items = [("Hello", 0.0, 0.3), ("world", 0.3, 0.6)]

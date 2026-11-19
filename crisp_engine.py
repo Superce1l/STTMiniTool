@@ -128,9 +128,10 @@ SUPPORTED_LANGUAGES = [
     "Arabic", "Thai", "Vietnamese", "Indonesian", "Malay",
 ]
 
-# 以空白分词、且分行器能以空格拼回词界（拉丁字母）的语言：whisper 挂 -sow
-# 按词切段才安全（见 _build_cmd）。中文／粤语／日文／泰文不以空白分词，不在此列。
-_SPACE_DELIMITED = frozenset({"en", "fr", "de", "es", "pt", "id", "ms", "vi"})
+# 以空白分词、且分行器能以空格拼回词界的语言：whisper 挂 -sow 按词切段
+# 才安全（见 _build_cmd）。韩国语同样以空格分词（上游 2.1.0 修正），故纳入；
+# 中文／粤语／日文／泰文不以空白分词，不在此列。
+_SPACE_DELIMITED = frozenset({"en", "fr", "de", "es", "pt", "id", "ms", "vi", "ko"})
 
 
 def _default_threads() -> int:

@@ -34,6 +34,52 @@ PAUSE_MIN_ZH    = 5      # 停顿前行至少已累积的中文字数（防把�
 PAUSE_MIN_WORDS = 3      # 含拉丁词的行最少词数
 MIN_SPLIT_GAP   = 0.15   # 超限回退切行时，词间空隙的最小可信值（秒）；
                          # 须明显大于连续语流的字间隙（≲0.1s）、小于句间停顿（≥0.3s）
+SILENCE_BREAK_SEC = 2.0  # 长静音：词间空隙 ≥ 此值一律断行（不再要求行已有长度）
+
+# 日文助词（平假名）——无标点长句在助词后换行（对齐上游 2.1.0 的做法）。
+# 中文/韩文不会出现平假名，故只在含假名的行启用，不会误伤中文断句。
+_JA_PARTICLES = frozenset("はがをにでとものへやねよかなさぞぜわも")
+
+
+def _is_hangul(ch: str) -> bool:
+    """韩文（Hangul 音节 / 字母）。"""
+    o = ord(ch)
+    return (0xAC00 <= o <= 0xD7A3) or (0x1100 <= o <= 0x11FF) or (0x3130 <= o <= 0x318F)
+
+
+def _has_hangul(t: str) -> bool:
+    return any(_is_hangul(c) for c in (t or ""))
+
+
+def _has_kana(t: str) -> bool:
+    """含平假名/片假名 → 视为日文行。"""
+    return any(0x3041 <= ord(c) <= 0x30FF for c in (t or ""))
+
+
+def _is_space_word(w: str) -> bool:
+    """以空格分词的书写系统（拉丁字母 / 韩文）：词间要空格、按「词」计数。
+
+    中文/日文逐字书写不加空格；韩文与英文一样必须保留词间空格
+    （否则 안녕 하세요 → 안녕하세요，对齐上游 2.1.0 的韩文修正）。
+    """
+    return any(c.isascii() and c.isalpha() for c in w) or _has_hangul(w)
+
+
+def _join_words(words: list[str]) -> str:
+    """按书写系统拼词：只在两个「空格分词」词之间插一个空格。
+
+    修上游 2.0.1 的「中英夹杂逐字空白」：旧实现只要行内有任一拉丁词就整行
+    " ".join，产出「我们 play golf 吧」；现在只在相邻两个英文/韩文词之间留
+    空格 → 「我们play golf吧」。
+    """
+    out: list[str] = []
+    prev: str | None = None
+    for w in words:
+        if prev is not None and _is_space_word(prev) and _is_space_word(w):
+            out.append(" ")
+        out.append(w)
+        prev = w
+    return "".join(out)
 
 
 def _strip_pua(s: str) -> str:
@@ -195,7 +241,8 @@ def lines_to_txt(lines: list[tuple[float, float, str, str | None]]) -> str:
         )
 
     def _latin(ch: str) -> bool:
-        return bool(ch) and ch.isascii() and ch.isalpha()
+        # 相邻行首尾需要空格的文字：拉丁字母 / 韩文（以空格分词）
+        return bool(ch) and ((ch.isascii() and ch.isalpha()) or _is_hangul(ch))
 
     texts = [t for (_s, _e, t, _spk) in lines]
     if not texts:
@@ -264,13 +311,15 @@ def _merge_orphan_lines(
         return lines
 
     def _has_latin(t: str) -> bool:
-        return any(c.isascii() and c.isalpha() for c in t)
+        # 名字沿用旧称：实际是「空格分词文字」（拉丁字母 / 韩文）
+        return (any(c.isascii() and c.isalpha() for c in t)
+                or _has_hangul(t))
 
     def _vlen(t: str) -> int:
         return len(t.replace(" ", ""))
 
     def _is_orphan(t: str) -> bool:
-        # 纯中文且可见字数极少才视为孤儿；含拉丁词（英文/数字词）不并
+        # 纯中文且可见字数极少才视为孤儿；含拉丁词/韩文（以空格分词）不并
         return (not _has_latin(t)) and 0 < _vlen(t) <= min_chars
 
     def _join(a: str, b: str) -> str:
@@ -313,7 +362,9 @@ def _merge_orphan_lines_rich(
         return lines
 
     def _has_latin(t: str) -> bool:
-        return any(c.isascii() and c.isalpha() for c in t)
+        # 名字沿用旧称：实际是「空格分词文字」（拉丁字母 / 韩文）
+        return (any(c.isascii() and c.isalpha() for c in t)
+                or _has_hangul(t))
 
     def _vlen(t: str) -> int:
         return len(t.replace(" ", ""))
@@ -395,8 +446,6 @@ def _ts_chatllm_to_subtitle_lines(
     seg_words: list[str] = []   # 当前行的原始 word
     ri = 0                      # raw_text 扫描位置
 
-    def _is_latin_word(w: str) -> bool:
-        return any(c.isascii() and c.isalpha() for c in w)
 
     def _emit():
         nonlocal seg_idx, seg_words
@@ -405,11 +454,7 @@ def _ts_chatllm_to_subtitle_lines(
             return
         start = chunk_offset + ts_items[seg_idx[0]][1]
         end   = chunk_offset + ts_items[seg_idx[-1]][2]
-        if any(_is_latin_word(w) for w in seg_words):
-            text = " ".join(seg_words)
-        else:
-            text = "".join(seg_words)
-        text = _conv(text)
+        text = _conv(_join_words(seg_words))
         # 字级清单：每个 ts_item → 一个高亮单位（中文＝单字、拉丁＝整词）
         words = [
             {"start": chunk_offset + ts_items[k][1],
@@ -422,15 +467,21 @@ def _ts_chatllm_to_subtitle_lines(
         seg_idx = []; seg_words = []
 
     def _over_limit() -> bool:
-        if any(_is_latin_word(w) for w in seg_words):
+        if any(_is_space_word(w) for w in seg_words):
             return len(seg_words) > MAX_WORDS
         return sum(len(w) for w in seg_words) > MAX_ZH_CHARS
 
     def _pause_break(gap: float) -> bool:
-        """行已具一定长度 + 字间空隙够长 → 停顿处主动切行。"""
+        """行已具一定长度 + 字间空隙够长 → 停顿处主动切行。
+
+        长静音（≥SILENCE_BREAK_SEC，默认 2s）例外：**不论行多短都断开**——
+        否则「嗯」+3 秒静音+「好」会被并成一行横跨静音（上游 #31 同类问题）。
+        """
         if gap < PAUSE_BREAK_SEC or not seg_idx:
             return False
-        if any(_is_latin_word(w) for w in seg_words):
+        if gap >= SILENCE_BREAK_SEC:
+            return True
+        if any(_is_space_word(w) for w in seg_words):
             return len(seg_words) >= PAUSE_MIN_WORDS
         return sum(len(w) for w in seg_words) >= PAUSE_MIN_ZH
 
@@ -445,6 +496,13 @@ def _ts_chatllm_to_subtitle_lines(
             gap = float(ts_items[seg_idx[k]][1]) - float(ts_items[seg_idx[k - 1]][2])
             if gap >= best_gap:            # ≥，取最靠后的最大停顿
                 best_k, best_gap = k, gap
+        if best_k <= 0 and any(_has_kana(w) for w in seg_words):
+            # 日文无标点长句：无停顿时退到「助词后」换行（近行尾 1/3 内优先），
+            # 避免在词中间硬切（对齐上游 2.1.0）。
+            for k in range(len(seg_idx) - 1, max(0, len(seg_idx) // 2), -1):
+                if seg_words[k - 1] in _JA_PARTICLES:
+                    best_k = k
+                    break
         if best_k > 0:
             tail_idx, tail_words = seg_idx[best_k:], seg_words[best_k:]
             seg_idx, seg_words = seg_idx[:best_k], seg_words[:best_k]

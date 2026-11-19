@@ -194,7 +194,13 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 ## 版本历史
 
-- **v2.4.0（当前）**：发行整理（issue #7）——
+- **v2.4.1（当前）**：断行与等待提示（对齐上游 2.0.1 / 2.1.0 的同类修正）——
+  - ✍️ **中英混排**：不再逐字加空格，「我们 play golf 吧」→「我们play golf吧」；
+  - 🇰🇷 **韩文**：保留词间空格（拼行/按词计数/孤儿行/纯文字行间拼接），Whisper 挂 `-sow` 按词切段；
+  - ⏸️ **长静音**：≥2 秒的字间停顿一律断行，字幕不再横跨静音；
+  - 🇯🇵 **日文长句**：无标点时在助词后换行（仅含假名的行），不再词中硬切；
+  - ⏱️ **等待计时**：运行中任务与模型加载显示「已等待 N 秒/分」。
+- **v2.4.0**：发行整理（issue #7）——
   - 📁 **对齐器归位**：qwen3 ForcedAligner GGUF（q5 约 643 MB）改存**模型目录**（默认 `ov_models/`），
     与 Whisper／Qwen3-ASR 等模型同层，不再写进 `crispasr/` 核心目录（换加速版本／升版会清该目录的
     exe/dll，「卸载重装保留配置」也容易把这个大档误删）。旧位置已下载的档仍**照用不重下**；
@@ -409,7 +415,7 @@ slicing.py              # 长音频切片纯函数层（切片计划/合并去�
 model_catalog.py        # 模型目录元数据（引擎→模型→settings patch；CLI --profile 同源）
 transcription_service.py# 转录编排 mixin（WebBackend 继承：单片/切片/ffmpeg 就绪）
 transcription_queue.py  # 转录队列（单 worker FIFO；暂停/恢复、进度、结果；事件经 SSE 推送）
-tests/                  # 单元测试 185 例（unittest；python -m unittest discover -s tests）
+tests/                  # 单元测试 189 例（unittest；python -m unittest discover -s tests）
 fa_aligner.py           # ForcedAligner 字级时间轴（OpenVINO 卡拉OK逐字用，调 chatllm main.exe）
 diarize.py              # 说话者分离引擎（外部 ONNX，不依赖 torch）
 audio_io.py             # 音频读取（16k mono，零 librosa/numba）
@@ -443,7 +449,7 @@ pip install -r requirements.txt        # 或 requirements-lock.txt（精确锁�
 python app_webview.py          # 启动 WebView 界面
 ```
 
-运行测试（185 例，无需模型即可跑绝大部分）：
+运行测试（189 例，无需模型即可跑绝大部分）：
 
 ```bash
 python -m unittest discover -s tests

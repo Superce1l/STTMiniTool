@@ -41,6 +41,7 @@
     "queue.audioTooBig": ["音轨过大（>300MB），仅显示字幕与时间轴", "Audio too large (>300 MB) — subtitles only"],
     "queue.audioMissing": ["音轨不可用", "Audio unavailable"],
     "queue.dragHint": ["拖动可调整排队顺序", "Drag to reorder queued tasks"],
+    "queue.waited": ["已等待 {t}", "waited {t}"],
     "queue.dismiss": ["移除", "Remove"],
     "queue.resume": ["继续", "Resume"],
     "queue.clearDone": ["清空已完成", "Clear finished"],

@@ -358,6 +358,35 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
     syncRunButton();
   }
 
+  // ── 已等待时间（长档「看起来像卡住」的提示，对齐上游 2.1.0）─────────
+  let _modelLoadAt = 0, _modelBaseStatus = "";
+  function fmtWait(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
+  }
+  function tickWait() {
+    const j = queueJobs.find(x => x.state === "running");
+    if (j && !j.cancelling) {
+      if (!j._startedAt) j._startedAt = Date.now();
+      const row = document.querySelector('.queue-item[data-id="' + j.id + '"]');
+      const note = row && row.querySelector(".q-note");
+      if (note) {
+        const base = j.status || T("queue.stRunning", "识别中");
+        note.textContent = base + " · " +
+          T("queue.waited", "已等待 {t}", { t: fmtWait(Date.now() - j._startedAt) });
+      }
+    }
+    if (state.modelLoading) {
+      if (!_modelLoadAt) _modelLoadAt = Date.now();
+      const el = $("#model-prog-status");
+      if (el) el.textContent = (_modelBaseStatus || "") + " · " +
+        T("queue.waited", "已等待 {t}", { t: fmtWait(Date.now() - _modelLoadAt) });
+    } else if (_modelLoadAt) {
+      _modelLoadAt = 0;
+      _modelBaseStatus = "";
+    }
+  }
+
   // ── 队列拖动排序（仅排队中）──────────────────────────────────────
   let _dragQueueId = null;
   function wireQueueDrag(row, job) {
@@ -443,6 +472,10 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
     if (ev.kind === "paused") queuePaused = true;
     else if (ev.kind === "queued" || ev.kind === "started") queuePaused = false;
     upsertJob(ev);
+    if (ev.kind === "started" && ev.id) {
+      const cur = queueJobs.find(x => x.id === ev.id);
+      if (cur) cur._startedAt = Date.now();
+    }
     if (ev.kind === "finished") {
       renderHistory();
       // 结果区为空才自动展示；否则只在行上标「查看」，不抢用户正在看/编辑的结果
@@ -2423,7 +2456,11 @@ export function boot() {
   // 「上传中…」行表示，避免与队列行重复。
   API.on("progress", ({ pct, status, jobId }) => {
     if (pct < 0) { connHint(status); return; }   // SSE 断线/恢复提示（桥接层自动重连）
-    if (state.modelLoading) { setModelProg(pct, status); return; }
+    if (state.modelLoading) {
+      if (status) _modelBaseStatus = status;
+      setModelProg(pct, status);
+      return;
+    }
     if (!jobId) return;
     const j = queueJobs.find(x => x.id === jobId);
     if (j && !j.cancelling) { j.pct = pct; j.status = status || ""; }
@@ -2431,6 +2468,7 @@ export function boot() {
   });
   // 队列：启动先对账一次（刷新回来可能处于暂停态），再订阅增量事件
   refreshQueue();
+  setInterval(tickWait, 1000);   // 运行中任务/模型加载的「已等待」计时
   API.on("queue", onQueueEvent);
   $("#queue-resume") && $("#queue-resume").addEventListener("click", async () => {
     try {
