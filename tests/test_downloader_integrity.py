@@ -204,5 +204,48 @@ class TestDownloadFileHttp(unittest.TestCase):
         self.assertEqual(self.dest.read_bytes(), payload)
 
 
+class TestAlignerLocation(unittest.TestCase):
+    """ForcedAligner GGUF 的存放位置（issue #7）。
+
+    契约：下载／检查一律指向**模型目录**；旧版遗留的 crispasr/ 位置仍能找到
+    （升级不重下 643MB），且模型目录里的档优先。
+    """
+
+    def test_find_prefers_model_dir_then_legacy(self):
+        with tempfile.TemporaryDirectory() as td:
+            model, legacy = Path(td) / "ov_models", Path(td) / "crispasr"
+            model.mkdir()
+            legacy.mkdir()
+            name = D.aligner_gguf_filename("q5")
+            (legacy / name).write_bytes(b"x" * 1024)
+            self.assertEqual(D.find_aligner_gguf(model, "q5", legacy), legacy / name)
+            (model / name).write_bytes(b"y" * 1024)
+            self.assertEqual(D.find_aligner_gguf(model, "q5", legacy), model / name)
+
+    def test_absent_returns_none_and_lists_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(D.find_aligner_gguf(Path(td), "q5"))
+            self.assertFalse(D.quick_check_aligner_gguf(Path(td), "q5"))
+            self.assertEqual(D.missing_files_aligner_gguf(Path(td), "q5"),
+                             [D.aligner_gguf_filename("q5")])
+
+    def test_download_targets_model_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td) / "models"
+            calls = []
+
+            def fake_dl(url, dest, progress_cb=None, pin_scope=None):
+                calls.append((url, Path(dest)))
+                Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                Path(dest).write_bytes(b"gguf" * 512)
+
+            with mock.patch.object(D, "_download_file", side_effect=fake_dl):
+                D.download_aligner_gguf(model, "q5")
+            want = model / D.aligner_gguf_filename("q5")
+            self.assertEqual(calls[0][1], want)
+            self.assertTrue(D.quick_check_aligner_gguf(model, "q5"))
+            self.assertEqual(D.missing_files_aligner_gguf(model, "q5"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

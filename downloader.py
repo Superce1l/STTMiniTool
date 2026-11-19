@@ -1154,6 +1154,12 @@ def _download_ffmpeg_locked(dest_dir: Path, progress_cb=None):
 # ── qwen3 ForcedAligner GGUF（CrispASR -am 对齐器，Whisper 核心专用 FA）──
 # crispasr.exe -am <gguf> -falign：用 CTC 对齐器的字级时间轴覆盖 whisper 自带
 # 的（较粗）时间戳。同作者(cstr)上传，与 crispasr 的 -am 界面兼容。
+#
+# 存放位置：**模型目录**（model_dir，默认 ov_models/），与 Qwen／Whisper 等模型
+# 同层。旧版放在 crispasr/ 核心目录里——换加速版本／升版时该目录的 exe/dll 会
+# 先被清掉（见 _download_crispasr_core_locked），用户「卸载重装保留配置」时也
+# 容易把这个 643 MB 的档一起删掉（issue #7）。迁移后：核心目录只放核心，
+# 用户模型一律在模型目录。旧位置既有的档仍照用（find_aligner_gguf 兼容）。
 _ALIGNER_GGUF_REPO  = "cstr/qwen3-forced-aligner-0.6b-GGUF"
 _ALIGNER_GGUF_BASE  = f"https://huggingface.co/{_ALIGNER_GGUF_REPO}/resolve/main"
 _ALIGNER_GGUF_FILES = {
@@ -1170,21 +1176,46 @@ def aligner_gguf_filename(quant: str = _ALIGNER_GGUF_DEFAULT) -> str:
     return _ALIGNER_GGUF_FILES.get(quant, _ALIGNER_GGUF_FILES[_ALIGNER_GGUF_DEFAULT])
 
 
-def quick_check_aligner_gguf(crispasr_dir: Path,
+def quick_check_aligner_gguf(model_dir: Path,
                              quant: str = _ALIGNER_GGUF_DEFAULT) -> bool:
-    """指定量化的 ForcedAligner GGUF 是否存在（排除 LFS pointer）。"""
-    return _file_is_real(crispasr_dir / aligner_gguf_filename(quant))
+    """指定量化的 ForcedAligner GGUF 是否存在于模型目录（排除 LFS pointer）。"""
+    return _file_is_real(Path(model_dir) / aligner_gguf_filename(quant))
 
 
-def download_aligner_gguf(crispasr_dir: Path,
+def find_aligner_gguf(model_dir: Path, quant: str = _ALIGNER_GGUF_DEFAULT,
+                      *legacy_dirs: Path) -> Path | None:
+    """定位 ForcedAligner GGUF：模型目录优先，其后依次查旧位置。
+
+    返回实际路径（找不到回 None）。旧版把 gguf 下载到 crispasr/ 核心目录内，
+    已在旧位置的档照样沿用，避免升级后重下 643 MB。
+    """
+    fname = aligner_gguf_filename(quant)
+    for d in (model_dir, *legacy_dirs):
+        if not d:
+            continue
+        p = Path(d) / fname
+        if _file_is_real(p):
+            return p
+    return None
+
+
+def missing_files_aligner_gguf(model_dir: Path,
+                               quant: str = _ALIGNER_GGUF_DEFAULT) -> list[str]:
+    """指定量化的 ForcedAligner GGUF 缺了哪些（相对 model_dir）。"""
+    fname = aligner_gguf_filename(quant)
+    return [] if _file_is_real(Path(model_dir) / fname) else [fname]
+
+
+def download_aligner_gguf(model_dir: Path,
                           quant: str = _ALIGNER_GGUF_DEFAULT, progress_cb=None):
-    """下载 qwen3 ForcedAligner GGUF 至 crispasr_dir（与 crispasr.exe 同层）。
+    """下载 qwen3 ForcedAligner GGUF 至模型目录（与其它模型同层）。
 
     progress_cb(pct: float, msg: str)。支持断点续传与 HF 镜像。
     """
-    crispasr_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
     fname = aligner_gguf_filename(quant)
-    dest  = crispasr_dir / fname
+    dest  = model_dir / fname
     if _file_is_real(dest):
         if progress_cb:
             progress_cb(1.0, f"{fname} 已存在")

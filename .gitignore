@@ -123,6 +123,10 @@ UI.txt
 release_pkg/
 *.zip
 
+# 转录队列的输入暂存与结果归档（运行时产生；见 webview_backend 队列段）
+queue-spool/
+queue-archive/
+
 # 运行时按需下载的 7zr.exe（预留）；运行日志（applog.py 写入 app-年月.log）
 /tools/
 /logs/

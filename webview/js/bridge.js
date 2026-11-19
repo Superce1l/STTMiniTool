@@ -155,6 +155,76 @@
       if (MODE === "web") { try { await apiPost("/api/cancel", {}); } catch {} return true; }
       MOCK.cancelled = true; return true;
     },
+
+    // ── 批量队列：上传即入队（后端串行执行，空闲自动开跑）──────────────
+    //   {ok, jobId, queue}；进度与终态经 SSE event=queue 推送，不在这里等。
+    async enqueue(opts) {
+      if (MODE === "web") return webEnqueue(opts);
+      return mockEnqueue(opts);
+    },
+    async queueStatus() {
+      if (MODE === "web") { try { return await apiGet("/api/queue"); } catch {} }
+      return mockQueueStatus();
+    },
+    async queueResult(id) {
+      if (MODE === "web")
+        return apiGet("/api/queue-result?id=" + encodeURIComponent(id));
+      const r = _mockResults[id];
+      if (!r) throw new Error(tr("queue.resultGone", "结果已过期"));
+      return r;
+    },
+    // 任务输入音轨（后端归档保留）→ Blob；用于刷新/重启后仍能回放
+    async queueAudio(id) {
+      if (MODE !== "web") throw new Error(tr("queue.audioMissing", "音轨不可用"));
+      const r = await apiFetch("/api/queue-audio?id=" + encodeURIComponent(id),
+                               { headers: authHeaders() }, 0);   // 大文件不设超时
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return await r.blob();
+    },
+    async queueRetry(id) {
+      if (MODE === "web") {
+        try { return await apiPost("/api/queue-retry", { id }); }
+        catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+      }
+      return { ok: false, error: "mock 模式下不支持重试" };
+    },
+    async queueReorder(id, before) {
+      if (MODE === "web") {
+        try { return await apiPost("/api/queue-reorder", { id, before: before || "" }); }
+        catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+      }
+      const i = _mockJobs.findIndex(j => j.id === id);
+      const k = before ? _mockJobs.findIndex(j => j.id === before) : -1;
+      if (i >= 0) {
+        const [job] = _mockJobs.splice(i, 1);
+        k >= 0 ? _mockJobs.splice(k, 0, job) : _mockJobs.push(job);
+      }
+      return { ok: true, queue: mockQueueStatus() };
+    },
+    async queueCancel(id) {
+      if (MODE === "web") {
+        try { return await apiPost("/api/queue-cancel", { id }); }
+        catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
+      }
+      const j = _mockJobs.find(x => x.id === id);
+      if (j && j.state !== "finished") { j.state = "cancelled"; emit("queue", Object.assign({ kind: "cancelled" }, j)); }
+      return { ok: !!j };
+    },
+    async queuePause() {
+      if (MODE === "web") { try { return await apiPost("/api/queue-pause", {}); } catch {} }
+      return { ok: true, queue: mockQueueStatus() };
+    },
+    async queueResume() {
+      if (MODE === "web") { try { return await apiPost("/api/queue-resume", {}); } catch {} }
+      return { ok: true, resumed: 0, queue: mockQueueStatus() };
+    },
+    async queueClearFinished() {
+      if (MODE === "web") { try { return await apiPost("/api/queue-clear", {}); } catch {} }
+      for (let i = _mockJobs.length - 1; i >= 0; i--) {
+        if (!["queued", "running", "paused"].includes(_mockJobs[i].state)) _mockJobs.splice(i, 1);
+      }
+      return { ok: true, queue: mockQueueStatus() };
+    },
     // 录音开始/结束 → 同步给后端（关窗确认依据之一）；失败不影响录音
     async recordState(on) {
       if (MODE === "web") { try { await apiPost("/api/record-state", { on: !!on }); } catch {} }
@@ -259,6 +329,30 @@
       Object.assign(MOCK.settings, patch); return MOCK.settings;
     },
   };
+
+  // ── web 入队：POST /api/enqueue（multipart 上传 → job spool）──────
+  //   与 webTranscribe 的区别：请求只等「上传 + 入队」，不等转录完成，
+  //   因此不再有「长请求被前端超时/断连打断」的问题；结果经 SSE 回推。
+  async function webEnqueue(opts) {
+    if (!opts.file) throw new Error(tr("file.pickFirst", "请先选择文件"));
+    const fd = new FormData();
+    fd.append("file", opts.file, opts.file.name);
+    if (opts.language) fd.append("language", opts.language);
+    fd.append("align", opts.align ? "1" : "0");
+    fd.append("diarize", opts.diarize ? "1" : "0");
+    if (opts.nSpeakers && opts.nSpeakers !== "auto") fd.append("n_speakers", String(opts.nSpeakers));
+    if (opts.hint) fd.append("hint", opts.hint);
+    emit("progress", { pct: 2, status: tr("file.uploading", "上传中…") });
+    // 大文件上传本身可能几分钟（几百 MB ~ 数 GB），沿用长超时；入队即返回。
+    const r = await apiFetch("/api/enqueue",
+      { method: "POST", body: fd, headers: authHeaders() }, TRANSCRIBE_TIMEOUT_MS);
+    if (!r.ok) {
+      let msg = "HTTP " + r.status;
+      try { msg = (await r.json()).error?.message || msg; } catch {}
+      throw new Error(msg);
+    }
+    return r.json();   // {ok, jobId, queue}
+  }
 
   // ── web 转录：POST /api/transcribe（进度走 SSE）──────────
   async function webTranscribe(opts) {
@@ -408,6 +502,42 @@
     return { segments: MOCK.segments, srtPath: "subtitles/B.srt" };
   }
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ── mock 队列：让「展示模式」也能看到排队→运行→完成的全流程 ──────────
+  const _mockJobs = [];
+  const _mockResults = {};
+  let _mockSeq = 0;
+  const _MOCK_ACTIVE = new Set(["queued", "running", "paused"]);
+
+  function mockQueueStatus() {
+    const cur = _mockJobs.find(j => j.state === "running");
+    return { jobs: _mockJobs.map(j => Object.assign({}, j)),
+             current: cur ? cur.id : null, paused: false };
+  }
+
+  async function mockEnqueue(opts) {
+    const id = "mock" + (++_mockSeq);
+    const name = (opts.file && opts.file.name) || ("样本" + _mockSeq + ".wav");
+    const job = { id, label: name, state: "queued", error: null, pct: 0, status: "",
+                  meta: { name, size: (opts.file && opts.file.size) || 0 }, hasResult: false };
+    _mockJobs.push(job);
+    emit("queue", Object.assign({ kind: "queued" }, job));
+    (async () => {
+      await sleep(500);
+      job.state = "running";
+      emit("queue", Object.assign({ kind: "started" }, job));
+      try {
+        const res = await mockTranscribe(opts);
+        _mockResults[id] = res;
+        Object.assign(job, { state: "finished", pct: 100, hasResult: true });
+        emit("queue", Object.assign({ kind: "finished" }, job));
+      } catch (e) {
+        Object.assign(job, { state: "failed", error: String(e && e.message || e) });
+        emit("queue", Object.assign({ kind: "failed" }, job));
+      }
+    })();
+    return { ok: true, jobId: id, queue: mockQueueStatus() };
+  }
 
   window.QwenAPI = api;
 })();

@@ -54,10 +54,10 @@
 - 💾 **多种导出格式**：SRT 字幕／ASS 卡拉OK（字级 `\k` 逐字拍点）／LRC 歌词／VTT／纯文本
 - ⏹️ **转录取消**：转换进行中一键取消（立即终止子进程 / 段间生效），不必等跑完；**界面断开／关窗即自动停止**，不会空烧 GPU
 - 🛡️ **双开保护**：第二个实例会提示「打开已有窗口／仍要并行／退出」；并行时输出与日志自动隔离，不会互相覆盖
-- 🧵 **批量队列**：多个转录任务排队串行执行（`/api/queue`，排队/开始/完成事件经 SSE 实时推送）
+- 🧵 **批量队列**：拖入多个文件即入队、串行执行（空闲自动跑、运行中只排队）；音频页实时显示状态/进度，可取消、查看、清空已完成——**不会顶掉当前正在看的结果**
 - ⚡ **大字幕流畅编辑**：>400 段自动窗口化渲染 + 事件委托 + 编辑脏区更新；卡拉OK游标式增量渲染，数千段也不卡
 - ⏱️ **实时延迟可见**：录制页按当前引擎提示每段出字延迟预期（大模型约 2-3 秒/段，Whisper Base 约 0.5 秒，CPU 无冷启动）
-- 📦 **开箱即用**：CrispASR 核心与 VAD 随包附带；各模型／ffmpeg 按需自动下载
+- 📦 **按需下载**：VAD 与界面随包附带；CrispASR 核心（首次使用自动取**上游最新版**）、各模型／ffmpeg 首次使用时下载
 
 ---
 
@@ -72,6 +72,22 @@
 3. 点「**▶ 开始转换**」，进度条实时显示，**转换中可点「取消转换」立即中止**；完成后可「**打开输出文件夹**」或「**保存字幕**」
 4. 保存时可选格式：**SRT / ASS 卡拉OK / LRC / VTT / 纯文本**
 5. 下方呈现**真实波形 + 播放头 + 分段标注**，点波形、字幕条或区块都能跳播
+
+**批量队列**（拖入文件即入队，串行执行）：
+
+| 行为 | 说明 |
+|---|---|
+| 拖入 / 多选多个文件 | 直接入队；当前正在看的结果与正在跑的任务**不会被顶掉**（旧版会串台） |
+| 空闲 / 运行中 | 空闲自动开跑；运行中只排队，队列面板显示「运行中 1 · 排队 n」 |
+| 队列面板 | 每行：序号、文件名、状态（排队/识别中/已暂停/已完成/失败/已取消）、进度条；可**取消**、**查看**结果、**移除**已结束项。音频页只保留队列行的进度条（原先另有一条全局进度条，重复已移除） |
+| 取消反馈 | 点「取消」立刻转为「正在取消…」（按钮置灰），实际停下通常 1–3 秒——先给反馈再等引擎收尾 |
+| 结果展示 | 新任务完成时若结果区为空则自动展示；否则只标「查看」，不打断你正在校对的结果 |
+| 刷新 / 断连 | 自动**暂停**（运行中转「已暂停」、排队保留），回到页面点「**继续**」接着跑 |
+| 关窗 / 重启 | **保留**：未完成任务开机后自动恢复为「排队中（已暂停）」；已完成任务连输入音轨一起归档，重启后仍能「查看」与回放 |
+| 失败 / 取消 | 行上「**重试**」直接用归档里的输入文件重排一次（不必重新拖入）；归档保留最近 10 条 / 7 天 |
+| 调整顺序 | 直接**拖动**「排队中」的行（仅排队态可拖，运行中/已暂停不可） |
+
+> 队列任务的**输入文件会随任务归档**（`queue-archive/`），所以刷新、关窗、重启后再点「查看」仍能播放原音轨；只有单文件超过 300 MB 时只显示字幕与时间轴（避免整档读进内存）。
 
 结果区工具条提供完整校对能力（图中为结果页面）：
 
@@ -141,14 +157,15 @@
 ### CRISPASR（GPU）— 主力核心
 
 以 [CrispASR](https://github.com/CrispStrobe/CrispASR)（whisper.cpp 家族的多后端 runtime，ggml C++）
-加速推理。
+加速推理。核心（`crispasr.exe` + dll）**不随包附带**：首次使用 GPU 核心时自动下载上游最新 release
+（Vulkan／CUDA／CPU 由「推理加速版本」决定），版本始终跟得上上游。
 
 | 模型 | 用途 |
 |------|------|
 | **Qwen3-ASR-1.7B Q4 / Q8** | 通用高识别率，中文断句佳 |
 | **Qwen3-ASR-1.7B 日语动漫 Q4 / Q8** | 日语／动漫特化，日文歌词・台词识别明显较佳 |
 | **OpenAI Whisper Base / Small / Medium / Large / Large-Turbo** | 官方 Whisper（ggerganov/whisper.cpp GGML），99 语言通用；Turbo 为 Large 级精度、约 8 倍速 |
-| **qwen3 ForcedAligner GGUF** | 字级时间轴对齐（卡拉OK逐字、精准字幕）|
+| **qwen3 ForcedAligner GGUF** | 字级时间轴对齐（卡拉OK逐字、精准字幕）；存于**模型目录** `ov_models/`，与其它模型同层 |
 
 ### Qwen · OpenVINO（纯 CPU）
 
@@ -177,7 +194,21 @@ STTMiniTool.exe apply fixed.json --base work.json -o final.srt
 
 ## 版本历史
 
-- **v2.3.1（当前）**：双开稳定 + 长视频不再误报「请求超时」（反馈 #4 / #5 / #6）——
+- **v2.4.0（当前）**：发行整理（issue #7）——
+  - 📁 **对齐器归位**：qwen3 ForcedAligner GGUF（q5 约 643 MB）改存**模型目录**（默认 `ov_models/`），
+    与 Whisper／Qwen3-ASR 等模型同层，不再写进 `crispasr/` 核心目录（换加速版本／升版会清该目录的
+    exe/dll，「卸载重装保留配置」也容易把这个大档误删）。旧位置已下载的档仍**照用不重下**；
+  - 🧲 **核心不同捆**：CrispASR 核心（crispasr.exe + dll）不再随包附带，首次使用（选 GPU 核心并
+    加载模型）时自动下载**上游最新 release** 的对应加速版本——同捆 0.8.53、上游已 0.8.54 一联网就
+    判「版本不符 → 重新下载」的问题不再存在；
+  - 📦 **双格式发行**：一次构建同时产出 **onedir**（EXE + `_internal/`，零解压、启动快、不留临时
+    垃圾）与 **onefile**（单一 EXE，每次启动解压到 `%TEMP%`）两个 zip，用户按需自选；
+  - 🧵 **转录队列 + 展示不再被顶替**：转录改走任务队列——拖入文件只入队，不再替换/清除当前展示的
+    结果（旧实现结果渲染回头读全局选中文件，运行中换文件会把 A 的字幕配上 B 的音轨）；音频页新增队列
+    面板（状态/进度/取消/查看/清空已完成）；空闲自动跑、运行中只排队；刷新/断连自动暂停（点「继续」
+    接着跑）；任务输入随归档保留，关窗/重启后已完成任务仍可查看与回放、未完成任务恢复排队，失败可一键重试、
+    排队顺序可拖动调整；顺带修掉「拖到页面空白处 → WebView 导航到该视频、前端被替换」。
+- **v2.3.1**：双开稳定 + 长视频不再误报「请求超时」（反馈 #4 / #5 / #6）——
   - ⏱️ **超时**：转录不再硬限 30 分钟。53 分钟素材单跑约 25 分钟，两个实例并行时被 GPU 争用拖过
     30 分钟线 → 前端 abort、后端仍在跑、界面报「请求超时」且拿不到产物。改为 SSE 进度 +
     取消按钮做控制面，只留 6 小时兜底；
@@ -377,8 +408,8 @@ settings_store.py       # settings.json 单点读写（锁 + 原子替换 + mtim
 slicing.py              # 长音频切片纯函数层（切片计划/合并去重/SRT 解析/跨片说话者匹配/指派）
 model_catalog.py        # 模型目录元数据（引擎→模型→settings patch；CLI --profile 同源）
 transcription_service.py# 转录编排 mixin（WebBackend 继承：单片/切片/ffmpeg 就绪）
-transcription_queue.py  # 批量转录任务队列（单 worker FIFO；事件经 SSE 推送）
-tests/                  # 单元测试 165 例（unittest；python -m unittest discover -s tests）
+transcription_queue.py  # 转录队列（单 worker FIFO；暂停/恢复、进度、结果；事件经 SSE 推送）
+tests/                  # 单元测试 185 例（unittest；python -m unittest discover -s tests）
 fa_aligner.py           # ForcedAligner 字级时间轴（OpenVINO 卡拉OK逐字用，调 chatllm main.exe）
 diarize.py              # 说话者分离引擎（外部 ONNX，不依赖 torch）
 audio_io.py             # 音频读取（16k mono，零 librosa/numba）
@@ -388,7 +419,7 @@ ffmpeg_utils.py         # ffmpeg 检测与音轨提取
 cli_mode.py             # 无头 CLI（transcribe / apply / status / profiles）
 proc_guard.py           # Windows Job Object：主进程退出连带终止子进程
 version.py              # 版本单一事实来源
-build_webview.bat       # PyInstaller onedir 打包（WebView EXE + 发行 zip）
+build_webview.bat       # PyInstaller 双格式打包（onedir + onefile，各自出发行 zip；不同捆 CrispASR）
 motw_unblock.py         # 启动自清 Mark-of-the-Web（onedir 发行版必需）
 assets/make_icon.py     # 图标生成（SVG → PNG/ICO，语音转文字图标）
 pyproject.toml          # ruff / mypy 工具链配置（CI 分级门禁）
@@ -412,7 +443,7 @@ pip install -r requirements.txt        # 或 requirements-lock.txt（精确锁�
 python app_webview.py          # 启动 WebView 界面
 ```
 
-运行测试（151 例，无需模型即可跑绝大部分）：
+运行测试（185 例，无需模型即可跑绝大部分）：
 
 ```bash
 python -m unittest discover -s tests
@@ -421,13 +452,24 @@ python -m unittest discover -s tests
 ### 打包 EXE
 
 ```bash
-build_webview.bat              # 产出 dist2\STTMiniTool\（EXE + _internal\）
-                               # 与发行包 dist2\STTMiniTool-v版本-windows.zip
+build_webview.bat              # 一次产出两种包：
+                               #   dist2\STTMiniTool\STTMiniTool.exe + _internal\   (onedir)
+                               #   dist2\onefile\STTMiniTool.exe                    (onefile)
+                               # 与两个发行 zip：
+                               #   dist2\STTMiniTool-v版本-windows.zip          (onedir)
+                               #   dist2\STTMiniTool-v版本-onefile-windows.zip  (onefile)
 ```
+
+| 发行格式 | 内容 | 适合 |
+|----------|------|------|
+| **onedir**（推荐） | `STTMiniTool\` 文件夹：EXE + `_internal\` | 零解压、启动快、不占 C 盘临时目录（默认选它） |
+| **onefile** | 单个 `STTMiniTool.exe` | 想要一个文件带走；每次启动会把运行时解压到 `%TEMP%\_MEIxxxx`，首次启动较慢、需 C 盘余量 |
 
 > ⚠️ 安装路径请使用**全英文**（例如 `C:\STTMiniTool`），含中文字符可能无法正常运行。
 >
-> 📦 发行包为**目录版**（EXE + `_internal\` 同层，不写 C 盘临时目录）。首次运行若 SmartScreen 提示，点「更多信息 → 仍要运行」即可——程序启动时会自动解除锁定（清掉解压带来的 MOTW 标记），之后直接双击运行。
+> 📦 两种包都**不同捆 CrispASR 核心**：首次使用 GPU 核心时自动下载上游最新版到 `crispasr/`（由使用者在模型页选定加速版本，Vulkan／CUDA／CPU）。模型与 ffmpeg 同样按需下载到模型目录。
+>
+> 首次运行若 SmartScreen 提示，点「更多信息 → 仍要运行」即可——程序启动时会自动解除锁定（清掉解压带来的 MOTW 标记），之后直接双击运行。
 
 ---
 
@@ -450,7 +492,7 @@ build_webview.bat              # 产出 dist2\STTMiniTool\（EXE + _internal\）
 | Qwen3-ASR-1.7B GGUF（CrispASR）| [cstr/qwen3-asr-1.7b-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-GGUF) |
 | **Qwen3-ASR-1.7B 日语动漫 GGUF** | [cstr/qwen3-asr-1.7b-ja-anime-GGUF](https://huggingface.co/cstr/qwen3-asr-1.7b-ja-anime-GGUF) |
 | **OpenAI Whisper GGML（官方）** | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp)（base / small / medium / large-v2 / large-v3-turbo）|
-| qwen3 ForcedAligner GGUF | [cstr/qwen3-forced-aligner-0.6b-GGUF](https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF) |
+| qwen3 ForcedAligner GGUF（存**模型目录** `ov_models/`）| [cstr/qwen3-forced-aligner-0.6b-GGUF](https://huggingface.co/cstr/qwen3-forced-aligner-0.6b-GGUF) |
 | 0.6B OpenVINO INT8 | [dseditor](https://huggingface.co/dseditor/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO) ／ [Echo9Zulu](https://huggingface.co/Echo9Zulu/Qwen3-ASR-0.6B-INT8_ASYM-OpenVINO) |
 | 1.7B OpenVINO INT8 KV-Cache | [dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO](https://huggingface.co/dseditor/Qwen3-ASR-1.7B-INT8_OpenVINO) |
 | 原始 PyTorch 模型 | [Qwen/Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) ／ [1.7B](https://huggingface.co/Qwen3-ASR-1.7B) |

@@ -12,9 +12,11 @@ ASREngine。不依赖 pywebview，也不依赖 HTTP —— 可被 webview_server
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -89,6 +91,20 @@ class WebBackend(TranscribeService):
         # 同步语义不变（仍走 transcribe()），队列仅供批量入口使用。
         from transcription_queue import TaskQueue
         self._tx_queue = TaskQueue(on_event=self._queue_event)
+        # 队列任务的输入暂存与结果缓存（详见「批量转录队列」段）：
+        # 上传文件在 HTTP 请求返回后仍须供 worker 读 → queue-spool/<job_id>/；
+        # 完成的结果只留最近 N 份，供前端「查看」。
+        # 用 core.BASE_DIR（冻结时=EXE 旁；本模块的 __file__ 在 onefile 下指向
+        # _MEIPASS 临时目录，暂存放那里会随进程退出消失）
+        self._queue_spool = Path(getattr(core, "BASE_DIR", BASE_DIR)) / "queue-spool"
+        # 已完成/失败/取消的任务连同输入文件归档在这里（重启后仍可「查看」与回放，
+        # 失败任务可一键重试）。保留最近 _QUEUE_ARCHIVE_KEEP 条 / _QUEUE_ARCHIVE_DAYS 天。
+        self._queue_archive = Path(getattr(core, "BASE_DIR", BASE_DIR)) / "queue-archive"
+        self._job_spool: dict[str, Path] = {}
+        self._job_results: dict[str, dict] = {}
+        self._archive: dict[str, dict] = {}
+        self._purge_stale_spool()
+        self._restore_queue()
         self._seed_defaults()            # 首次启动（无 backend）→ 种子默认模型
         self._apply_runtime_prefs()      # 启动即套用持久化偏好（VAD/简繁/镜像/格式）
 
@@ -278,11 +294,12 @@ class WebBackend(TranscribeService):
         from downloader import (quick_check_crispasr, download_crispasr_core,
                                 quick_check_whisper_ggml, download_whisper_ggml,
                                 whisper_ggml_filename,
-                                quick_check_aligner_gguf, download_aligner_gguf,
+                                find_aligner_gguf, download_aligner_gguf,
                                 aligner_gguf_filename, crispasr_gpu_backend,
                                 crispasr_core_issue)
         s = self._settings_raw()
         crispasr_dir = self._crispasr_dir()
+        model_dir = self._model_dir()      # 用户模型一律放模型目录（含 FA 对齐器）
         crisp_model = s.get("crisp_model", "whisper")    # whisper / qwen3 / qwen3-ja
         quant = s.get("crisp_quant", "q5")
         fa_enabled = bool(s.get("crisp_fa", True))
@@ -306,8 +323,6 @@ class WebBackend(TranscribeService):
             # 文件名不同（由 _qwen_casr_dl 分派）。Q4/Q8 两量化，缺文件自动下载（cstr repo）。
             fname_fn, check_fn, download_fn = _qwen_casr_dl(crisp_model)
             qquant = s.get("crisp_qwen_quant", "q8")
-            model_dir = Path(s.get("model_dir", str(getattr(core, "_DEFAULT_MODEL_DIR",
-                                                            BASE_DIR / "ov_models"))))
             model_path = model_dir / fname_fn(qquant)
             if not check_fn(model_dir, qquant):
                 _note = _QWEN_CASR_NOTE.get(crisp_model, "")
@@ -327,13 +342,15 @@ class WebBackend(TranscribeService):
                 download_whisper_ggml(crispasr_dir, size, progress_cb=self._dl_progress)
         aligner_path = None
         if fa_enabled:
-            if quick_check_aligner_gguf(crispasr_dir, fa_quant):
-                aligner_path = crispasr_dir / aligner_gguf_filename(fa_quant)
-            else:
+            # 对齐器 GGUF 与其它模型同置模型目录：crispasr/ 核心目录在换加速版本／
+            # 升版时会先清 exe/dll，模型档放那里容易被误删（issue #7）。
+            # 旧版已下载到 crispasr/ 的档仍照用，不逼使用者重下 643 MB。
+            aligner_path = find_aligner_gguf(model_dir, fa_quant, crispasr_dir)
+            if aligner_path is None:
                 try:
                     self._st("下载时间轴对齐器…")
-                    download_aligner_gguf(crispasr_dir, fa_quant, progress_cb=self._dl_progress)
-                    aligner_path = crispasr_dir / aligner_gguf_filename(fa_quant)
+                    download_aligner_gguf(model_dir, fa_quant, progress_cb=self._dl_progress)
+                    aligner_path = model_dir / aligner_gguf_filename(fa_quant)
                 except Exception:
                     aligner_path = None       # 退回 Whisper 自带时间轴
         eng = CrispWhisperEngine()
@@ -397,7 +414,8 @@ class WebBackend(TranscribeService):
             if be == "crispasr":
                 cd = self._crispasr_dir()
                 if not quick_check_crispasr(cd):
-                    return False                  # 核心 exe 缺（理论上随包附带）→ 当作未就绪
+                    # 核心 exe 缺（不再随包附带，首次使用／换加速版本时才下载）→ 未就绪
+                    return False
                 cm = s.get("crisp_model", "whisper")
                 if cm in _QWEN_CASR_MODELS:
                     _, check_fn, _ = _qwen_casr_dl(cm)
@@ -1070,7 +1088,8 @@ class WebBackend(TranscribeService):
         from downloader import (quick_check, quick_check_1p7b, quick_check_aligner,
                                 quick_check_diarization, quick_check_crispasr,
                                 quick_check_whisper_ggml, quick_check_qwen3_asr_gguf,
-                                quick_check_qwen3_asr_ja_gguf, quick_check_aligner_gguf,
+                                quick_check_qwen3_asr_ja_gguf, find_aligner_gguf,
+                                missing_files_aligner_gguf,
                                 crispasr_variants, _CRISPASR_VERSION)
         s = self._settings_raw()
         model_dir = self._model_dir()
@@ -1141,8 +1160,10 @@ class WebBackend(TranscribeService):
                      quick_check_qwen3_asr_ja_gguf(model_dir, qwen_quant),
                      "已下载", "未下载（日语增强，启用时下载）"),
                 item("fa", f"时间轴对齐 FA（aligner gguf {fa_quant.upper()}）",
-                     quick_check_aligner_gguf(crispasr_dir, fa_quant),
-                     "已下载", "未下载（约 643MB，启用时下载）"),
+                     find_aligner_gguf(model_dir, fa_quant, crispasr_dir) is not None,
+                     "已下载",
+                     f"未下载（约 643MB，启用时下载到模型目录；缺 "
+                     f"{', '.join(missing_files_aligner_gguf(model_dir, fa_quant))}）"),
             ],
         }
 
@@ -1309,35 +1330,487 @@ class WebBackend(TranscribeService):
         self._apply_mirror(s.get("hf_mirror", ""))
         self._apply_output_format(s.get("output_format", "srt"))
 
-    # ── 批量转录队列（transcription_queue.TaskQueue 的包装）───────────────
-    def _queue_event(self, kind: str, job: dict):
-        """队列事件 → SSE（event=queue）。job 已脱敏（无 fn），可直接序列化。"""
-        self._emit("queue", {"kind": kind, **job})
+    # ── 转录队列（transcription_queue.TaskQueue 的包装 + 磁盘持久化）───────
+    #   语义：
+    #     • 空闲自动跑、运行中只排队（单 worker 串行）；录音分段优先入队
+    #     • 刷新/断连 → 暂停（运行中转 paused、排队保留），点「继续」接着跑
+    #     • 关窗不再清空：未完成任务留在 queue-spool/，下次启动恢复为「排队中
+    #       （队列已暂停）」；终态任务连输入文件进 queue-archive/，重启后仍可
+    #       「查看」与回放（刷新丢失 File 对象的问题一并解决），失败可重试
+    #   保留：归档最近 _QUEUE_ARCHIVE_KEEP 条、不超过 _QUEUE_ARCHIVE_DAYS 天。
+    _QUEUE_ARCHIVE_KEEP = 10
+    _QUEUE_ARCHIVE_DAYS = 7.0
 
-    def enqueue_transcribe(self, opts: dict, progress_cb=None) -> str:
+    def _queue_event(self, kind: str, job: dict):
+        """队列事件 → SSE（event=queue）。job 已脱敏（无 fn），可直接序列化。
+
+        终态时把输入文件从暂存搬进归档：完成后可「查看」并回放音轨（刷新/
+        重启后仍在），失败/取消可「重试」。meta.hidden 的任务（录音分段等
+        同步接口的临时任务）不入档，直接清理。
+        """
+        jid = str(job.get("id") or "")
+        hidden = bool((job.get("meta") or {}).get("hidden"))
+        if kind == "finished" and not hidden:
+            res = self._tx_queue.job_result(jid)
+            if res is not None:
+                self._job_results[jid] = res
+        if kind in ("finished", "failed", "cancelled"):
+            if hidden:
+                self._drop_spool(jid)
+            else:
+                self._archive_job(kind, job)
+                self._prune_archive()
+        self._emit("queue", {"kind": kind, **job,
+                             "hasResult": jid in self._job_results})
+        if hidden and kind in ("finished", "failed", "cancelled"):
+            # 录音分段的临时任务：终态即从列表移除，避免长会话里无限累积
+            self._tx_queue.drop(jid)
+
+    # ── 输入暂存 + 结果归档（磁盘持久化）───────────────────────────────
+    #   spool/<sid>/   ：未完成任务（queued/running/paused）→ 重启后恢复排队
+    #   archive/<jid>/ ：终态任务（finished/failed/cancelled）→ 查看/回放/重试
+    #   两处都是「input.<ext> + meta.json」，目录可整体搬迁（任务完成即搬归档）。
+    def queue_spool_root(self) -> Path:
+        """未完成任务输入暂存根目录。"""
+        return self._queue_spool
+
+    def queue_archive_root(self) -> Path:
+        """已完成任务归档根目录（结果 + 输入文件）。"""
+        return self._queue_archive
+
+    def new_spool_dir(self) -> Path:
+        """建一个新的任务暂存目录，返回其路径。"""
+        import uuid
+        self._queue_spool.mkdir(parents=True, exist_ok=True)
+        d = self._queue_spool / uuid.uuid4().hex
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _rm_spool_dir(d) -> None:
+        try:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _write_json(path: Path, obj: dict) -> None:
+        """原子写 JSON（先写临时名再 replace，进程被杀不留半截文件）。"""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            traceback.print_exc()
+
+    @staticmethod
+    def _read_json(path: Path) -> dict | None:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _write_spool_meta(self, spool: Path, opts: dict, label: str,
+                          meta: dict, input_name: str) -> None:
+        """把「恢复所需」的一切写进暂存目录（不含绝对路径，搬迁后仍可用）。"""
+        portable = {k: v for k, v in (opts or {}).items()
+                    if k not in ("path", "spool", "size")}
+        self._write_json(Path(spool) / "meta.json", {
+            "opts": portable, "input": input_name, "label": label,
+            "meta": dict(meta or {}), "created_at": time.time()})
+
+    def _drop_spool(self, jid: str) -> None:
+        d = self._job_spool.pop(jid, None)
+        if d is not None:
+            self._rm_spool_dir(d)
+
+    def _archive_job(self, kind: str, job: dict) -> None:
+        """终态：暂存目录整体搬进归档，并写归档 meta（结果/错误/输入名）。"""
+        jid = str(job.get("id") or "")
+        spool = self._job_spool.pop(jid, None)
+        if not spool or not Path(spool).is_dir():
+            return
+        spool = Path(spool)
+        dest = self._queue_archive / jid
+        try:
+            self._rm_spool_dir(dest)
+            self._queue_archive.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.move(str(spool), str(dest))
+        except Exception:
+            traceback.print_exc()
+            self._rm_spool_dir(spool)
+            return
+        sp_meta = self._read_json(dest / "meta.json") or {}
+        res = self._job_results.get(jid) or {}
+        rec = {
+            "id": jid, "label": job.get("label", ""),
+            "name": (job.get("meta") or {}).get("name") or job.get("label", ""),
+            "size": int((job.get("meta") or {}).get("size") or 0),
+            "state": "finished" if kind == "finished" else kind,
+            "error": job.get("error"),
+            "opts": sp_meta.get("opts") or {},
+            "input": sp_meta.get("input") or "",
+            "srtPath": res.get("srtPath"),
+            "segments": res.get("segments"),
+            "finished_at": time.time(),
+        }
+        self._write_json(dest / "meta.json", rec)
+        self._archive[jid] = rec
+
+    def _prune_archive(self) -> None:
+        """归档保留策略：最近 N 条且不超过 D 天；其余连输入文件一起删。"""
+        try:
+            items = sorted(self._archive.values(), key=lambda m: m.get("finished_at") or 0)
+            now = time.time()
+            drop = []
+            for i, m in enumerate(items):
+                too_old = now - (m.get("finished_at") or 0) > self._QUEUE_ARCHIVE_DAYS * 86400
+                too_many = (len(items) - i) > self._QUEUE_ARCHIVE_KEEP
+                if too_old or too_many:
+                    drop.append(str(m.get("id")))
+            for jid in drop:
+                self._archive.pop(jid, None)
+                self._job_results.pop(jid, None)
+                self._rm_spool_dir(self._queue_archive / jid)
+        except Exception:
+            traceback.print_exc()
+
+    def _purge_stale_spool(self, max_age_hours: float = 168.0) -> None:
+        """清掉没有 meta.json 的脏暂存目录（异常退出残留）；有 meta 的留给恢复。"""
+        try:
+            root = self._queue_spool
+            if not root.is_dir():
+                return
+            now = time.time()
+            for d in list(root.iterdir()):
+                try:
+                    if not d.is_dir():
+                        continue
+                    if (d / "meta.json").is_file():
+                        continue       # 可恢复的任务，交给 _restore_queue
+                    if now - d.stat().st_mtime > max_age_hours * 3600:
+                        self._rm_spool_dir(d)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    def queue_audio_path(self, jid: str) -> Path | None:
+        """任务输入文件的现行路径（归档优先，其次暂存）；没有则 None。"""
+        jid = str(jid or "")
+        cands = []
+        if jid in self._archive:
+            cands.append(self._queue_archive / jid)
+        sp = self._job_spool.get(jid)
+        if sp is not None:
+            cands.append(Path(sp))
+        for d in cands:
+            try:
+                for p in sorted(d.iterdir()):
+                    if p.is_file() and p.name.startswith("input"):
+                        return p
+            except OSError:
+                continue
+        return None
+
+    def enqueue_from_upload(self, src: Path, filename: str, fields: dict) -> str:
+        """把已落盘的上传文件移入 job spool 并入队，返回 job_id。
+
+        输入统一改名为 input<ext>（恢复/回放时路径可预测），原始文件名留在
+        meta 里供字幕命名；同目录写 meta.json，重启后即可把任务恢复排队。
+        HTTP 的 /api/enqueue 用它：请求立刻返回 job_id，worker 之后从 spool
+        读文件，不再依赖「连接还活着」。入队失败（队列满）时清掉刚建的空目录。
+        """
+        import shutil
+        spool = self.new_spool_dir()
+        safe = Path(str(filename).replace("\\", "/")).name or "upload"
+        if not safe or safe.startswith("."):
+            safe = "upload"
+        suffix = Path(safe).suffix
+        dest = spool / ("input" + suffix)
+        shutil.move(str(src), str(dest))
+        fields = fields or {}
+        opts = {
+            "path": str(dest),
+            "name": filename,
+            "size": dest.stat().st_size,
+            "spool": str(spool),
+            "language": (fields.get("language") or "").strip() or None,
+            "diarize": (fields.get("diarize", "") or "").lower() in ("1", "true", "on", "yes"),
+            "nSpeakers": fields.get("n_speakers", ""),
+            "align": (fields.get("align", "1") or "").lower() in ("1", "true", "on", "yes"),
+            "hint": fields.get("hint", ""),
+        }
+        meta = {"name": filename, "size": opts["size"]}
+        self._write_spool_meta(spool, opts, filename, meta, dest.name)
+        try:
+            return self.enqueue_transcribe(opts, extra_meta=meta)
+        except Exception:
+            self._rm_spool_dir(spool)
+            raise
+
+    def enqueue_transcribe(self, opts: dict, progress_cb=None, front: bool = False,
+                           extra_meta: dict | None = None, box: dict | None = None,
+                           done_event=None) -> str:
         """把一个转录任务排入队列，立即返回 job_id。
 
         执行体复用 transcribe()（含切片/取消/输出命名全部语义）；排队中取消
         → 直接跳过，运行中取消 → cancel_job 会接通现有取消链（self._cancel +
         引擎 cancel_event）。并发上限由 TaskQueue(maxsize) 控制，超出抛错。
+
+        front：插队到队首（录音分段等交互式任务优先）。
+        extra_meta：附加到任务快照的元信息（hidden 的任务不入档）。
+        box / done_event：同步接口用——结果或异常写进 box，完成时置位事件。
         """
-        label = Path(str(opts.get("path", ""))).name or "transcribe"
+        label = Path(str(opts.get("name") or opts.get("path") or "")).name or "transcribe"
+        meta = {"name": label, "size": int(opts.get("size") or 0)}
+        meta.update(extra_meta or {})
+        holder: dict = {}
+
+        def _progress(pct, status=""):
+            jid = holder.get("jid")
+            if not jid:
+                return
+            self._tx_queue.update_progress(jid, pct, status)
+            # 进度带上 jobId → 前端只刷新对应队列行（其余进度事件保持原样）
+            self._emit("progress", {"pct": pct, "status": status, "jobId": jid})
 
         def _job(_cancel_event):
-            # 取消走 WebBackend.cancel()（cancel_job 接通），不走队内事件：
-            # 引擎子进程终止/切片段间检查两条既有链路都已挂在 self._cancel 上。
-            return self.transcribe(opts, progress_cb=progress_cb)
+            # 取消走 WebBackend.cancel()（cancel_job / queue_pause 接通），
+            # 不走队内事件：引擎子进程终止、切片段间检查两条链路都挂在
+            # self._cancel 上。
+            try:
+                res = self.transcribe(opts, progress_cb=_progress)
+            except BaseException as e:
+                if box is not None:
+                    box["error"] = e
+                raise
+            finally:
+                if done_event is not None:
+                    done_event.set()
+            if box is not None:
+                box["result"] = res
+            return res
 
-        return self._tx_queue.submit(_job, label=label)
+        import uuid as _uuid
+        jid = _uuid.uuid4().hex[:12]
+        # 先登记暂存目录再入队：任务可能在 submit 返回前就瞬间完成并触发
+        # 终态清理（_drop_spool），否则会漏删目录（实测竞态）。
+        if opts.get("spool"):
+            self._job_spool[jid] = Path(opts["spool"])
+        holder["jid"] = jid
+        try:
+            self._tx_queue.submit(_job, label=label, meta=meta,
+                                  front=front, job_id=jid)
+        except Exception:
+            self._job_spool.pop(jid, None)
+            raise
+        return jid
+
+    # ── 启动恢复 / 同步接口 / 重试 / 排序 ────────────────────────────────
+    def _restore_queue(self) -> None:
+        """启动恢复：归档里的终态任务 + 暂存里的未完成任务。
+
+        未完成任务恢复后**先把队列置为暂停**：不替使用者决定要不要继续烧
+        GPU；页面上点「继续」即按原顺序接着跑。
+        """
+        # 1) 归档（重启后仍可查看/回放/重试）
+        try:
+            self._queue_archive.mkdir(parents=True, exist_ok=True)
+            for d in list(self._queue_archive.iterdir()):
+                if not d.is_dir():
+                    continue
+                rec = self._read_json(d / "meta.json")
+                if not rec:
+                    self._rm_spool_dir(d)      # 无 meta 的脏目录
+                    continue
+                jid = str(rec.get("id") or d.name)
+                rec["id"] = jid
+                self._archive[jid] = rec
+                self._job_spool[jid] = d
+                if rec.get("state") == "finished" and rec.get("segments") is not None:
+                    self._job_results[jid] = {
+                        "segments": rec.get("segments"),
+                        "srtPath": rec.get("srtPath")}
+                self._tx_queue.adopt(
+                    jid, label=rec.get("label") or rec.get("name") or "",
+                    meta={"name": rec.get("name") or "", "size": rec.get("size") or 0},
+                    state=rec.get("state") or "finished", error=rec.get("error"))
+            self._prune_archive()
+        except Exception:
+            traceback.print_exc()
+
+        # 2) 暂存里的未完成任务 → 恢复排队（保持创建顺序）
+        entries = []
+        try:
+            if self._queue_spool.is_dir():
+                for d in self._queue_spool.iterdir():
+                    if not d.is_dir():
+                        continue
+                    meta = self._read_json(d / "meta.json")
+                    if not meta or not meta.get("opts"):
+                        continue
+                    entries.append((meta.get("created_at") or 0, d, meta))
+                entries.sort(key=lambda x: x[0])
+        except Exception:
+            traceback.print_exc()
+        if entries:
+            # 先暂停再恢复：否则 worker 会立刻开跑，等于替使用者决定继续烧 GPU
+            self._tx_queue.pause()
+        restored = 0
+        for _ts, d, meta in entries:
+            opts = dict(meta.get("opts") or {})
+            inp = str(meta.get("input") or "")
+            path = d / inp if inp else None
+            if path is None or not path.is_file():
+                self._rm_spool_dir(d)
+                continue
+            try:
+                opts.update({"path": str(path), "spool": str(d),
+                             "size": (meta.get("meta") or {}).get("size")
+                                     or path.stat().st_size})
+                self.enqueue_transcribe(opts, extra_meta=meta.get("meta"))
+                restored += 1
+            except Exception:
+                traceback.print_exc()
+        if restored and not self._tx_queue.is_paused():
+            self._tx_queue.pause()
+
+    def transcribe_via_queue(self, opts: dict, progress_cb=None, on_job=None) -> dict:
+        """同步接口（/api/transcribe）也走队列：与批量任务串行，不再抢识别 gate。
+
+        任务标记 hidden：不占队列面板、不归档；阻塞到任务结束，失败原样抛出。
+        on_job(job_id) 在入队后回调，供 HTTP 层挂断连取消。
+        """
+        box: dict = {}
+        ev = threading.Event()
+        jid = self.enqueue_transcribe(opts, progress_cb=progress_cb, front=True,
+                                      extra_meta={"hidden": True, "source": "live"},
+                                      box=box, done_event=ev)
+        if on_job:
+            try:
+                on_job(jid)
+            except Exception:
+                pass
+        ev.wait()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result") or {}
+
+    def queue_retry(self, jid: str) -> dict:
+        """把失败/取消的任务重新排队（复用归档里的输入文件，不必重传）。"""
+        jid = str(jid or "")
+        rec = self._archive.get(jid)
+        src = self.queue_audio_path(jid)
+        if not rec or not src:
+            return {"ok": False, "error": "找不到该任务的输入文件，无法重试"}
+        spool = self.new_spool_dir()
+        try:
+            import shutil
+            dest = spool / src.name
+            shutil.copy2(str(src), str(dest))
+            opts = dict(rec.get("opts") or {})
+            opts.update({"path": str(dest),
+                         "name": rec.get("name") or src.name,
+                         "size": int(rec.get("size") or dest.stat().st_size),
+                         "spool": str(spool)})
+            label = rec.get("label") or opts["name"]
+            meta = {"name": opts["name"], "size": opts["size"]}
+            self._write_spool_meta(spool, opts, label, meta, dest.name)
+            new_jid = self.enqueue_transcribe(opts, extra_meta=meta)
+        except Exception as e:
+            self._rm_spool_dir(spool)
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return {"ok": True, "jobId": new_jid, "queue": self.queue_status()}
+
+    def queue_reorder(self, jid: str, before: str | None = None) -> dict:
+        """调整「排队中」任务的顺序（前端拖动排序），返回最新快照。"""
+        ok = self._tx_queue.move(str(jid or ""), str(before) if before else None)
+        return {"ok": ok, "queue": self.queue_status()}
 
     def queue_status(self) -> dict:
-        """队列快照（全部任务 + 当前运行 id）。"""
-        return {"jobs": self._tx_queue.status(),
-                "current": self._tx_queue.current_id()}
+        """队列快照（全部任务 + 当前运行 id + 是否暂停）。
+
+        每个任务附：hasResult（有结果可查看）、archived（已进归档）、
+        hasAudio（输入文件还在，可回放/重试）、retryable（失败/取消且可重试）
+        —— 前端据此决定「查看 / 重试」按钮；刷新/重启后靠归档恢复。
+        """
+        jobs = self._tx_queue.status()
+        for j in jobs:
+            jid = str(j.get("id") or "")
+            j["hasResult"] = jid in self._job_results
+            j["archived"] = jid in self._archive
+            j["hasAudio"] = self.queue_audio_path(jid) is not None
+            j["retryable"] = (j.get("state") in ("failed", "cancelled")
+                              and j["hasAudio"])
+        return {"jobs": jobs,
+                "current": self._tx_queue.current_id(),
+                "paused": self._tx_queue.is_paused()}
+
+    def queue_result(self, jid: str) -> dict | None:
+        """任务结果（{segments, srtPath}）：内存优先，其次归档；未知 id → None。"""
+        jid = str(jid or "")
+        res = self._job_results.get(jid)
+        if res is not None:
+            return res
+        rec = self._archive.get(jid)
+        if rec and rec.get("segments") is not None:
+            return {"segments": rec.get("segments"), "srtPath": rec.get("srtPath")}
+        return None
 
     def cancel_job(self, jid: str) -> bool:
-        """取消指定任务（排队中→跳过；运行中→接通现有取消链）。"""
+        """取消指定任务（排队中/已暂停→跳过；运行中→接通现有取消链）。"""
         ok = self._tx_queue.cancel(jid)
         if ok and self._tx_queue.current_id() == jid:
             self.cancel()                # 运行中：复用 /api/cancel 的取消链
         return ok
+
+    def queue_clear_finished(self) -> dict:
+        """清空「已完成/失败/已取消」的列表项（结果缓存与暂存一并释放）。"""
+        gone = self._tx_queue.clear_finished()      # 返回被移除的 id 列表
+        for jid in gone:
+            self._job_results.pop(jid, None)
+            self._drop_spool(jid)
+        return {"ok": True, "removed": len(gone), "queue": self.queue_status()}
+
+    def queue_pause(self) -> bool:
+        """暂停队列（刷新/断连触发）：停派发 + 让运行中的任务尽快停下转 paused。"""
+        cur = self._tx_queue.pause()
+        if cur:
+            self.cancel()                # 复用现有取消链（_cancel + 引擎 cancel_event）
+        return True
+
+    def queue_resume(self) -> dict:
+        """恢复队列：被暂停的任务回到队首先跑。"""
+        return {"ok": True, "resumed": self._tx_queue.resume()}
+
+    def queue_on_client_gone(self) -> None:
+        """前端页面断开（刷新/关标签）→ 暂停队列。
+
+        不取消排队的任务：刷新回来后队列仍在，点「继续」接着跑（issue 反馈
+        里明确要求「刷新/断连=暂停运行中、保留排队」）。空闲时不动作，避免
+        无谓状态变化。
+        """
+        try:
+            if self._tx_queue.current_id() and not self._tx_queue.is_paused():
+                self.queue_pause()
+        except Exception:
+            traceback.print_exc()
+
+    def close_queue(self) -> None:
+        """关窗：让队列停下，但**保留**磁盘上的暂存与归档（下次启动恢复）。
+
+        与早期「关窗清空」不同——未完成任务重启后继续排队（暂停态），已完成
+        任务仍可查看/回放。要彻底清掉用「清空已完成」或手动删 queue-spool/。
+        """
+        try:
+            if self._tx_queue.current_id():
+                self._tx_queue.pause()      # 让运行中的任务收尾成 paused（保留输入）
+                self.cancel()
+            self._tx_queue.close(wait=True)
+        except Exception:
+            traceback.print_exc()

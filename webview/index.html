@@ -99,6 +99,18 @@
           <label class="switch"><input type="checkbox" id="sw-align" checked><span class="track"></span><span data-i18n="file.align">时间轴对齐</span></label>
         </div>
 
+        <!-- 批量队列：拖入多个文件即入队；串行执行，刷新/断连自动暂停 -->
+        <div class="queue-panel" id="queue-panel" hidden>
+          <div class="queue-head">
+            <span class="q-title" data-i18n="queue.title">队列</span>
+            <span class="q-sum" id="queue-sum"></span>
+            <span class="sp"></span>
+            <button class="btn btn-ghost btn-sm" id="queue-resume" hidden data-i18n="queue.resume">继续</button>
+            <button class="btn btn-ghost btn-sm" id="queue-clear" data-i18n="queue.clearDone">清空已完成</button>
+          </div>
+          <div class="queue-list" id="queue-list"></div>
+        </div>
+
         <!-- 最近转录：subtitles/ 最近产出，点击回填查看（有历史才显示） -->
         <div class="hint-head" id="history-head" hidden>
           <div class="l"><span class="t" data-i18n="file.history">最近转录</span></div>
@@ -111,10 +123,6 @@
         </div>
         <textarea class="input" id="hint-box" data-i18n-ph="file.hintPh" placeholder="例如：本段为产品营销 Podcast，会出现“转化率”“漏斗”等营销术语…"></textarea>
 
-        <div class="progress" id="progress" hidden>
-          <div class="meta"><span class="s" id="prog-status">识别中 · 第 5/8 段</span><span class="p" id="prog-pct">68%</span></div>
-          <div class="bar"><i id="prog-bar" style="width:68%"></i></div>
-        </div>
 
         <!-- 精华区：波形 + 字幕卡 -->
         <div class="result" id="result" hidden>
@@ -296,7 +304,7 @@
   </div>
 </div>
 
-<input id="hidden-file" type="file" accept="audio/*,video/*" style="display:none">
+<input id="hidden-file" type="file" accept="audio/*,video/*" multiple style="display:none">
 <script src="js/bridge.js?v=8"></script>   <!-- classic：全局 QwenAPI（未改，版本保持） -->
 <script src="js/i18n.js?v=9"></script>     <!-- classic：全局 I18N（data-i18n apply 消费面广，不迁移；未改，版本保持） -->
 <script type="module" src="js/main.js"></script>  <!-- ESM 入口：state → util → views/modelView → appCore；util.js 不再单独引入（改由 ESM import） -->

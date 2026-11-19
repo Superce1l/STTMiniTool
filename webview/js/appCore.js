@@ -21,7 +21,7 @@
       boot 内语句按原 app.js 相对顺序移入，执行语义不变）
 
    未迁出的纯局部状态（模块作用域私有，语义同原 IIFE 内 let/const）：
-   picked / running / audioEl / audioUrl / waveDur / _editHistory / _subEls /
+   picked / enqueuing / queueJobs / audioEl / audioUrl / waveDur / _editHistory / _subEls /
    _blockEls / _playingIdx / _playedBars / _segHint / _stickyPad / _virtualMode /
    _vwin / _spacerTop / _spacerBot / _scrollHost / _scrollRaf / _measureRaf /
    _editCtx / playFollow / karaokeOn / karaokeRAF / _karaCache /
@@ -152,11 +152,32 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
   // 音频转字幕
   // ════════════════════════════════════════════════════════
   let picked = null;             // {path?, name, file?} 或 null
+  let enqueuing = false;         // 入队请求进行中（防重复点击）
+  // ── 批量队列（后端 TaskQueue 的镜像；SSE event=queue 驱动）──────────
+  //   拍板语义：空闲自动跑、运行中只排队；新任务完成时仅「结果区为空」才自动
+  //   展示，否则标「查看」；刷新/断连后端暂停、点「继续」接着跑。
+  let queueJobs = [];            // [{id,label,state,meta,pct,status,error,hasResult}]
+  let queuePaused = false;
+  let uploading = [];            // 正在上传的文件（入队前也有一行反馈）
+  let _upSeq = 0;
+  const pendingFiles = {};       // jobId → File（本页会话内「查看」可回放音频）
+  let focusedJob = null;         // 结果区当前展示的 jobId
+  const _Q_ACTIVE = new Set(["queued", "running", "paused"]);
   const drop = $("#drop"), hiddenFile = $("#hidden-file");
+
+  // 「开始转换」可用性的唯一判定点：任何改 picked / 入队状态的地方都只调它。
+  // 旧实现 setFile() 直接写 btn-run.disabled=false —— 转录进行中拖入新文件会把
+  // 熄灭的按钮重新点亮（反馈：拖入新视频可替换/清除当前多媒体并让按钮亮起）。
+  // 现在「运行中」不再是按钮禁用的理由：排队机制下允许继续加任务。
+  function syncRunButton() {
+    const btn = $("#btn-run");
+    if (!btn) return;
+    btn.disabled = !picked || enqueuing;
+  }
 
   function setFile(f) {
     picked = f;
-    if (!f) { drop.classList.remove("has-file"); renderDropEmpty(); $("#btn-run").disabled = true; return; }
+    if (!f) { drop.classList.remove("has-file"); renderDropEmpty(); syncRunButton(); return; }
     drop.classList.add("has-file");
     const meta = f.sizeSec ? T("file.sizeSec", "{n} 秒", { n: f.sizeSec })
                            : (f.size ? (f.size / 1048576).toFixed(1) + " MB" : "");
@@ -164,7 +185,7 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
       ${meta ? `<span class="meta">${meta}</span>` : ""}
       <button class="x" title="${T("common.remove", "移除")}">✕</button></span>`;
     drop.querySelector(".x").addEventListener("click", ev => { ev.stopPropagation(); setFile(null); });
-    $("#btn-run").disabled = false;
+    syncRunButton();
   }
   function renderDropEmpty() {
     drop.innerHTML = `<div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg></div>
@@ -172,26 +193,333 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
       <div class="sub">${T("file.dropSub", "支持 mp3 / wav / m4a / 视频音轨")}</div>`;
   }
 
-  // 转录
-  let running = false;
-  // pct<0：无有效进度，只显示 status 文案（空 = 连接已恢复，撤掉提示文字，
-  // 进度条保留原值等待下一条真实进度）。仅任务进行中才显示，空闲断线不打扰
-  // （EventSource 自己会重连，无需用户操作）。
-  function connHint(status) {
-    if (!(running || state.modelLoading)) return;
-    if (state.modelLoading) {
-      $("#model-progress").hidden = false;
-      $("#model-prog-status").textContent = status || "";
-    } else {
-      $("#progress").hidden = false;
-      $("#prog-status").textContent = status || "";
+  // ════════════════════════════════════════════════════════
+  // 批量队列 UI（后端 TaskQueue 的镜像）
+  //   · 拖入文件即入队（空闲自动跑、运行中只排队）
+  //   · 每行：序号/文件名/状态/进度/操作（取消、查看、移除）
+  //   · 刷新或断连 → 后端暂停；顶部「继续」接着跑
+  // ════════════════════════════════════════════════════════
+  const _Q_ST_LABEL = { queued: "queue.stQueued", running: "queue.stRunning",
+                        paused: "queue.stPaused", finished: "queue.stDone",
+                        failed: "queue.stFailed", cancelled: "queue.stCancelled" };
+  const _Q_ST_FALLBACK = { queued: "排队中", running: "识别中", paused: "已暂停",
+                           finished: "已完成", failed: "失败", cancelled: "已取消" };
+
+  function qStateText(st) {
+    return T(_Q_ST_LABEL[st] || "queue.stQueued", _Q_ST_FALLBACK[st] || st || "");
+  }
+  function qName(j) { return (j.meta && j.meta.name) || j.label || "audio"; }
+  function qActive(j) { return _Q_ACTIVE.has(j.state); }
+  function queueBusy() { return queueJobs.some(qActive); }
+
+  function upsertJob(job) {
+    if (!job || !job.id) return;
+    const i = queueJobs.findIndex(j => j.id === job.id);
+    if (i >= 0) queueJobs[i] = Object.assign({}, queueJobs[i], job);
+    else queueJobs.push(Object.assign({}, job));
+  }
+
+  function applyQueueSnapshot(st) {
+    if (!st) return;
+    if (Array.isArray(st.jobs)) {
+      // hidden：同步接口（录音分段）的临时任务，不占队列面板
+      queueJobs = st.jobs.map(j => Object.assign({}, j))
+                        .filter(j => !(j.meta && j.meta.hidden));
+    }
+    queuePaused = !!st.paused;
+    renderQueue();
+  }
+
+  async function refreshQueue() {
+    try { applyQueueSnapshot(await API.queueStatus()); }
+    catch (e) { /* mock/断线：保持现状 */ }
+  }
+
+  // 运行中任务的进度只改对应行，不整表重绘（进度事件较频繁）。
+  function patchQueueProgress(jid, pct, status) {
+    const row = document.querySelector('.queue-item[data-id="' + jid + '"]');
+    if (!row) { renderQueue(); return; }
+    const bar = row.querySelector(".q-bar > i");
+    if (bar) bar.style.width = Math.max(0, Math.min(100, Number(pct) || 0)) + "%";
+    const note = row.querySelector(".q-note");
+    // 已点取消：进度事件别再覆盖「正在取消…」文案
+    if (note && status && !row.classList.contains("cancelling")) note.textContent = status;
+  }
+
+  function renderQueue() {
+    const panel = $("#queue-panel"), list = $("#queue-list"), sum = $("#queue-sum");
+    if (!panel || !list) return;
+    if (!queueJobs.length && !uploading.length) {
+      panel.hidden = true;
+      list.innerHTML = "";
+      if (sum) sum.textContent = "";
+      const c0 = $("#btn-cancel-tx");
+      if (c0) c0.hidden = true;
+      state.switchBusy = false;
+      syncRunButton();
+      return;
+    }
+    panel.hidden = false;
+    const runningJob = queueJobs.find(j => j.state === "running");
+    if (sum) {
+      sum.textContent = runningJob
+        ? T("queue.sumRunning", "运行中 1 · 排队 {n}", { n: queueJobs.filter(j => j.state === "queued").length })
+        : (queueJobs.length ? T("queue.sumIdle", "{n} 个任务", { n: queueJobs.length })
+                             : T("queue.uploading", "上传中…"));
+      sum.classList.toggle("paused", queuePaused);
+      sum.title = queuePaused ? T("queue.pausedHint", "队列已暂停（刷新/断连自动暂停），点「继续」接着跑") : "";
+    }
+    const resumeBtn = $("#queue-resume");
+    if (resumeBtn) resumeBtn.hidden = !queuePaused;
+
+    // 取消按钮：仅运行中显示；点过取消后立刻置灰改文案（不等后端收尾）
+    const cbtn = $("#btn-cancel-tx");
+    if (cbtn) {
+      cbtn.hidden = !runningJob;
+      if (runningJob) {
+        const canceling = !!runningJob.cancelling;
+        cbtn.disabled = canceling;
+        cbtn.textContent = canceling ? T("queue.cancelling", "正在取消…")
+                                     : T("tx.cancel", "取消转换");
+      }
+    }
+
+    list.innerHTML = "";
+    // 上传中（还没有 job 行）：先给一行反馈，入队成功后自动换成任务行
+    uploading.forEach(u => {
+      const row = document.createElement("div");
+      row.className = "queue-item st-uploading";
+      row.innerHTML =
+        '<span class="q-idx">⤒</span>' +
+        '<span class="q-name" title="' + STTUtil.escapeHtml(u.name) + '">' + STTUtil.escapeHtml(u.name) + '</span>' +
+        '<span class="q-st">' + STTUtil.escapeHtml(T("queue.uploading", "上传中…")) + '</span>' +
+        '<span class="q-note"></span><span class="q-act"></span>' +
+        '<span class="q-bar indet"><i></i></span>';
+      list.appendChild(row);
+    });
+    queueJobs.forEach((j, idx) => {
+      const row = document.createElement("div");
+      row.className = "queue-item st-" + j.state
+        + (j.cancelling ? " cancelling" : "")
+        + (focusedJob === j.id ? " focused" : "");
+      row.dataset.id = j.id;
+      if (j.state === "queued") wireQueueDrag(row, j);
+      const pct = Math.max(0, Math.min(100, Number(j.pct) || 0));
+      const cancelling = !!j.cancelling;
+      const showBar = j.state === "running" || j.state === "paused";
+      const note = cancelling ? T("queue.cancelling", "正在取消…")
+                 : j.state === "running" ? (j.status || "")
+                 : j.state === "failed" ? (j.error || "") : "";
+      const badge = cancelling ? T("queue.cancelling", "正在取消…") : qStateText(j.state);
+      row.innerHTML =
+        '<span class="q-idx">' + (idx + 1) + '</span>' +
+        '<span class="q-name" title="' + STTUtil.escapeHtml(qName(j)) + '">' + STTUtil.escapeHtml(qName(j)) + '</span>' +
+        '<span class="q-st">' + STTUtil.escapeHtml(badge) + '</span>' +
+        '<span class="q-note" title="' + STTUtil.escapeHtml(note) + '">' + STTUtil.escapeHtml(note) + '</span>' +
+        '<span class="q-act"></span>' +
+        (showBar ? '<span class="q-bar"><i style="width:' + pct + '%"></i></span>' : "");
+
+      const act = row.querySelector(".q-act");
+      const addBtn = (label, fn, cls) => {
+        const b = document.createElement("button");
+        b.className = "btn btn-ghost btn-sm" + (cls ? " " + cls : "");
+        b.textContent = label;
+        b.addEventListener("click", ev => { ev.stopPropagation(); fn(); });
+        return act.appendChild(b);
+      };
+      if (j.state === "finished" && j.hasResult) {
+        addBtn(T("queue.view", "查看"), () => viewJob(j), focusedJob === j.id ? "on" : "");
+      }
+      if (j.retryable) {
+        addBtn(T("queue.retry", "重试"), () => retryJob(j));
+      }
+      if (qActive(j)) {
+        // 立即反馈：先本地置 cancelling 并重绘，再发请求（引擎收尾可能要几秒）
+        const b = addBtn(cancelling ? T("queue.cancelling", "正在取消…") : T("queue.cancel", "取消"),
+          async () => {
+            if (j.cancelling) return;
+            j.cancelling = true;
+            j.status = T("queue.cancelling", "正在取消…");
+            renderQueue();
+            try { await API.queueCancel(j.id); } catch (e) {}
+            refreshQueue();
+          });
+        if (cancelling) b.disabled = true;
+      } else {
+        addBtn(T("queue.dismiss", "移除"), () => {
+          queueJobs = queueJobs.filter(x => x.id !== j.id);
+          renderQueue();
+        });
+      }
+      list.appendChild(row);
+    });
+
+    state.switchBusy = queueBusy();
+    syncRunButton();
+  }
+
+  // ── 队列拖动排序（仅排队中）──────────────────────────────────────
+  let _dragQueueId = null;
+  function wireQueueDrag(row, job) {
+    row.draggable = true;
+    row.title = T("queue.dragHint", "拖动可调整排队顺序");
+    row.addEventListener("dragstart", ev => {
+      _dragQueueId = job.id;
+      try { ev.dataTransfer.setData("text/plain", job.id); } catch (e) {}
+      ev.dataTransfer.effectAllowed = "move";
+      row.classList.add("dragging");
+    });
+    row.addEventListener("dragend", () => {
+      _dragQueueId = null;
+      row.classList.remove("dragging");
+      renderQueue();
+    });
+    row.addEventListener("dragover", ev => {
+      if (!_dragQueueId || _dragQueueId === job.id) return;
+      ev.preventDefault();
+      row.classList.add("drop-target");
+    });
+    row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
+    row.addEventListener("drop", ev => {
+      ev.preventDefault();
+      try { ev.stopPropagation(); } catch (e) {}
+      row.classList.remove("drop-target");
+      const id = _dragQueueId || ev.dataTransfer.getData("text/plain");
+      if (id && id !== job.id) reorderJob(id, job.id);
+    });
+  }
+
+  async function reorderJob(id, before) {
+    try {
+      const r = await API.queueReorder(id, before || null);
+      if (r && r.queue) applyQueueSnapshot(r.queue); else refreshQueue();
+    } catch (e) { logLine("✕ " + (e && e.message ? e.message : String(e))); }
+  }
+
+  async function retryJob(job) {
+    try {
+      const r = await API.queueRetry(job.id);
+      if (r && r.ok) {
+        if (r.queue) applyQueueSnapshot(r.queue); else refreshQueue();
+        logLine("↻ " + T("queue.retried", "已重新排队：") + qName(job));
+      } else {
+        logLine("✕ " + ((r && r.error) || T("queue.retryFail", "重试失败")));
+      }
+    } catch (e) { logLine("✕ " + (e && e.message ? e.message : String(e))); }
+  }
+
+  async function viewJob(job) {
+    try {
+      const res = await API.queueResult(job.id);
+      if (!res || !res.segments) throw new Error("empty");
+      // 音轨：本页会话内有原 File 就用；没有（刷新/重启后）向后端要归档文件，
+      // 这样「查看」仍能播放，不必重新拖入同一文件。太大的文件只放字幕。
+      let audio = pendingFiles[job.id] || null;
+      if (!audio && job.hasAudio) {
+        const size = Number((job.meta && job.meta.size) || 0);
+        if (size > 300 * 1048576) {
+          logLine("ℹ " + T("queue.audioTooBig", "音轨过大（>300MB），仅显示字幕与时间轴"));
+        } else {
+          try { audio = await API.queueAudio(job.id); }
+          catch (e) { audio = null; logLine("ℹ " + T("queue.audioMissing", "音轨不可用")); }
+        }
+      }
+      focusedJob = job.id;
+      renderResult(res.segments, audio);
+      $("#btn-open-dir").disabled = false;
+      $("#btn-save-sub").disabled = false;
+      logLine("✓ " + T("queue.view", "查看") + "：" + qName(job)
+              + (res.srtPath ? T("file.logSaved", "，已输出 ") + res.srtPath : ""));
+      renderQueue();
+    } catch (e) {
+      logLine("✕ " + T("queue.resultGone", "结果已过期，请重新转录"));
     }
   }
-  function showProgress(pct, status) {
-    $("#progress").hidden = false;
-    $("#prog-bar").style.width = pct + "%";
-    $("#prog-pct").textContent = Math.round(pct) + "%";
-    if (status != null) $("#prog-status").textContent = status;
+
+  function onQueueEvent(ev) {
+    if (!ev) return;
+    if (ev.kind === "cleared") { refreshQueue(); return; }
+    if (!ev.id) return;
+    if (ev.kind === "paused") queuePaused = true;
+    else if (ev.kind === "queued" || ev.kind === "started") queuePaused = false;
+    upsertJob(ev);
+    if (ev.kind === "finished") {
+      renderHistory();
+      // 结果区为空才自动展示；否则只在行上标「查看」，不抢用户正在看/编辑的结果
+      if (ev.hasResult && !state.curSegs.length) viewJob(ev);
+    } else if (ev.kind === "failed") {
+      logLine("✕ " + qName(ev) + "：" + (ev.error || ""));
+    }
+    renderQueue();
+  }
+
+  // 上传并入队一个文件（返回 jobId）
+  async function enqueueFile(file) {
+    if (!(file instanceof Blob)) throw new Error("no file");
+    const up = { key: "up" + (++_upSeq), name: file.name || "audio" };
+    uploading.push(up);
+    renderQueue();                 // 入队前先显示「上传中…」行（大文件要等一会）
+    enqueuing = true; syncRunButton();
+    try {
+      const res = await API.enqueue({
+        file,
+        language: $("#sel-lang").value || null,
+        diarize: $("#sw-diar").checked,
+        nSpeakers: $("#sel-spk").value,
+        align: $("#sw-align").checked,
+        hint: $("#hint-box").value.trim(),
+      });
+      if (res && res.jobId) {
+        pendingFiles[res.jobId] = file;
+        if (res.queue) applyQueueSnapshot(res.queue);
+        return res.jobId;
+      }
+      throw new Error(T("queue.enqueueFailed", "入队失败"));
+    } finally {
+      uploading = uploading.filter(u => u.key !== up.key);
+      enqueuing = false; syncRunButton();
+      renderQueue();
+    }
+  }
+
+  // 录制页仍走同步 /api/transcribe（结果要立刻回显）。队列忙碌时先等它空出来，
+  // 否则会撞上「已有识别任务进行中」把录音分段整段丢掉。
+  function waitQueueIdle(timeoutMs = 10 * 60 * 1000) {
+    const t0 = Date.now();
+    return new Promise(resolve => {
+      const tick = () => {
+        if (!queueBusy() || Date.now() - t0 > timeoutMs) return resolve();
+        setTimeout(tick, 700);
+      };
+      tick();
+    });
+  }
+  let recTxChain = Promise.resolve();   // 录音分段识别串行化（避免并发 gate 冲突）
+
+  // 拖入/多选的批量入队（顺序入队；中途失败即停，已入队的仍照跑）
+  async function enqueueFiles(files) {
+    const list = Array.from(files || []).filter(f => f instanceof Blob);
+    if (!list.length) return 0;
+    let ok = 0;
+    for (const f of list) {
+      try { await enqueueFile(f); ok++; }
+      catch (e) { logLine("✕ " + (e && e.message ? e.message : String(e))); break; }
+    }
+    if (ok) logLine("＋ " + T("queue.batchAdded", "已加入队列 {n} 个文件", { n: ok }));
+    return ok;
+  }
+
+  // 转录
+  // SSE 断线/恢复提示：模型加载进度归模型页；队列任务的进度由队列行显示。
+  // （音频页原先还有一条全局进度条，与队列行的进度条重复，已移除。）
+  // 仅任务进行中才提示，空闲断线不打扰（EventSource 自己会重连）。
+  function connHint(status) {
+    if (!(queueBusy() || state.modelLoading)) return;
+    if (state.modelLoading) {
+      if (status) $("#model-prog-status").textContent = status;
+      return;
+    }
+    if (status) logLine("… " + status);
   }
 
   // ════ Signature：真实波形 + 播放 + 分段标注（Suno 式）════
@@ -273,7 +601,11 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
     return -1;
   }
 
-  async function renderResult(segments) {
+  // audioFile：**产生这批 segments 的那一次任务**的文件（File/Blob）。
+  // 旧实现从全局 picked 取音频 → 转录期间换选文件后，结果会把 A 的字幕配上
+  // B 的波形/音轨（或因为 B 不是 Blob 而彻底没有播放）——「拖入新视频把
+  // 前端显示的视频替换/清除」即此。现在由调用方把任务的文件显式传进来。
+  async function renderResult(segments, audioFile) {
     $("#result").hidden = false;
     state.curSegs = segments;
     state.speakerNames = {};                 // 新结果 → 说话者名称重置
@@ -287,7 +619,7 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
     state.selRange = null;                     // 新结果 → 片段选中态重置
     cleanupAudio();
 
-    const file = picked && (picked.file || (picked instanceof Blob ? picked : null));
+    const file = (audioFile instanceof Blob) ? audioFile : null;
     let peaks = null;
     waveDur = segments.length ? segments[segments.length - 1].end : 0;
 
@@ -1733,7 +2065,8 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
         try {
           const r = await API.loadHistory(it.name);
           if (r && r.ok && (r.segments || []).length) {
-            renderResult(r.segments);
+            focusedJob = null;                // 历史字幕不属于任何队列任务
+            renderResult(r.segments, null);   // 历史字幕没有对应音频 → 不带播放源
             $("#btn-open-dir").disabled = false;
             $("#btn-save-sub").disabled = false;
             logLine("✓ " + T("file.historyLoaded", "已载入历史字幕：") + it.name);
@@ -1900,14 +2233,16 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
     const t1 = Math.max(t0 + 0.5, state.REC.segEndElapsed || recElapsed());
     if (state.REC.on) startSeg(); else teardownRec();    // 先续录，避免上传期间漏话
     if (ok) {
-      try {
+      // 串行 + 等队列空闲后再发（录音分段不能丢，也不能与队列任务抢识别 gate）
+      recTxChain = recTxChain.then(async () => {
         const file = new File([blob], "recording.webm", { type: blob.type });
         const recLang = $("#rec-lang") ? $("#rec-lang").value : "";
+        await waitQueueIdle();
         const res = await API.transcribe({ file, language: recLang || null, diarize: false, align: false });
         (res.segments || []).forEach(s => {
           if (s.text && s.text.trim()) appendRecLine(s.text.trim(), t0, t1);
         });
-      } catch (err) { recNote(T("record.recFailed", "识别失败：") + (err.message || err), true); }
+      }).catch(err => recNote(T("record.recFailed", "识别失败：") + (err.message || err), true));
     }
   }
   function monitor() {
@@ -2020,10 +2355,26 @@ export function boot() {
     if (native) setFile(native);
     else hiddenFile.click();
   });
-  hiddenFile.addEventListener("change", e => { if (e.target.files[0]) setFile(e.target.files[0]); });
+  hiddenFile.addEventListener("change", e => {
+    const fs = Array.from(e.target.files || []);
+    if (!fs.length) return;
+    // 单文件 → 先选后开始（可先调语言/分离等选项）；多文件 → 直接批量入队
+    if (fs.length === 1) setFile(fs[0]);
+    else enqueueFiles(fs);
+    hiddenFile.value = "";
+  });
   ["dragover", "dragenter"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("hot"); }));
   ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("hot"); }));
-  drop.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f) setFile(f); });
+  // 拖入（单个或多个）→ 直接入队：不再顶掉当前正在看的结果/正在跑的任务
+  drop.addEventListener("drop", e => {
+    const fs = Array.from(e.dataTransfer.files || []).filter(f => f instanceof Blob);
+    if (fs.length) enqueueFiles(fs);
+  });
+  // 页面级兜底：拖到 #drop 之外时，浏览器默认会「打开」被拖入的文件 ——
+  // WebView2 会整页导航到那个视频/音频，前端界面直接被替换掉（反馈现象）。
+  // 一律吞掉默认行为；真正的落点在 #drop / 队列面板自己的监听里处理。
+  ["dragover", "dragenter", "drop"].forEach(ev =>
+    window.addEventListener(ev, e => { e.preventDefault(); }, false));
 
   // 读入 TXT：浏览器沙箱用隐藏 <input type=file> + FileReader 读文字进提示框
   const _txtInput = document.createElement("input");
@@ -2037,64 +2388,61 @@ export function boot() {
     _txtInput.value = "";
   });
   $("#btn-load-txt").addEventListener("click", () => _txtInput.click());
-  // 取消按钮：仅转录进行中可见；点击即禁用并改「正在取消…」，通知后端 /api/cancel
-  $("#btn-cancel-tx") && $("#btn-cancel-tx").addEventListener("click", () => {
+  // 取消按钮：仅运行中显示（显隐由 renderQueue 控制）；取消队列里当前跑的那个
+  $("#btn-cancel-tx") && $("#btn-cancel-tx").addEventListener("click", async () => {
+    const cur = queueJobs.find(j => j.state === "running");
+    if (!cur) return;
     const cancelBtn = $("#btn-cancel-tx");
     cancelBtn.disabled = true;
     cancelBtn.textContent = T("tx.cancelling", "正在取消…");
-    API.cancel();
+    try { await API.queueCancel(cur.id); } catch (e) {}
+    refreshQueue();
   });
+  // 「开始转换」= 把当前选中文件入队（空闲自动开跑、运行中排队）。
+  // 结果不再由这里的 await 返回，而是经 SSE event=queue 回到 onQueueEvent。
   $("#btn-run").addEventListener("click", async () => {
-    if (!picked || running) return;
-    running = true; state.switchBusy = true;    // 转录中 → 模型页切换禁用
-    const btn = $("#btn-run");
-    const cancelBtn = $("#btn-cancel-tx");
-    btn.disabled = true; btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>${T("file.running", "识别中…")}`;
-    if (cancelBtn) { cancelBtn.hidden = false; cancelBtn.disabled = false; cancelBtn.textContent = T("tx.cancel", "取消转换"); }
-    $("#result").hidden = true;
-    showProgress(0, T("file.preparing", "准备中…"));
-    logLine("▶ " + T("file.logStart", "开始转换：") + picked.name);
+    if (!picked || enqueuing) return;
+    const file = (picked.file instanceof Blob) ? picked.file
+                 : (picked instanceof Blob ? picked : null);
+    if (!file) {
+      logLine("✕ " + T("file.needBlob", "该条目没有可上传的音频，请重新选择文件"));
+      return;
+    }
+    const name = picked.name || file.name || "audio";
     try {
-      const res = await API.transcribe({
-        path: picked.path, file: picked.file || picked,
-        language: $("#sel-lang").value || null,
-        diarize: $("#sw-diar").checked,
-        nSpeakers: $("#sel-spk").value,
-        align: $("#sw-align").checked,
-        hint: $("#hint-box").value.trim(),
-      });
-      renderResult(res.segments);
-      logLine("✓ " + T("file.logDone", "完成，共 {n} 段", { n: res.segments.length })
-        + (res.srtPath ? T("file.logSaved", "，已输出 ") + res.srtPath : ""));
-      $("#btn-open-dir").disabled = false;
-      $("#btn-save-sub").disabled = false;
-      renderHistory();
-    } catch (err) {
-      showProgress(0, "");
-      $("#progress").hidden = true;
-      const msg = err && err.message ? err.message : String(err);
-      if (/已取消|cancel/i.test(msg)) {
-        // 用户主动取消 → 中性提示，不当错误弹窗处理
-        logLine("ℹ " + T("tx.cancelled", "已取消"));
-      } else {
-        logLine("✕ " + msg);
-      }
-    } finally {
-      running = false; state.switchBusy = false;
-      btn.disabled = false;
-      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>${T("file.run", "开始转换")}`;
-      if (cancelBtn) cancelBtn.hidden = true;    // 完成/失败/取消后一律隐藏
+      await enqueueFile(file);
+      logLine("▶ " + T("file.logStart", "开始转换：") + name);
+      setFile(null);          // 已进队列 → 清空待选 chip（队列面板才是真相）
+    } catch (e) {
+      // enqueueFile 已把错误写进日志；保留 picked 方便重试
     }
   });
 
-  // 进度分派：模型就地加载中 → 模型页进度；批量执行中 → 当前任务列；否则 → 单文件进度条
-  API.on("progress", ({ pct, status }) => {
+  // 进度分派：模型就地加载 → 模型页；队列任务 → 对应队列行（唯一进度显示）。
+  // 无 jobId 的进度（上传中/录制等）不画全局条——上传进度改由队列面板的
+  // 「上传中…」行表示，避免与队列行重复。
+  API.on("progress", ({ pct, status, jobId }) => {
     if (pct < 0) { connHint(status); return; }   // SSE 断线/恢复提示（桥接层自动重连）
-    if (state.modelLoading) {
-      setModelProg(pct, status);
-    } else {
-      showProgress(pct, status);
-    }
+    if (state.modelLoading) { setModelProg(pct, status); return; }
+    if (!jobId) return;
+    const j = queueJobs.find(x => x.id === jobId);
+    if (j && !j.cancelling) { j.pct = pct; j.status = status || ""; }
+    patchQueueProgress(jobId, pct, status);
+  });
+  // 队列：启动先对账一次（刷新回来可能处于暂停态），再订阅增量事件
+  refreshQueue();
+  API.on("queue", onQueueEvent);
+  $("#queue-resume") && $("#queue-resume").addEventListener("click", async () => {
+    try {
+      const r = await API.queueResume();
+      if (r && r.queue) applyQueueSnapshot(r.queue); else refreshQueue();
+    } catch (e) {}
+  });
+  $("#queue-clear") && $("#queue-clear").addEventListener("click", async () => {
+    try {
+      const r = await API.queueClearFinished();
+      if (r && r.queue) applyQueueSnapshot(r.queue); else refreshQueue();
+    } catch (e) {}
   });
   // 文档级快捷键：Ctrl+Z 撤销、Ctrl+Y / Ctrl+Shift+Z 重做；仅在已渲染结果时生效；
   // 编辑器输入中（contenteditable）放行浏览器默认的文本撤销。
@@ -2262,7 +2610,7 @@ export function boot() {
   // 事件处理（原生 MessageBox），这里不注册，避免确认后二次弹窗。
   if (!new URLSearchParams(location.search).has("native")) {
     window.addEventListener("beforeunload", (e) => {
-      const busy = running || state.REC.on || state.modelLoading;
+      const busy = queueBusy() || state.REC.on || state.modelLoading;
       if (busy) { e.preventDefault(); e.returnValue = ""; }
     });
   }

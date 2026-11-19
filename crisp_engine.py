@@ -67,15 +67,33 @@ _PROC_STALL_TIMEOUT_SECS = 180
 # 默认 crispasr 目录与模型文件名
 _DEFAULT_CRISPASR_DIR = BASE_DIR / "crispasr"
 _DEFAULT_MODEL_NAME   = "ggml-base.bin"   # OpenAI Whisper Base（ggerganov/whisper.cpp）
-# qwen3 ForcedAligner GGUF（FA 对齐器）文件名样式，置于 crispasr_dir 同层
+# qwen3 ForcedAligner GGUF（FA 对齐器）文件名样式；与 app.py 的 _DEFAULT_MODEL_DIR
+# 同口径放在模型目录，crispasr_dir 只作旧版兼容备援（issue #7）。
 _ALIGNER_GLOB = "qwen3-forced-aligner-0.6b-*.gguf"
+_DEFAULT_OV_MODEL_DIR = BASE_DIR / "ov_models"
 
 
-def _find_aligner_gguf(crispasr_dir: Path) -> Path | None:
-    """在 crispasr 目录查找 qwen3 ForcedAligner GGUF（取第一个符合者）。"""
-    for g in sorted(crispasr_dir.glob(_ALIGNER_GLOB)):
-        if g.is_file():
-            return g
+def _find_aligner_gguf(*dirs: Path) -> Path | None:
+    """依序在给定目录查找 qwen3 ForcedAligner GGUF（取第一个符合者）。
+
+    调用端给的顺序是「模型目录 → crispasr 目录」：新版下载到模型目录，
+    旧版留在核心目录的档仍能找到，不必重新下载。
+    """
+    seen: set[str] = set()
+    for d in dirs:
+        if not d:
+            continue
+        d = Path(d)
+        try:
+            key = str(d.resolve())
+        except OSError:
+            key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        for g in sorted(d.glob(_ALIGNER_GLOB)):
+            if g.is_file():
+                return g
     return None
 
 
@@ -311,7 +329,8 @@ class CrispWhisperEngine:
              cpu_threads: int = 0):
         """验证 crispasr.exe 与模型存在即可（子程序模式无常驻加载）。
 
-        aligner_path：qwen3 ForcedAligner GGUF；None 时自动在 crispasr_dir 内查找。
+        aligner_path：qwen3 ForcedAligner GGUF；None 时自动在模型目录（ov_models）
+        与 crispasr_dir 内查找（模型目录优先）。
         找到 → 启用 FA（process_file 加 `-am <gguf> -falign`）；找不到 → 退回
         whisper native 时间轴。
 
@@ -360,7 +379,8 @@ class CrispWhisperEngine:
         if self._fa_blocked:
             _s("此模型原生输出繁体，与 CTC 对齐器不兼容 → 禁用字级对齐，"
                "改用后端自带时间轴")
-        ap = Path(aligner_path) if aligner_path else _find_aligner_gguf(crispasr_dir)
+        ap = (Path(aligner_path) if aligner_path
+              else _find_aligner_gguf(_DEFAULT_OV_MODEL_DIR, crispasr_dir))
         if ap and ap.exists() and not self._fa_blocked:
             self._aligner_path = ap
             self._fa_bin   = ap          # 真值＝FA 就绪

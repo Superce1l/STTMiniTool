@@ -56,6 +56,10 @@ class TestTaskQueue(_QCase):
         wait_until(lambda: len(done) == 3, msg="not all jobs finished")
         self.assertEqual(done, ["a", "b", "c"])           # 严格 FIFO
         for jid in (ja, jb, jc):
+            # 终态事件在任务体返回之后才发：先等到事件到齐再断言（原写法靠
+            # 时序运气，加锁/暂停钩子后会偶发只看到 queued+started）。
+            wait_until(lambda j=jid: len(self._events_for(j)) >= 3,
+                       msg=f"events incomplete for {jid}")
             self.assertEqual(self._events_for(jid),
                              ["queued", "started", "finished"])
 
@@ -115,6 +119,28 @@ class TestTaskQueue(_QCase):
         wait_until(lambda: bool(seen), msg="job not finished")
         self.assertEqual(seen, [True])            # 协作式取消信号送达
 
+    def test_cancel_running_marks_cancelling_immediately(self):
+        """取消要立刻可见：先出 cancelling 事件 + 快照置位，终态再收尾。"""
+        hold = threading.Event()
+
+        def stubborn(ce):
+            hold.wait(timeout=5)      # 故意不理会 cancel_event，保持 running
+            return "done"
+
+        jid = self.q.submit(stubborn, label="stubborn")
+        wait_until(lambda: self.q.current_id() == jid, msg="not running")
+        self.assertTrue(self.q.cancel(jid))
+        wait_until(lambda: "cancelling" in self._events_for(jid),
+                   msg="no cancelling event")
+        snap = {j["id"]: j for j in self.q.status()}[jid]
+        self.assertTrue(snap["cancelling"])
+        self.assertEqual(snap["status"], "正在取消…")
+
+        hold.set()
+        wait_until(lambda: {j["id"]: j for j in self.q.status()}[jid]["state"] == "finished")
+        snap = {j["id"]: j for j in self.q.status()}[jid]
+        self.assertFalse(snap["cancelling"])       # 终态清掉标记
+
     def test_queue_full_rejects(self):
         gate = threading.Event()
         q2 = TaskQueue(maxsize=1)
@@ -143,6 +169,97 @@ class TestTaskQueue(_QCase):
                    msg="worker thread did not exit")
         with self.assertRaisesRegex(RuntimeError, "已关闭"):
             self.q.submit(lambda ce: "x")          # 关闭后拒绝新任务
+
+
+class TestTaskQueuePause(_QCase):
+    """暂停/恢复语义：刷新/断连=暂停运行中、保留排队（issue 反馈拍板）。"""
+
+    def _states(self):
+        return {j["id"]: j["state"] for j in self.q.status()}
+
+    def test_pause_marks_running_paused_and_blocks_dispatch(self):
+        gate = threading.Event()
+        ran, lk = [], threading.Lock()
+
+        def blocker(ce):
+            gate.wait(timeout=5)
+            return "first"
+
+        def second(ce):
+            with_lock(lk, ran.append, "second")
+            return "second"
+
+        ja = self.q.submit(blocker, label="first")
+        self.q.submit(second, label="second")
+        wait_until(lambda: self.q.current_id() == ja, msg="first not started")
+
+        self.assertEqual(self.q.pause(), ja)      # 返回被暂停的运行中任务
+        self.assertTrue(self.q.is_paused())
+        gate.set()                                # 让运行中的任务收尾
+        wait_until(lambda: self._states()[ja] == "paused", msg="not paused")
+        self.assertEqual(self._events_for(ja)[-1], "paused")
+
+        time.sleep(0.3)                           # 暂停期间不能再启动下一个
+        self.assertEqual(ran, [])
+        self.assertEqual(self._states()[ja], "paused")
+
+    def test_resume_runs_paused_job_before_queued_ones(self):
+        gate = threading.Event()
+        order, lk = [], threading.Lock()
+        attempts = {"n": 0}
+
+        def first(ce):
+            attempts["n"] += 1
+            gate.wait(timeout=5)          # 第一次被 pause 打断，第二次才是正跑
+            if attempts["n"] > 1:
+                with_lock(lk, order.append, "first")
+            return "first"
+
+        def second(ce):
+            with_lock(lk, order.append, "second")
+            return "second"
+
+        ja = self.q.submit(first, label="first")
+        jb = self.q.submit(second, label="second")
+        wait_until(lambda: self.q.current_id() == ja)
+        self.q.pause()
+        gate.set()
+        wait_until(lambda: self._states()[ja] == "paused")
+
+        self.assertEqual(self.q.resume(), 1)      # 只有一个被暂停的任务
+        wait_until(lambda: self._states()[jb] == "finished", msg="queue did not resume")
+        self.assertEqual(self._states()[ja], "finished")
+        self.assertEqual(order, ["first", "second"])   # 恢复的排在原队列之前
+        self.assertFalse(self.q.is_paused())
+
+    def test_cancel_paused_job_drops_it(self):
+        gate = threading.Event()
+        ja = self.q.submit(lambda ce: (gate.wait(timeout=5), "a")[1], label="a")
+        self.q.submit(lambda ce: "b", label="b")
+        wait_until(lambda: self.q.current_id() == ja)
+        self.q.pause()
+        gate.set()
+        wait_until(lambda: self._states()[ja] == "paused")
+        self.assertTrue(self.q.cancel(ja))
+        self.assertEqual(self._states()[ja], "cancelled")
+        self.assertEqual(self.q.resume(), 0)      # 被取消的不会回到队列
+
+    def test_meta_and_progress_snapshot(self):
+        jid = self.q.submit(lambda ce: "x", label="job",
+                            meta={"name": "clip.mp4", "size": 123})
+        self.q.update_progress(jid, 42, "识别中")
+        snap = {j["id"]: j for j in self.q.status()}[jid]
+        self.assertEqual(snap["meta"]["name"], "clip.mp4")
+        self.assertEqual(snap["meta"]["size"], 123)
+        self.assertEqual(snap["pct"], 42)
+        self.assertEqual(snap["status"], "识别中")
+        json.dumps([snap], ensure_ascii=False)     # 仍可序列化
+
+    def test_job_result_available_after_finish(self):
+        jid = self.q.submit(lambda ce: {"segments": [1, 2]}, label="r")
+        wait_until(lambda: self._states()[jid] == "finished")
+        self.assertEqual(self.q.job_result(jid), {"segments": [1, 2]})
+        self.assertIsNone(self.q.job_result("nope"))
 
 
 def with_lock(lk, fn, *a):

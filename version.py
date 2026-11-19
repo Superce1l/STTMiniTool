@@ -9,12 +9,37 @@
 """
 from __future__ import annotations
 
-__version__ = "2.3.1"
+__version__ = "2.4.0"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.4.0 更新汇总（发行整理：核心不捆绑 + 双格式发行 + 对齐器归位）──────────
+#   模型：qwen3 ForcedAligner GGUF（q5 约 643MB）改放**模型目录**（默认 ov_models/），
+#         与 Whisper／Qwen3-ASR 等模型同层；不再写进 crispasr/ 核心目录——换加速
+#         版本或升版时该目录的 exe/dll 会先被清掉，「卸载重装保留配置」也容易
+#         把这个大档误删（issue #7 第 1 点）。旧位置已下载的档仍照用
+#         （downloader.find_aligner_gguf 兼容），不逼使用者重下 643MB。
+#   发行：CrispASR 核心不再随包附带。首次使用（选 GPU 核心并加载模型）时向
+#         GitHub 取**最新 release** 的对应加速版本 zip 解压到 crispasr/，版本永远
+#         跟得上上游（issue #7：同捆 0.8.53、上游已 0.8.54，一联网即判「版本不符
+#         → 重新下载」）。硬件检测本来就走 OS 查询，没有本地核心也能推荐版本。
+#   发行：一次构建产出**两种包**——onedir（EXE + _internal/，零解压、启动快、
+#         不留临时垃圾）与 onefile（单一 EXE，每次启动解压到 %TEMP%）；各出一个
+#         zip，用户按需自选。构建脚本共用同一份 PyInstaller 参数，两个包不会漂移。
+#   队列：任务输入与结果落盘持久化（queue-spool/ 未完成、queue-archive/ 终态）——
+#         刷新/关窗/重启后已完成任务仍可查看并回放原音轨，未完成任务恢复排队；
+#         失败/取消可一键重试（复用归档输入）；排队顺序可拖动调整；/api/transcribe
+#         也走队列（隐藏任务），录音分段不再撞「已有识别任务进行中」。
+#   队列：转录改走任务队列（transcription_queue.TaskQueue）——拖入的文件只入队，
+#         不再顶替当前展示的结果/正在跑的任务；空闲自动跑、运行中排队；音频页
+#         显示队列（状态/进度/取消/查看/清空已完成）。结果与文件按任务绑定
+#         （renderResult(segments, file)），修掉「运行中拖入新文件 → 结果被换成
+#         新文件的音轨/播放被清空」与「拖入页面空白处 → WebView 导航到该视频、
+#         前端被替换」两个问题。刷新/断连 → 暂停（运行中转 paused、排队保留，
+#         点「继续」接着跑）；关窗 → 退出并清空（含输入暂存 queue-spool/）。
 
 # ── 2.3.1 更新汇总（双开稳定 + 长视频不再误报「请求超时」）──────────────────
 #   超时：前端原先把「上传 + 转录」硬限 30 分钟（bridge.js

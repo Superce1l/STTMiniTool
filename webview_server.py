@@ -30,7 +30,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from webview_backend import WebBackend
 
@@ -254,6 +254,11 @@ class _EventHub:
         with self._lock:
             self._subs.discard(q)
 
+    def count(self) -> int:
+        """当前 SSE 订阅者数量（「页面是否还连着」的判据）。"""
+        with self._lock:
+            return len(self._subs)
+
     def publish(self, event: str, payload: dict):
         msg = {"event": event, "payload": payload}
         with self._lock:
@@ -363,6 +368,20 @@ class WebViewServer:
                     return self._json(server.backend.list_history())
                 if path == "/api/queue":          # 批量转录队列快照
                     return self._json(server.backend.queue_status())
+                if path == "/api/queue-result":   # 队列任务结果（内存/归档）
+                    qs = parse_qs(urlparse(self.path).query)
+                    jid = (qs.get("id") or [""])[0]
+                    res = server.backend.queue_result(jid)
+                    if res is None:
+                        return self._err(404, "结果不存在或已过期")
+                    return self._json(res)
+                if path == "/api/queue-audio":    # 任务输入音轨（刷新/重启后回放）
+                    qs = parse_qs(urlparse(self.path).query)
+                    jid = (qs.get("id") or [""])[0]
+                    p = server.backend.queue_audio_path(jid)
+                    if not p or not Path(p).is_file():
+                        return self._err(404, "音轨不存在或已清理")
+                    return self._send_media(Path(p))
                 if path == "/api/events":
                     return self._sse()
                 if path.startswith("/api/"):
@@ -405,6 +424,26 @@ class WebViewServer:
                         body = self._read_json_body()
                         return self._json({"ok": server.backend.cancel_job(
                             str(body.get("id", "")))})
+                    if path == "/api/enqueue":        # 上传并排队（立即返回 job_id）
+                        return self._enqueue()
+                    if path == "/api/queue-clear":    # 清空已结束的列表项
+                        return self._json(server.backend.queue_clear_finished())
+                    if path == "/api/queue-retry":    # 失败/取消任务重新排队
+                        body = self._read_json_body()
+                        return self._json(server.backend.queue_retry(
+                            str(body.get("id", ""))))
+                    if path == "/api/queue-reorder":  # 拖动排序（仅排队中）
+                        body = self._read_json_body()
+                        return self._json(server.backend.queue_reorder(
+                            str(body.get("id", "")),
+                            str(body.get("before", "")) or None))
+                    if path == "/api/queue-pause":    # 暂停队列（刷新/断连）
+                        return self._json({"ok": server.backend.queue_pause(),
+                                           "queue": server.backend.queue_status()})
+                    if path == "/api/queue-resume":   # 继续队列
+                        r = server.backend.queue_resume()
+                        r["queue"] = server.backend.queue_status()
+                        return self._json(r)
                     if path == "/api/record-state":   # 录音开始/结束 → 后端同步（关窗确认用）
                         body = self._read_json_body()
                         server.backend.set_recording(bool(body.get("on")))
@@ -440,6 +479,11 @@ class WebViewServer:
                     except Exception:
                         pass
                     try:
+                        # 关窗=退出并清空：取消队列、删暂存与结果缓存
+                        server.backend.close_queue()
+                    except Exception:
+                        pass
+                    try:
                         server.stop()
                     except Exception:
                         pass
@@ -467,6 +511,47 @@ class WebViewServer:
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(data)
+
+            # ── 音轨回放（支持 Range：<audio> 拖动进度条要 206）──────────
+            def _send_media(self, target: Path):
+                import mimetypes
+                size = target.stat().st_size
+                ctype = (mimetypes.guess_type(target.name)[0]
+                         or _CONTENT_TYPES.get(target.suffix.lower())
+                         or "application/octet-stream")
+                start, end, status = 0, size - 1, 200
+                rng = self.headers.get("Range", "")
+                if rng.startswith("bytes="):
+                    try:
+                        a, _, b = rng[6:].partition("-")
+                        start = int(a) if a else 0
+                        end = int(b) if b else size - 1
+                        start = max(0, min(start, size - 1))
+                        end = max(start, min(end, size - 1))
+                        status = 206
+                    except ValueError:
+                        start, end, status = 0, size - 1, 200
+                length = end - start + 1
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "no-cache")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                with open(target, "rb") as f:
+                    f.seek(start)
+                    remain = length
+                    while remain > 0:
+                        chunk = f.read(min(262144, remain))
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                        remain -= len(chunk)
 
             # ── SSE 进度/状态流式 ─────────────────────────────
             def _sse(self):
@@ -497,6 +582,55 @@ class WebViewServer:
                     pass
                 finally:
                     server.hub.unsubscribe(q)
+                    # 页面断开（刷新/关标签）→ 暂停队列：运行中的转 paused、
+                    # 排队的保留（「刷新/断连=暂停、关窗=清空」的拍板语义）。
+                    # 只有「最后一个页面连接」断开才算页面走了——否则多开一个
+                    # 标签页/调试端口连一下再关，就会把正在跑的任务误暂停。
+                    if server.hub.count() == 0:
+                        server.backend.queue_on_client_gone()
+
+            # ── 上传并排队（multipart → job spool，立即返回 job_id）──────
+            #   与 /api/transcribe 的区别：请求不必等转录完成（几分钟级），
+            #   因此也不会因「前端请求超时/断开」而误杀任务；文件搬进
+            #   queue-spool/<job_id>/ 由 worker 异步读取，任务终态即清理。
+            def _enqueue(self):
+                ctype = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in ctype or "boundary=" not in ctype:
+                    return self._err(400, "需以 multipart/form-data 上传 file")
+                boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
+                try:
+                    n = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    return self._err(400, "缺少 Content-Length")
+                if n <= 0:
+                    return self._err(400, "请求体为空")
+                if n > _MAX_UPLOAD_BYTES:
+                    return self._err(413, f"文件过大：上限 "
+                                          f"{_MAX_UPLOAD_BYTES // (1024 ** 3)} GB")
+
+                tmp_dir = Path(tempfile.mkdtemp(prefix="asr_enq_"))
+                try:
+                    fields, files = _parse_multipart_stream(
+                        self.rfile, boundary, tmp_dir, n)
+                    if "file" not in files:
+                        return self._err(400, "缺少 file 部件")
+                    filename, in_path = files["file"]
+                    if not in_path.is_file() or in_path.stat().st_size == 0:
+                        return self._err(400, "file 内容为空")
+                    try:
+                        jid = server.backend.enqueue_from_upload(in_path, filename, fields)
+                    except RuntimeError as e:      # 队列已满 / 已关闭
+                        return self._err(429, str(e))
+                    except Exception as e:
+                        from applog import log_error
+                        log_error(f"入队失败：{filename}", exc=e)
+                        head = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+                        return self._err(500, head)
+                    return self._json({"ok": True, "jobId": jid,
+                                       "queue": server.backend.queue_status()})
+                finally:
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
 
             # ── 转录（multipart 上传，流式落盘）────────────────
             def _transcribe(self):
@@ -532,12 +666,18 @@ class WebViewServer:
                     # 即断，但本线程还阻塞在 backend.transcribe 里。立刻取消，
                     # 避免「界面已报错、后端还在烧 GPU」跑完整档（反馈 #4/#5）。
                     # 取消走既有链路：_cancel + 引擎 cancel_event。
-                    def _watch_client(_conn=self.connection, _name=filename):
+                    job_box: dict = {}
+                    def _watch_client(_conn=self.connection, _name=filename,
+                                      _box=job_box):
                         while not done.wait(1.0):
                             if not _client_disconnected(_conn):
                                 continue
                             try:
-                                server.backend.cancel()
+                                jid = _box.get("jid")
+                                if jid:
+                                    server.backend.cancel_job(jid)
+                                else:
+                                    server.backend.cancel()
                             except Exception:
                                 pass
                             try:
@@ -560,9 +700,12 @@ class WebViewServer:
                         "hint": fields.get("hint", ""),
                     }
                     try:
-                        result = server.backend.transcribe(
+                        # 同步转录也走队列：与批量任务串行，避免「已有识别任务
+                        # 进行中」把录音分段丢掉（任务标记 hidden，不进面板/归档）。
+                        result = server.backend.transcribe_via_queue(
                             opts, progress_cb=lambda pct, status:
-                            server.hub.publish("progress", {"pct": pct, "status": status}))
+                            server.hub.publish("progress", {"pct": pct, "status": status}),
+                            on_job=lambda jid: job_box.__setitem__("jid", jid))
                     except Exception as e:
                         from applog import log_error
                         log_error(f"转录失败：{filename}", exc=e)
