@@ -123,10 +123,11 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
   }
 
   // ── 录制页实时识别延迟提示 ──────────────────────────────
-  // 依据实测（GTX 1660 SUPER / 0.8.53）：CrispASR 每段转录的进程固定开销
-  // （Vulkan init + 模型上显存）约 2-3s，占实时出字延迟 ~90%；whisper base
-  // 固定开销约 0.5s；OpenVINO 为进程内推理、无冷启动。详见
-  // crisp_engine.transcribe docstring 与 docs/upstream-feature-request-crispasr.md。
+  // 依据实测（GTX 1660 SUPER / 核心 0.8.54）：CrispASR 逐段 spawn 的固定开销
+  // （设备初始化 + 模型上显存）whisper base ≈0.6s、qwen3 Q8 ≈2.35s；
+  // 现在录音期间改用常驻 `--server`（模型只加载一次），单段实测 ≈0.2s，
+  // 出字延迟主要剩推理本身。OpenVINO 为进程内推理、无冷启动。
+  // 实现见 crisp_engine._CrispServer / transcribe_realtime。
   let _recLatencyClosed = false;
   async function updateRecLatencyHint(status) {
     if (state.curView !== "record" || _recLatencyClosed) return;
@@ -2271,7 +2272,9 @@ const API = window.QwenAPI;                    // 经典脚本 bridge.js 的全�
         const file = new File([blob], "recording.webm", { type: blob.type });
         const recLang = $("#rec-lang") ? $("#rec-lang").value : "";
         await waitQueueIdle();
-        const res = await API.transcribe({ file, language: recLang || null, diarize: false, align: false });
+        // realtime：逐段上传走常驻识别（模型只加载一次），免每段重新上显存
+        const res = await API.transcribe({ file, language: recLang || null, diarize: false,
+                                           align: false, realtime: true });
         (res.segments || []).forEach(s => {
           if (s.text && s.text.trim()) appendRecLine(s.text.trim(), t0, t1);
         });

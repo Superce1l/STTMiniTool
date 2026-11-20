@@ -9,12 +9,31 @@
 """
 from __future__ import annotations
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 # WebView 版独立版本字符串（与 __version__ 同值）。
 # 显示于 WebView 设置页的版本徽章；保留常数名是为了不动既有引用
 # （webview_backend._app_version / setting.py 版本徽章）。
 WEBVIEW_VERSION = __version__
+
+# ── 2.4.2 更新汇总（录音实时出字：常驻识别，免每段重载模型）──────────────────
+#   录音：CrispASR 逐段上传改走常驻 `crispasr --server`（仅绑 127.0.0.1、端口
+#         动态分配）。旧路径每段 spawn 一次、模型每次重新上显存，固定开销占实时
+#         出字延迟 ~90%；常驻后模型只载一次，实测单段 2.35s → 0.17–0.23s
+#         （whisper base 温请求）。qwen3 Q8 冷启动 ~17s 只在开录时付一次（已用
+#         预热线程在录音开始时提前付）。上游核心不带 --server 时自动退回逐段
+#         spawn，行为与旧版一致，不丢字。
+#   显存：开录预热、停录后宽限 20 秒再停（收尾段还要上传，立即杀会让最后一句
+#         重新冷启动）；换模型／批量转录前立即释放——避免常驻模型与批量任务的
+#         一次性进程各占一份显存（4GB 卡会 OOM）。
+#   产物：实时分段不再往 subtitles/ 每段落一个字幕文件；时间轴由录音时钟给出，
+#         分段上传也不必先过 ffmpeg 抽音轨（crispasr 自己解 webm/ogg）。
+#   文档：删除两份失效文件——requirements-gpu.txt（只剩「已删除」说明的空壳，
+#         内容在 requirements.txt 尾部注释已有）与 docs/upstream-feature-request-
+#         crispasr.md（其「上游没有 server 模式／无 C ABI」的前提经 0.8.54 实测
+#         证伪：--server、--ws-port、include/crispasr.h 都在）。
+#   测试：新增 22 例（切句/请求字段/服务失败回退/启动失败不自锁死/宽限释放/
+#         编排层不落产物），本机全套 186 例。
 
 # ── 2.4.1 更新汇总（断行与等待提示：对齐上游 2.0.1 / 2.1.0 的近期修正）────────
 #   断行：中英混排不再逐字加空格——旧实现只要行内有任一拉丁词就整行 join，

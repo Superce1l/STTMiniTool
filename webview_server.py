@@ -697,6 +697,10 @@ class WebViewServer:
                         "diarize": (fields.get("diarize", "") or "").lower() in ("1", "true", "on", "yes"),
                         "nSpeakers": fields.get("n_speakers", ""),
                         "align": (fields.get("align", "1") or "").lower() in ("1", "true", "on", "yes"),
+                        # 录音页逐段上传：走引擎常驻服务、不落字幕文件（见
+                        # transcription_service.transcribe 的 realtime 分支）
+                        "realtime": (fields.get("realtime", "") or "").lower()
+                                    in ("1", "true", "on", "yes"),
                         "hint": fields.get("hint", ""),
                     }
                     try:

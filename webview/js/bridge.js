@@ -364,6 +364,9 @@
     fd.append("diarize", opts.diarize ? "1" : "0");
     if (opts.nSpeakers && opts.nSpeakers !== "auto") fd.append("n_speakers", String(opts.nSpeakers));
     if (opts.hint) fd.append("hint", opts.hint);
+    // 录音页逐段上传：后端据此走常驻识别服务（模型只加载一次），
+    // 并跳过「每段落一个字幕文件」的产物路径
+    if (opts.realtime) fd.append("realtime", "1");
     emit("progress", { pct: 3, status: tr("file.uploading", "上传中…") });
     // 上传 + 转录是分钟级长任务（进度经 SSE 推送）；不发固定分钟数上限，
     // 见 TRANSCRIBE_TIMEOUT_MS 处的说明。

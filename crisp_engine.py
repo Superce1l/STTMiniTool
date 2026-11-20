@@ -25,13 +25,20 @@ ASREngine[OpenVINO] 并列），用来加载 Whisper
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +65,15 @@ _STARTUP_INFO: "subprocess.STARTUPINFO | None" = startup_info()
 _RT_PROC_TIMEOUT_SECS = 600
 # 流式模式收尾宽限：正常退出等待上限（秒）；超时强杀。
 _PROC_SHUTDOWN_GRACE_SECS = 30
+# 实时分段：常驻 server（crispasr --server）的三条时间线。
+# 启动上限给足：首次要加载模型上显存（qwen3 Q8 2.5GB），慢盘/小显存机器
+# 可能十几秒；超时即判失败，本进程后续改走一次性 spawn，不再反复等待。
+_SERVER_START_TIMEOUT_SECS = 180.0
+# 单段请求上限（录音段通常 1–30s；推理本身 ~0.2s，余量给解码/排队）。
+_SERVER_REQ_TIMEOUT_SECS = 300.0
+# 停服务宽限：先 terminate，超时才 kill（Vulkan 下 take 一点时间收尾）。
+_SERVER_STOP_GRACE_SECS = 5.0
+
 # 流式模式输出停滞上限（秒）：超过此时长没有任何新输出行才判挂死。
 # 注意不能太小：qwen3 后端可能先做 LID 初始化与音频扫描（几十秒无输出），
 # 且上游明确不出 progress 行（-pp 仅 whisper 后端有效），进度只能靠
@@ -272,8 +288,211 @@ def _lid_model_path(crispasr_dir: Path | None = None) -> Path | None:
     return None
 
 
+# ── 实时分段：常驻 server 的薄客户端 ──────────────────────────────────
+def _free_local_port() -> int:
+    """取一个当前空闲的本地端口（crispasr --server 绑定用）。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+# 句末标点后切行（录音页一句一行追加显示）。不切逗号，避免碎片化。
+_RT_SENT_END = re.compile(r"(?<=[。！？!?；;])\s*|(?<=[.!?])\s+")
+
+
+def _split_realtime_lines(text: str) -> list[str]:
+    """整段识别文字 → 一句一行（空行丢弃）。"""
+    t = (text or "").strip()
+    if not t:
+        return []
+    return [p.strip() for p in _RT_SENT_END.split(t) if p and p.strip()]
+
+
+def _realtime_segments_from_api(obj: dict) -> list[dict]:
+    """server 的 JSON → segments_rich（[{'start','end','text','speaker','words'}]）。
+
+    server 的 verbose_json 已带分段时间轴；没有 segments 时退回把 text 切句，
+    时间轴留 0（录音页本来就用录音时钟盖时间，不依赖后端时间轴）。
+    """
+    out: list[dict] = []
+    for s in (obj.get("segments") or []):
+        try:
+            start = float(s.get("start") or 0.0)
+            end = float(s.get("end") or 0.0)
+        except (TypeError, ValueError):
+            start = end = 0.0
+        for line in _split_realtime_lines(s.get("text") or ""):
+            out.append({"start": start, "end": end, "text": line,
+                        "speaker": None, "words": []})
+    if out:
+        return out
+    return [{"start": 0.0, "end": 0.0, "text": line, "speaker": None, "words": []}
+            for line in _split_realtime_lines(obj.get("text") or "")]
+
+
+def _warn(msg: str) -> None:
+    """尽力记日志：GUI 里走 applog；单测/CLI 无 applog 时退 stderr。"""
+    try:
+        from applog import log_warn
+        log_warn(msg)
+    except Exception:
+        print(f"[crisp_engine] {msg}", file=sys.stderr)
+
+
+class _CrispServer:
+    """crispasr.exe `--server` 常驻进程的托管（实时分段专用）。
+
+    为什么需要：录音页每说完一句就切一段上传，旧路径每段 spawn 一次
+    crispasr.exe、模型每次重新上显存。实测（GTX 1660 SUPER / 核心 0.8.54）
+    固定开销 whisper base ≈0.6s、qwen3 Q8 ≈2.35s，占出字延迟 ~90%；
+    `--server` 只在启动时加载一次模型，POST /v1/audio/transcriptions 复用，
+    单段回落到 ~0.2s（实测 0.17–0.23s）。
+
+    生命周期归引擎：录音开始按需起，录音结束宽限若干秒再停（收尾段还要
+    上传），换模型／批量转录前立即停——否则常驻模型与批量转录的一次性进程
+    会各占一份显存（4GB 卡直接 OOM）。
+    """
+
+    def __init__(self, argv: list[str], cwd: str | Path):
+        self._argv = list(argv)
+        self._cwd = str(cwd)
+        # RLock：start() 持锁等 /health，失败路径要调 stop()（同一把锁）——
+        # 用普通 Lock 会在「起不来」这条路上自锁死，恰好让退路永远走不到。
+        self._lock = threading.RLock()
+        self._proc: "subprocess.Popen[str] | None" = None
+        self._port = 0
+        self._tail: deque = deque(maxlen=80)
+
+    # ── 状态 ──
+    @property
+    def port(self) -> int:
+        return self._port
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def tail(self, n: int = 6) -> str:
+        return "　|　".join(list(self._tail)[-n:]) or "（无输出）"
+
+    # ── 子进程输出泵：只留最近几行，失败时拿来报原因 ──
+    def _pump(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            for line in proc.stdout:
+                t = line.rstrip()
+                if t:
+                    self._tail.append(t)
+        except Exception:
+            pass
+
+    # ── 启动 / 停止 ──
+    def start(self, timeout: float = _SERVER_START_TIMEOUT_SECS) -> None:
+        with self._lock:
+            if self.alive():
+                return
+            port = _free_local_port()
+            argv = self._argv + ["--server", "--host", "127.0.0.1", "--port", str(port)]
+            self._proc = subprocess.Popen(
+                argv, cwd=self._cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                bufsize=1, creationflags=_CREATE_NO_WINDOW, startupinfo=_STARTUP_INFO,
+            )
+            self._port = port
+            threading.Thread(target=self._pump, name="crispasr-server-log",
+                             daemon=True).start()
+            try:
+                self._wait_healthy(timeout)
+            except BaseException:
+                self.stop()
+                raise
+
+    def _wait_healthy(self, timeout: float) -> None:
+        """轮询 /health 直到就绪；进程提前退出/超时都带上输出尾巴报错。"""
+        deadline = time.monotonic() + max(1.0, float(timeout))
+        url = f"http://127.0.0.1:{self._port}/health"
+        while time.monotonic() < deadline:
+            if not self.alive():
+                raise RuntimeError(
+                    "crispasr --server 启动即退出（这份核心可能不带 --server，"
+                    f"或显存不足）。最后输出：{self.tail()}")
+            try:
+                with urllib.request.urlopen(url, timeout=2.0) as r:
+                    body = json.loads(r.read().decode("utf-8", "replace"))
+                if str((body or {}).get("status", "")).lower() in ("ok", "ready", "loaded"):
+                    return
+            except Exception:
+                pass
+            time.sleep(0.2)
+        raise RuntimeError(
+            f"crispasr --server 在 {timeout:.0f} 秒内未就绪"
+            f"（模型可能仍在加载或卡在初始化）。最后输出：{self.tail()}")
+
+    def transcribe_file(self, path: Path | str, fields: dict | None = None,
+                        timeout: float = _SERVER_REQ_TIMEOUT_SECS) -> dict:
+        """POST /v1/audio/transcriptions（multipart）→ 解析后的 JSON。"""
+        if not self.alive():
+            raise RuntimeError("crispasr 常驻服务已退出。")
+        path = Path(path)
+        boundary = "----sttcrisp" + uuid.uuid4().hex
+        chunks: list[bytes] = []
+        for k, v in (fields or {}).items():
+            if v is None or v == "":
+                continue
+            chunks.append(f"--{boundary}\r\n".encode())
+            chunks.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode())
+            chunks.append(str(v).encode("utf-8") + b"\r\n")
+        chunks.append(f"--{boundary}\r\n".encode())
+        # 文件名保留原扩展名（.webm 等容器由 crispasr 内部解码器判定）
+        fname = f"seg{path.suffix or '.wav'}"
+        chunks.append(
+            f'Content-Disposition: form-data; name="file"; filename="{fname}"\r\n'
+            .encode())
+        chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        chunks.append(path.read_bytes())
+        chunks.append(b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode())
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self._port}/v1/audio/transcriptions",
+            data=b"".join(chunks),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = (e.read() or b"").decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"crispasr 常驻服务返回 HTTP {e.code}：{detail or e.reason}") from None
+
+    def stop(self) -> None:
+        with self._lock:
+            proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=_SERVER_STOP_GRACE_SECS)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
 class CrispWhisperEngine:
-    """CrispASR(whisper backend) 推理引擎。子程序模式调用 crispasr.exe。"""
+    """CrispASR(whisper backend) 推理引擎。
+
+    文件转录：一次性子进程（`crispasr.exe -osrt -ml 1`，要字级时间轴与进度）。
+    实时分段：常驻 `crispasr.exe --server`（见 _CrispServer），免去每段重新
+    加载模型的固定开销；起不来时自动退回一次性子进程。
+    """
 
     # whisper_fa 做成 property：三处判定收敛一处（原先两处内联重复，改一处
     # 漏一处即「字级时间轴走没走 -am 对齐」行为分叉）。
@@ -321,6 +540,12 @@ class CrispWhisperEngine:
         self._device_id  = 0       # GPU device id
         self._gpu_backend = "vulkan"  # --gpu-backend；None＝纯 CPU（挂 -ng）
         self._threads    = _default_threads()  # crispasr -t
+        # 实时分段常驻服务（见 _CrispServer）：录音期间按需起、之后复用。
+        # server_mode=False 或核心不支持 --server 时退回一次性 spawn。
+        self.server_mode = True
+        self._srv: "_CrispServer | None" = None
+        self._srv_failed = False    # 起过一次失败就不再重试（旧核心没有 --server）
+        self._srv_lock   = threading.Lock()
 
     # ══ 加载 ══════════════════════════════════════════════════════════
 
@@ -400,6 +625,121 @@ class CrispWhisperEngine:
         _fa_tag = "  + FA" if self._aligner_path else ""
         _gpu_tag = (self._gpu_backend or "cpu").upper()
         _s(f"就绪（CrispASR / {_gpu_tag} / {self._backend}  {model_path.name}{_fa_tag}）")
+
+    # ══ 实时分段：常驻 --server（免每段重新加载模型）════════════════════
+
+    def _server_argv(self) -> list[str]:
+        """常驻 server 的启动参数（模型/后端/设备/调优与 _build_cmd 同口径）。
+
+        `--server` 后的 --host/--port 由 _CrispServer.start() 追加（端口动态取，
+        避免与其它实例/端口占用冲突）。-fa/-nf/-bo 1 是启动期解码默认值，
+        与文件转录那条命令保持同一套速度/质量取舍。
+        """
+        cmd = [str(self._exe), "-m", str(self._model_path)]
+        if self._backend and self._backend != "whisper":
+            cmd += ["--backend", self._backend]
+            # qwen3 后端的 LID 模型：显式指到本地 whisper ggml，免联网下载
+            # （详见 _build_cmd 同一位置的说明）。
+            lid = _lid_model_path(self._exe.parent) if self._exe else None
+            if lid:
+                cmd += ["--lid-model", str(lid)]
+        if self._gpu_backend:
+            cmd += ["--gpu-backend", self._gpu_backend, "-dev", str(self._device_id)]
+        else:
+            cmd += ["-ng"]
+        cmd += ["-t", str(self._threads), "-fa", "-nf", "-bo", "1"]
+        return cmd
+
+    def _ensure_server(self, timeout: float | None = None) -> "_CrispServer | None":
+        """取常驻 server（必要时启动）。失败→记一次并永久退回 spawn，返回 None。"""
+        if not getattr(self, "server_mode", True) or not self._exe or not self._model_path:
+            return None
+        with self._srv_lock:
+            if self._srv is not None and self._srv.alive():
+                return self._srv
+            if self._srv_failed:
+                return None
+            srv = _CrispServer(self._server_argv(), self._exe.parent)
+            try:
+                srv.start(timeout if timeout is not None else _SERVER_START_TIMEOUT_SECS)
+            except Exception as e:
+                self._srv_failed = True
+                _warn(f"crispasr 常驻服务启动失败，实时分段改用一次性进程：{e}")
+                return None
+            self._srv = srv
+            return srv
+
+    def prepare_realtime(self) -> None:
+        """录音开始：后台预热常驻 server（失败静默，分段时自然退回 spawn）。"""
+        if not getattr(self, "server_mode", True) or self._srv_failed:
+            return
+        threading.Thread(target=self._ensure_server, name="crispasr-server-warm",
+                         daemon=True).start()
+
+    def release_realtime(self) -> None:
+        """停掉常驻 server（录音结束／换模型／开始批量转录前调用，给显存让位）。"""
+        with self._srv_lock:
+            srv, self._srv = getattr(self, "_srv", None), None
+        if srv is not None:
+            srv.stop()
+
+    def transcribe_realtime(self, audio_path, language: str | None = None,
+                            context: str | None = None) -> TranscribeResult:
+        """单段音频 → 文字（录音页实时出字；不产字幕文件、不做字级对齐）。
+
+        ── 为什么改走常驻服务（2026-11 实测，GTX 1660 SUPER / 核心 0.8.54）──
+        旧路径每段 spawn 一次 crispasr.exe，模型每次都重新上显存：whisper base
+        固定开销 ≈0.6s、qwen3 Q8 ≈2.35s，占实时出字延迟 ~90%。`--server`
+        只加载一次模型，同样的 2s 音频单段实测 0.17–0.23s。
+        服务起不来（旧核心无 --server／显存不足）时自动退回一次性 spawn，
+        行为与改动前一致，不会因为常驻失败而丢字。
+        """
+        srv = self._ensure_server()
+        if srv is not None:
+            try:
+                obj = srv.transcribe_file(audio_path, {
+                    # 语言名 → whisper 语言代码；None = 自动检测（沿用服务端设置）
+                    "language": _LANG_MAP.get(language) if language else None,
+                    "prompt": ((context or "").strip()[:500] or None),
+                    "response_format": "verbose_json",
+                })
+                segs = _realtime_segments_from_api(obj)
+                return TranscribeResult(
+                    segments_rich=segs,
+                    diag=None if segs else "未识别到语音内容。")
+            except Exception as e:
+                # 单次失败不永久禁用：停掉可惜的坏进程，本段退回 spawn，
+                # 下一段再试常驻（服务器崩溃/显存回收等情况能自愈）。
+                _warn(f"常驻服务转录失败，本段退回一次性进程：{e}")
+                with self._srv_lock:
+                    bad, self._srv = self._srv, None
+                if bad is not None:
+                    bad.stop()
+        text = self._realtime_spawn_text(audio_path, language, context)
+        segs = _realtime_segments_from_api({"text": text})
+        return TranscribeResult(segments_rich=segs,
+                                diag=None if segs else "未识别到语音内容。")
+
+    def _realtime_spawn_text(self, audio_path, language, context) -> str:
+        """一次性子进程的实时转录（常驻不可用时的后备，行为同旧实现）。"""
+        with tempfile.TemporaryDirectory() as td:
+            out_base = Path(td) / "seg_out"
+            cmd = self._build_cmd(Path(audio_path), out_base, language,
+                                  word_level=False, context=context)
+            with self._lock:
+                try:
+                    subprocess.run(
+                        cmd, capture_output=True, stdin=subprocess.DEVNULL,
+                        creationflags=_CREATE_NO_WINDOW, startupinfo=_STARTUP_INFO,
+                        timeout=_RT_PROC_TIMEOUT_SECS,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError(
+                        f"crispasr.exe 实时转录超时（>{_RT_PROC_TIMEOUT_SECS}s），"
+                        "已终止子进程。请检查显卡驱动或改用 CPU 版本。")
+            txt = out_base.with_suffix(".txt")
+            return (txt.read_text(encoding="utf-8", errors="replace").strip()
+                    if txt.exists() else "")
 
     # ══ 子程序命令建构（★ 由你定夺：speed/quality 取舍）═════════════════
 
@@ -777,43 +1117,17 @@ class CrispWhisperEngine:
 
     def transcribe(self, audio: np.ndarray, max_tokens: int = 300,
                    language: str | None = None, context: str | None = None) -> str:
-        """16kHz float32 音频 → 文字（实时模式用，不需字级时间轴）。
+        """16kHz float32 音频 → 文字（旧接口；保留给既有的 ndarray 调用端）。
 
-        ── 2026-11 实测（GTX 1660 SUPER / 核心 0.8.53 / qwen3 Q8 2.5GB）────
-        每段一次 spawn 的固定开销实测 **2.35s**（0.2s 静音即跑 2.35s：Vulkan
-        init + 权重上显存），占实时出字延迟的 ~90%；推理本身仅 ~0.2s。
-        「常驻子进程」可省这 2.35s，但上游不支持：
-          • crispasr.exe 无 server/stdin/stream 模式（--help 全量核对）
-          • crispasr.dll 9951 个导出全为 C++ mangled 内部符号、零干净 C ABI
-            （符号里可见 core_qwen3_stream 流式命名空间——能力在上游内部，
-             未暴露接口；ctypes 调 MSVC mangled + std::string 属逆向工程，
-             崩溃/显存泄漏/随版本漂移风险不可控）
-          • 多输入（file0 file1…）存在但会牺牲「段结束即出字」的实时语义
-        → 结论：驻留不可行，是上游能力缺口；降低实时延迟的现实手段是
-          选低开销模型档（whisper base 固定开销 0.45s vs qwen3 2.35s，
-          见录制页提示）。若上游未来提供 server/C ABI，此处是接入点。
+        录音页现在走 `transcribe_realtime`（可选常驻 --server）。这里落地成
+        临时 wav 后同样交给它，两条入口共用一条实现，不再各留一套 spawn。
         """
         import soundfile as sf
         with tempfile.TemporaryDirectory() as td:
             wav = Path(td) / "seg.wav"
             sf.write(str(wav), audio, SAMPLE_RATE)
-            out_base = Path(td) / "seg_out"
-            cmd = self._build_cmd(wav, out_base, language, word_level=False,
-                                  context=context)
-            with self._lock:
-                try:
-                    subprocess.run(
-                        cmd, capture_output=True, stdin=subprocess.DEVNULL,
-                        creationflags=_CREATE_NO_WINDOW, startupinfo=_STARTUP_INFO,
-                        timeout=_RT_PROC_TIMEOUT_SECS,
-                    )
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError(
-                        f"crispasr.exe 实时转录超时（>{_RT_PROC_TIMEOUT_SECS}s），"
-                        "已终止子进程。请检查显卡驱动或改用 CPU 版本。")
-            txt = out_base.with_suffix(".txt")
-            text = txt.read_text(encoding="utf-8", errors="replace").strip() if txt.exists() else ""
-        return text
+            res = self.transcribe_realtime(wav, language=language, context=context)
+        return "\n".join(s["text"] for s in (res.segments_rich or []))
 
 
 # ── SRT 解析 / 写入（模块层工具）──────────────────────────────────────

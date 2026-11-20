@@ -103,8 +103,8 @@
     "search.next": ["下一个匹配（Enter）", "Next match (Enter)"],
     "search.replaceCur": ["替换", "Replace"],
     "search.replaceAll": ["全部替换", "Replace All"],
-    "rec.latencyLarge": ["当前模型实时出字延迟约 2-3 秒/段（进程内模型加载开销为主）；追求即时出字可换 Whisper Base 或切换 CPU (OpenVINO) 核心", "The current model adds ~2-3 s of latency per segment (process model-load overhead). For instant output, switch to Whisper Base or the CPU (OpenVINO) core"],
-    "rec.latencyBase": ["Whisper Base 固定开销小，实时出字较快；长句识别精度低于大模型", "Whisper Base has low fixed overhead and faster realtime output; long-sentence accuracy is lower than larger models"],
+    "rec.latencyLarge": ["录音期间走常驻识别（模型只加载一次），出字延迟主要在推理本身，实测约 0.3-0.8 秒/段；追求更快可换 Whisper Base 或切换 CPU (OpenVINO) 核心", "Recording uses a resident recognizer (model loaded once), so per-segment latency is mostly inference — about 0.3-0.8 s measured. Whisper Base or the CPU (OpenVINO) core is faster still"],
+    "rec.latencyBase": ["Whisper Base 走常驻识别后基本只剩推理开销，出字很快；长句识别精度低于大模型", "With the resident recognizer, Whisper Base is mostly inference-bound and very fast; long-sentence accuracy is lower than larger models"],
     "rec.latencyCpu": ["CPU 进程内推理，无模型冷启动延迟", "In-process CPU inference — no cold-start latency"],
 
     "edit.line": ["编辑此行", "Edit this line"],

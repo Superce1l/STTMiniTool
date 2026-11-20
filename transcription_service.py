@@ -70,6 +70,38 @@ class TranscribeService:
         tmp_extra = None
         out_lock = None        # 产物跨进程锁（双开时同名字幕只许一个实例写）
         try:
+            # 语言：空字符串 / 自动检测 / auto → None（让引擎自动检测）
+            _lang = (opts.get("language") or "").strip()
+            if _lang in ("", "自动检测", "auto"):
+                _lang = None
+
+            # ── 实时录音分段（/api/transcribe 带 realtime=1）────────────────
+            # 录音页每说完一句就切一段上传，旧路径每段 spawn 一次 crispasr.exe
+            # （模型重新上显存：实测 whisper base ≈0.6s、qwen3 Q8 ≈2.35s，占
+            # 出字延迟 ~90%）。引擎支持 transcribe_realtime 时改走常驻
+            # `--server`（模型只载一次，单段 ≈0.2s）。
+            # 时间轴由前端录音时钟给出、结果只用于逐行显示，故这里不写字幕
+            # 文件、不登记产物（旧路径每段都会往 subtitles/ 落一个文件）。
+            # 也刻意排在「抽音轨」之前：crispasr 自己就能解 webm/ogg，为一段
+            # 1–3s 的录音再跑一次 ffmpeg 只是白加延迟。
+            if opts.get("realtime") and hasattr(self.engine, "transcribe_realtime"):
+                rt = self.engine.transcribe_realtime(
+                    audio_path, language=_lang,
+                    context=(opts.get("hint") or "").strip() or None)
+                segs = [{"start": float(_seg.get("start") or 0.0),
+                         "end": float(_seg.get("end") or 0.0),
+                         "text": (_seg.get("text") or "").strip()}
+                        for _seg in (rt.segments_rich or [])]
+                segs = [s for s in segs if s["text"]]
+                if not segs:
+                    raise RuntimeError(rt.diag or "未识别到语音内容。")
+                log_transcribe(
+                    f"实时分段完成：{Path(path).name}（{len(segs)} 行，"
+                    f"耗时 {_time.monotonic() - _t0:.2f}s）")
+                if progress_cb:
+                    progress_cb(100, "完成")
+                return {"segments": segs, "srtPath": None, "realtime": True}
+
             ext = audio_path.suffix.lower()
             from ffmpeg_utils import VIDEO_EXTS
             if ext in VIDEO_EXTS:
@@ -102,11 +134,6 @@ class TranscribeService:
 
             n_spk = opts.get("nSpeakers")
             n_speakers = int(n_spk) if str(n_spk).isdigit() else None
-
-            # 语言：空字符串 / 自动检测 / auto → None（让引擎自动检测）
-            _lang = (opts.get("language") or "").strip()
-            if _lang in ("", "自动检测", "auto"):
-                _lang = None
 
             # 输出落点：subtitles/ 下、用「原始上传文件名」命名（可在「开启输出文件夹」找到）。
             # 上传文件名为使用者可控（含 LAN/外网端点）→ 必须只取基名，杜绝路径穿越。
@@ -141,6 +168,12 @@ class TranscribeService:
                 out_ref, out_lock = unique_artifact(out_ref)
             except Exception:
                 traceback.print_exc()      # 锁不可用 → 用原名，绝不挡住转录
+
+            # 批量/文件转录用一次性子进程（要字级时间轴与 -pp 进度）：先把实时
+            # 常驻服务停下，避免两份模型同时占显存（4GB 卡会直接 OOM）。
+            _release_rt = getattr(self.engine, "release_realtime", None)
+            if callable(_release_rt):
+                _release_rt()
 
             with self._lock:
                 self._apply_chunk_secs(want_align)   # 任务自适应的每段上限（对齐→短段抗漂移）

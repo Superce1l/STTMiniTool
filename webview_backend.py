@@ -81,6 +81,7 @@ class WebBackend(TranscribeService):
         self._lock = threading.Lock()          # 转录/加载互斥（整个引擎调用期间被持有）
         self._load_gate = threading.Lock()     # start_load 的 check-and-set（非重入，短持有）
         self._transcribe_gate = threading.Lock()  # transcribe 忙碌 check-and-set（非重入）
+        self._rt_release_timer = None             # 录音结束后延迟停常驻服务的定时器
         self._active_label = None        # 实际加载的 (引擎标签, 模型标签)——字幕文件名/日志用
         # settings.json 单点读写（锁 + 原子写 + mtime 缓存）；cli_mode 的临时
         # 副本机制在构造本类前改 core.SETTINGS_FILE，故这里取到的已是生效路径。
@@ -146,6 +147,14 @@ class WebBackend(TranscribeService):
         if old is None:
             return
         import gc
+        # 先停常驻识别服务：换模型/换核心后旧 server 仍占着一份显存，
+        # 新模型加载会与它抢显存（4GB 卡直接加载失败）。
+        release = getattr(old, "release_realtime", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                traceback.print_exc()
         try:
             old.ready = False
         except Exception:
@@ -171,6 +180,15 @@ class WebBackend(TranscribeService):
         if backend == "crispasr":
             log_model(f"CrispASR 目录：{self._crispasr_dir()}")
         old_engine = getattr(self, "engine", None) if self._loaded else None
+        # 换模型前先停旧引擎的常驻识别服务：加载新模型要独占显存（4GB 卡上
+        # 两份模型会直接加载失败）。_release_engine 里还会再调一次（幂等）。
+        if old_engine is not None:
+            _prev_release = getattr(old_engine, "release_realtime", None)
+            if callable(_prev_release):
+                try:
+                    _prev_release()
+                except Exception:
+                    traceback.print_exc()
         try:
             with self._lock:
                 try:
@@ -616,8 +634,62 @@ class WebBackend(TranscribeService):
         return ""
 
     def set_recording(self, on: bool):
-        """前端录音开始／结束 → 同步到后端（关窗确认依据之一）。"""
+        """前端录音开始／结束 → 同步到后端（关窗确认依据之一）。
+
+        同时预热／释放 CrispASR 的常驻识别服务（`--server`）：录音期间模型
+        只加载一次，逐段出字不再付 spawn 的固定开销；录音结束后宽限若干秒
+        再停（收尾段还要上传），把显存还给批量转录。引擎不支持该接口
+        （OpenVINO）时代码不生效。
+        """
+        eng = getattr(self, "engine", None)
         self._recording = bool(on)
+        if eng is None:
+            return
+        try:
+            if on:
+                self._cancel_rt_release()      # 又开录：撤销待执行的释放
+                # 批量转录进行中不预热：两份模型同时上显存会 OOM，等录音分段
+                # 真正上传时（队列空闲后）再由引擎按需起服务。
+                if not self._transcribing:
+                    eng.prepare_realtime()
+            else:
+                # 不立刻停：录音页「停止」后还要上传收尾段（最后一句），
+                # 立即杀服务会让那一段重新冷启动（qwen3 要十几秒）。宽限
+                # 一段时间再停，期间若又开录/换模型则撤销或提前释放。
+                self._schedule_rt_release()
+        except Exception:
+            traceback.print_exc()      # 预热失败不影响录音（分段时会退回 spawn）
+
+    def _cancel_rt_release(self) -> None:
+        """撤销待执行的「停常驻服务」定时器（重复调用安全）。"""
+        t = getattr(self, "_rt_release_timer", None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._rt_release_timer = None
+
+    def _schedule_rt_release(self, delay: float = 20.0) -> None:
+        """录音结束后再等 delay 秒才停常驻服务（收尾段上传完再让出显存）。"""
+        self._cancel_rt_release()
+        timer = threading.Timer(delay, self._release_rt_if_idle)
+        timer.daemon = True
+        self._rt_release_timer = timer
+        timer.start()
+
+    def _release_rt_if_idle(self) -> None:
+        """定时器落地：仍在录音就留着，否则停服务把显存还给批量转录。"""
+        self._rt_release_timer = None
+        if self._recording:
+            return
+        eng = getattr(self, "engine", None)
+        release = getattr(eng, "release_realtime", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                traceback.print_exc()
 
     def open_output_dir(self) -> bool:
         import os
