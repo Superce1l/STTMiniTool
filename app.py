@@ -6,7 +6,7 @@ app.py — ASR 引擎层（OpenVINO CPU 核心）
   • Silero VAD 分段（_detect_speech_groups）与 VAD 模型查找
   • 路径 / 设置常量（BASE_DIR、SETTINGS_FILE、SRT_DIR、_DEFAULT_MODEL_DIR…）
 
-旧 CustomTkinter 桌面界面已移除；桌面 / WebView 唯一入口是 app_webview.py。
+桌面 / WebView 唯一入口是 app_webview.py。
 """
 from __future__ import annotations
 
@@ -991,6 +991,3 @@ class ASREngine1p7B(ASREngine):
             gen.append(nxt)
             cur += 1
         return gen
-
-
-
